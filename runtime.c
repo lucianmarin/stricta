@@ -1,5 +1,13 @@
 #include "runtime.h"
 #include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <pthread.h>
+#include <regex.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 /* --- Memory --- */
 
@@ -51,9 +59,9 @@ void stricta_init_args(int32_t argc, char** argv) {
 
 /* --- Exception Handling (Compiler-Lowered Propagation) --- */
 
-static int32_t _exc_type_id = 0;
-static void* _exc_obj = NULL;
-static StrictaStr* _exc_msg = NULL;
+static _Thread_local int32_t _exc_type_id = 0;
+static _Thread_local void* _exc_obj = NULL;
+static _Thread_local StrictaStr* _exc_msg = NULL;
 
 void stricta_set_exc(int32_t type_id, void* exc_obj, const char* msg) {
     if (_exc_msg) { stricta_str_free(_exc_msg); _exc_msg = NULL; }
@@ -176,6 +184,70 @@ StrictaStr* stricta_str_slice(StrictaStr* s, int64_t start, int64_t end) {
     return stricta_str_new(s->chars + start, (int32_t)(end - start));
 }
 
+int64_t stricta_slice_adjust(int64_t len, int64_t start, int32_t has_start,
+                             int64_t stop, int32_t has_stop, int64_t step, int64_t* out_start) {
+    if (step == 0) {
+        stricta_set_exc(1, NULL, "ValueError: slice step cannot be zero");
+        *out_start = 0;
+        return -1;
+    }
+    if (!has_start) {
+        start = (step < 0) ? len - 1 : 0;
+    } else {
+        if (start < 0) {
+            start += len;
+            if (start < 0) start = (step < 0) ? -1 : 0;
+        } else if (start >= len) {
+            start = (step < 0) ? len - 1 : len;
+        }
+    }
+    if (!has_stop) {
+        stop = (step < 0) ? -1 : len;
+    } else {
+        if (stop < 0) {
+            stop += len;
+            if (stop < 0) stop = (step < 0) ? -1 : 0;
+        } else if (stop >= len) {
+            stop = (step < 0) ? len - 1 : len;
+        }
+    }
+    *out_start = start;
+    if (step > 0) {
+        if (stop <= start) return 0;
+        uint64_t span = (uint64_t)stop - (uint64_t)start;
+        uint64_t ustep = (uint64_t)step;
+        return (int64_t)((span + ustep - 1) / ustep);
+    }
+    if (start <= stop) return 0;
+    uint64_t span = (uint64_t)start - (uint64_t)stop;
+    uint64_t ustep = (uint64_t)(-(step + 1)) + 1ULL;
+    return (int64_t)((span + ustep - 1) / ustep);
+}
+
+StrictaStr* stricta_str_slice_step(StrictaStr* s, int64_t start, int32_t has_start,
+                                   int64_t stop, int32_t has_stop, int64_t step) {
+    if (!s) {
+        int64_t st0 = 0;
+        stricta_slice_adjust(0, start, has_start, stop, has_stop, step, &st0);
+        return stricta_str_new("", 0);
+    }
+    int64_t cur = 0;
+    int64_t cnt = stricta_slice_adjust(s->length, start, has_start, stop, has_stop, step, &cur);
+    if (cnt <= 0) return stricta_str_new("", 0);
+    if (step == 1) return stricta_str_new(s->chars + cur, (int32_t)cnt);
+    StrictaStr* st = (StrictaStr*)stricta_alloc(sizeof(StrictaStr));
+    st->length = (int32_t)cnt;
+    st->is_static = 0;
+    st->hash = 0;
+    st->chars = (char*)stricta_alloc((size_t)cnt + 1);
+    for (int64_t i = 0; i < cnt; i++) {
+        st->chars[i] = s->chars[cur];
+        cur += step;
+    }
+    st->chars[cnt] = '\0';
+    return st;
+}
+
 StrictaStr* stricta_str_char_at(StrictaStr* s, int64_t idx) {
     if (!s || s->length == 0) {
         stricta_bounds_fail(idx, 0, "<str>", 0);
@@ -209,10 +281,12 @@ int32_t stricta_str_cmp(StrictaStr* a, StrictaStr* b) {
 
 uint64_t stricta_str_hash(StrictaStr* s) {
     if (!s) return 0;
-    if (s->hash == 0) {
-        s->hash = fnv1a_32(s->chars, s->length);
+    uint32_t h = s->hash;
+    if (h == 0) {
+        h = fnv1a_32(s->chars, s->length);
+        if (!s->is_static) s->hash = h;
     }
-    uint64_t x = (uint64_t)s->hash;
+    uint64_t x = (uint64_t)h;
     x = (x ^ (x >> 16)) * 0x45d9f3bULL;
     return x ^ (x >> 16);
 }
@@ -535,6 +609,40 @@ void stricta_bytes_free(StrictaBytes* b) {
 StrictaBytes* stricta_bytes_clone(StrictaBytes* b) {
     if (!b || b->is_static) return b;
     return stricta_bytes_new(b->data, b->length);
+}
+
+StrictaBytes* stricta_bytes_slice(StrictaBytes* b, int64_t start, int64_t end) {
+    if (!b) return stricta_bytes_new(NULL, 0);
+    int64_t len = b->length;
+    if (start < 0) start += len;
+    if (end < 0) end += len;
+    if (start < 0) start = 0;
+    if (end > len) end = len;
+    if (start >= end) return stricta_bytes_new(NULL, 0);
+    return stricta_bytes_new(b->data + start, (int32_t)(end - start));
+}
+
+StrictaBytes* stricta_bytes_slice_step(StrictaBytes* b, int64_t start, int32_t has_start,
+                                       int64_t stop, int32_t has_stop, int64_t step) {
+    if (!b) {
+        int64_t st0 = 0;
+        stricta_slice_adjust(0, start, has_start, stop, has_stop, step, &st0);
+        return stricta_bytes_new(NULL, 0);
+    }
+    int64_t cur = 0;
+    int64_t cnt = stricta_slice_adjust(b->length, start, has_start, stop, has_stop, step, &cur);
+    if (cnt <= 0) return stricta_bytes_new(NULL, 0);
+    if (step == 1) return stricta_bytes_new(b->data + cur, (int32_t)cnt);
+    StrictaBytes* out = (StrictaBytes*)stricta_alloc(sizeof(StrictaBytes));
+    out->length = (int32_t)cnt;
+    out->is_static = 0;
+    out->data = (uint8_t*)stricta_alloc((size_t)cnt + 1);
+    for (int64_t i = 0; i < cnt; i++) {
+        out->data[i] = b->data[cur];
+        cur += step;
+    }
+    out->data[cnt] = 0;
+    return out;
 }
 
 int32_t stricta_bytes_eq(StrictaBytes* a, StrictaBytes* b) {
@@ -874,3 +982,338 @@ StrictaStr* stricta_input(StrictaStr* prompt) {
     while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) len--;
     return stricta_str_new(buf, (int32_t)len);
 }
+
+/* --- OS & Process Primitives --- */
+
+StrictaPtrList* stricta_os_exec_list(StrictaStr* cmd) {
+    const char* c = (cmd && cmd->chars) ? cmd->chars : "";
+    FILE* fp = popen(c, "r");
+    StrictaPtrList* res = (StrictaPtrList*)stricta_alloc(sizeof(StrictaPtrList));
+    res->length = 2;
+    res->capacity = 4;
+    res->items = (void**)stricta_alloc(sizeof(void*) * 4);
+    if (!fp) {
+        res->items[0] = stricta_str_cstr("-1");
+        res->items[1] = stricta_str_new("", 0);
+        return res;
+    }
+    size_t cap = 4096, len = 0;
+    char* buf = (char*)stricta_alloc(cap);
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
+        len += n;
+        if (cap - len - 1 < 1024) {
+            cap *= 2;
+            buf = (char*)stricta_realloc(buf, cap);
+        }
+    }
+    buf[len] = '\0';
+    int st = pclose(fp);
+    int64_t rc = WIFEXITED(st) ? (int64_t)WEXITSTATUS(st) : -1;
+    res->items[0] = stricta_int_to_str(rc);
+    res->items[1] = stricta_str_new(buf, (int32_t)len);
+    free(buf);
+    return res;
+}
+
+int64_t stricta_os_system(StrictaStr* cmd) {
+    const char* c = (cmd && cmd->chars) ? cmd->chars : "";
+    int st = system(c);
+    if (st < 0) return -1;
+    return WIFEXITED(st) ? (int64_t)WEXITSTATUS(st) : -1;
+}
+
+int64_t stricta_os_exists(StrictaStr* path) {
+    if (!path || !path->chars) return 0;
+    return access(path->chars, F_OK) == 0 ? 1 : 0;
+}
+
+int64_t stricta_os_isdir(StrictaStr* path) {
+    if (!path || !path->chars) return 0;
+    struct stat st;
+    if (stat(path->chars, &st) != 0) return 0;
+    return S_ISDIR(st.st_mode) ? 1 : 0;
+}
+
+int64_t stricta_os_mkdir(StrictaStr* path) {
+    if (!path || !path->chars || path->length == 0) return 0;
+    if (mkdir(path->chars, 0755) == 0 || errno == EEXIST) return 1;
+    return 0;
+}
+
+StrictaPtrList* stricta_os_listdir(StrictaStr* path) {
+    StrictaPtrList* lst = (StrictaPtrList*)stricta_alloc(sizeof(StrictaPtrList));
+    lst->length = 0;
+    lst->capacity = 8;
+    lst->items = (void**)stricta_alloc(sizeof(void*) * (size_t)lst->capacity);
+    if (!path || !path->chars) return lst;
+    DIR* d = opendir(path->chars);
+    if (!d) return lst;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        if (lst->length >= lst->capacity) {
+            lst->capacity *= 2;
+            lst->items = (void**)stricta_realloc(lst->items, sizeof(void*) * (size_t)lst->capacity);
+        }
+        lst->items[lst->length++] = stricta_str_cstr(ent->d_name);
+    }
+    closedir(d);
+    return lst;
+}
+
+StrictaStr* stricta_os_getenv(StrictaStr* name) {
+    if (!name || !name->chars) return stricta_str_new("", 0);
+    const char* v = getenv(name->chars);
+    return v ? stricta_str_cstr(v) : stricta_str_new("", 0);
+}
+
+StrictaStr* stricta_os_getcwd(void) {
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) return stricta_str_new("", 0);
+    return stricta_str_cstr(buf);
+}
+
+int64_t stricta_os_remove(StrictaStr* path) {
+    if (!path || !path->chars) return 0;
+    return unlink(path->chars) == 0 ? 1 : 0;
+}
+
+int64_t stricta_os_symlink(StrictaStr* target, StrictaStr* linkpath) {
+    if (!target || !target->chars || !linkpath || !linkpath->chars) return 0;
+    return symlink(target->chars, linkpath->chars) == 0 ? 1 : 0;
+}
+
+/* --- Time & Date Primitives --- */
+
+double stricta_time_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+double stricta_time_monotonic(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+void stricta_time_sleep(double secs) {
+    if (secs <= 0.0) return;
+    struct timespec req;
+    req.tv_sec = (time_t)secs;
+    req.tv_nsec = (long)((secs - (double)req.tv_sec) * 1e9);
+    nanosleep(&req, NULL);
+}
+
+static StrictaPtrList* tm_to_list(const struct tm* t) {
+    StrictaPtrList* lst = (StrictaPtrList*)stricta_alloc(sizeof(StrictaPtrList));
+    lst->length = 8;
+    lst->capacity = 8;
+    lst->items = (void**)stricta_alloc(sizeof(void*) * 8);
+    lst->items[0] = stricta_int_to_str(t->tm_year + 1900);
+    lst->items[1] = stricta_int_to_str(t->tm_mon + 1);
+    lst->items[2] = stricta_int_to_str(t->tm_mday);
+    lst->items[3] = stricta_int_to_str(t->tm_hour);
+    lst->items[4] = stricta_int_to_str(t->tm_min);
+    lst->items[5] = stricta_int_to_str(t->tm_sec);
+    lst->items[6] = stricta_int_to_str((t->tm_wday + 6) % 7); /* Monday=0 .. Sunday=6 */
+    lst->items[7] = stricta_int_to_str(t->tm_yday + 1);
+    return lst;
+}
+
+StrictaPtrList* stricta_time_localtime(int64_t epoch_sec) {
+    time_t t = (time_t)epoch_sec;
+    struct tm tm_res;
+    localtime_r(&t, &tm_res);
+    return tm_to_list(&tm_res);
+}
+
+StrictaPtrList* stricta_time_gmtime(int64_t epoch_sec) {
+    time_t t = (time_t)epoch_sec;
+    struct tm tm_res;
+    gmtime_r(&t, &tm_res);
+    return tm_to_list(&tm_res);
+}
+
+int64_t stricta_time_mktime(int64_t y, int64_t m, int64_t d, int64_t H, int64_t M, int64_t S) {
+    struct tm tm_in;
+    memset(&tm_in, 0, sizeof(tm_in));
+    tm_in.tm_year = (int)(y - 1900);
+    tm_in.tm_mon = (int)(m - 1);
+    tm_in.tm_mday = (int)d;
+    tm_in.tm_hour = (int)H;
+    tm_in.tm_min = (int)M;
+    tm_in.tm_sec = (int)S;
+    tm_in.tm_isdst = -1;
+    return (int64_t)mktime(&tm_in);
+}
+
+/* --- Sys Primitives --- */
+
+StrictaPtrList* stricta_sys_get_argv(void) {
+    StrictaPtrList* res = (StrictaPtrList*)stricta_alloc(sizeof(StrictaPtrList));
+    int32_t n = stricta_sys_argv ? stricta_sys_argv->length : 0;
+    res->length = n;
+    res->capacity = n > 4 ? n : 4;
+    res->items = (void**)stricta_alloc(sizeof(void*) * (size_t)res->capacity);
+    for (int32_t i = 0; i < n; i++) {
+        res->items[i] = stricta_str_clone((StrictaStr*)stricta_sys_argv->items[i]);
+    }
+    return res;
+}
+
+void stricta_sys_exit(int64_t code) {
+    exit((int)code);
+}
+
+StrictaStr* stricta_sys_platform(void) {
+#if defined(__APPLE__)
+    return stricta_str_cstr("darwin");
+#elif defined(__linux__)
+    return stricta_str_cstr("linux");
+#elif defined(_WIN32)
+    return stricta_str_cstr("win32");
+#else
+    return stricta_str_cstr("unknown");
+#endif
+}
+
+/* --- Async Tasks --- */
+
+struct StrictaTask {
+    pthread_t thread;
+    int32_t joined;
+    int32_t has_result;
+    uint64_t result_bits;
+    void* arg_block;
+    void (*drop_result)(uint64_t);
+    int32_t exc_type_id;
+    void* exc_obj;
+    StrictaStr* exc_msg;
+};
+
+StrictaTask* stricta_task_spawn(void* (*entry)(void*), void* arg_block, void (*drop_result)(uint64_t)) {
+    StrictaTask* t = (StrictaTask*)stricta_calloc(1, sizeof(StrictaTask));
+    t->arg_block = arg_block;
+    t->drop_result = drop_result;
+    int rc = pthread_create(&t->thread, NULL, entry, t);
+    if (rc != 0) {
+        fprintf(stderr, "RuntimeError: failed to spawn async task thread (%d)\n", rc);
+        exit(1);
+    }
+    return t;
+}
+
+void* stricta_task_args(StrictaTask* t) {
+    return t ? t->arg_block : NULL;
+}
+
+void stricta_task_finish(StrictaTask* t, uint64_t bits) {
+    if (!t) return;
+    t->result_bits = bits;
+    t->has_result = 1;
+}
+
+void stricta_task_capture_exc(StrictaTask* t) {
+    if (!t) return;
+    t->exc_type_id = _exc_type_id;
+    t->exc_obj = _exc_obj;
+    t->exc_msg = _exc_msg;
+    _exc_type_id = 0;
+    _exc_obj = NULL;
+    _exc_msg = NULL;
+}
+
+uint64_t stricta_task_await(StrictaTask* t) {
+    if (!t) return 0;
+    if (!t->joined) {
+        pthread_join(t->thread, NULL);
+        t->joined = 1;
+    }
+    if (t->exc_type_id != 0) {
+        stricta_clear_exc(0);
+        _exc_type_id = t->exc_type_id;
+        _exc_obj = t->exc_obj;
+        _exc_msg = t->exc_msg;
+        free(t);
+        return 0;
+    }
+    uint64_t r = t->result_bits;
+    free(t);
+    return r;
+}
+
+void stricta_task_free(StrictaTask* t) {
+    if (!t) return;
+    if (!t->joined) {
+        pthread_join(t->thread, NULL);
+        t->joined = 1;
+    }
+    if (t->exc_type_id != 0) {
+        if (t->exc_msg) stricta_str_free(t->exc_msg);
+        if (t->exc_obj) free(t->exc_obj);
+    } else if (t->has_result && t->drop_result) {
+        t->drop_result(t->result_bits);
+    }
+    free(t);
+}
+
+/* --- Regex & Concurrency Helpers --- */
+
+StrictaPtrList* stricta_re_find(StrictaStr* pattern, StrictaStr* text, int64_t start_pos, int64_t flags) {
+    StrictaPtrList* res = (StrictaPtrList*)stricta_alloc(sizeof(StrictaPtrList));
+    res->length = 0;
+    res->capacity = 4;
+    res->items = (void**)stricta_alloc(sizeof(void*) * (size_t)res->capacity);
+    if (!pattern || !text || start_pos < 0 || start_pos > text->length) return res;
+
+    regex_t re;
+    int cflags = REG_EXTENDED;
+    if (flags & 2) cflags |= REG_ICASE;
+    if (flags & 4) cflags |= REG_NEWLINE;
+    int rc = regcomp(&re, pattern->chars, cflags);
+    if (rc != 0) {
+        char ebuf[256];
+        regerror(rc, &re, ebuf, sizeof(ebuf));
+        char msg[300];
+        snprintf(msg, sizeof(msg), "ERR:%s", ebuf);
+        res->items[0] = stricta_str_cstr(msg);
+        res->length = 1;
+        return res;
+    }
+
+    size_t nmatch = re.re_nsub + 1;
+    regmatch_t* pm = (regmatch_t*)stricta_calloc(nmatch, sizeof(regmatch_t));
+    int eflags = (start_pos > 0) ? REG_NOTBOL : 0;
+    if (regexec(&re, text->chars + start_pos, nmatch, pm, eflags) == 0) {
+        int32_t need = (int32_t)(2 + nmatch);
+        if (need > res->capacity) {
+            res->capacity = need;
+            res->items = (void**)stricta_realloc(res->items, sizeof(void*) * (size_t)res->capacity);
+        }
+        int64_t mstart = start_pos + (int64_t)pm[0].rm_so;
+        int64_t mend = start_pos + (int64_t)pm[0].rm_eo;
+        res->items[res->length++] = stricta_int_to_str(mstart);
+        res->items[res->length++] = stricta_int_to_str(mend);
+        for (size_t i = 0; i < nmatch; i++) {
+            if (pm[i].rm_so < 0 || pm[i].rm_eo < pm[i].rm_so) {
+                res->items[res->length++] = stricta_str_new("", 0);
+            } else {
+                res->items[res->length++] = stricta_str_new(
+                    text->chars + start_pos + pm[i].rm_so,
+                    (int32_t)(pm[i].rm_eo - pm[i].rm_so));
+            }
+        }
+    }
+    free(pm);
+    regfree(&re);
+    return res;
+}
+
+static uint64_t _stricta_uid_seq = 0;
+int64_t stricta_unique_id(void) {
+    return (int64_t)__atomic_add_fetch(&_stricta_uid_seq, 1, __ATOMIC_RELAXED);
+}
+
+

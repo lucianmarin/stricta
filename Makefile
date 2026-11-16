@@ -1,13 +1,16 @@
 CC      ?= clang
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share/stricta
 TARGET   = stricta
 
-.PHONY: all clean test
+.PHONY: all clean test install uninstall
 
 all: $(TARGET)
 
 $(TARGET): stricta.c
-	$(CC) $(CFLAGS) stricta.c -o $(TARGET)
+	$(CC) $(CFLAGS) -DSTRICTA_DATA_DIR=\"$(DATADIR)\" stricta.c -o $(TARGET)
 
 test: $(TARGET)
 	@set -e; \
@@ -25,6 +28,16 @@ test: $(TARGET)
 		count=$$((count + 1)); \
 	done; \
 	echo "=== All $$count test suites + test.str passed! ==="
+
+install:
+	$(CC) $(CFLAGS) -DSTRICTA_DATA_DIR=\"$(DATADIR)\" stricta.c -o $(TARGET)
+	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(DATADIR)"
+	install -m 755 $(TARGET) "$(DESTDIR)$(BINDIR)/$(TARGET)"
+	install -m 644 runtime.h runtime.c "$(DESTDIR)$(DATADIR)/"
+
+uninstall:
+	rm -f "$(DESTDIR)$(BINDIR)/$(TARGET)"
+	rm -rf "$(DESTDIR)$(DATADIR)"
 
 clean:
 	rm -f $(TARGET) *.ll *.o *.out test_bin

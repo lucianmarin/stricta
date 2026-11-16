@@ -1,0 +1,22 @@
+@extern("stricta_os_getcwd")
+def _c_getcwd() -> str:
+    pass
+
+@extern("stricta_time_now")
+def _c_time_now() -> float:
+    pass
+
+@extern("stricta_os_exists")
+def _c_exists(path: str) -> int:
+    pass
+
+def test_extern_ffi() -> None:
+    cwd = _c_getcwd()
+    assert len(cwd) > 0
+    assert _c_exists("Makefile") != 0
+    assert _c_exists("nonexistent_file_xyz_999") == 0
+    t = _c_time_now()
+    assert t > 1700000000.0
+
+test_extern_ffi()
+print("EXTERN TESTS PASSED")

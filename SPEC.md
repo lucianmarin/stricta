@@ -48,7 +48,7 @@ Stricta enforces strict static types on all bindings, parameters, fields, and co
 
 - **Statements**: `if`/`elif`/`else`, `while`/`else`, `for`/`else`, `match`/`case`, `try`/`except [Type [as e]]`/`else`/`finally`, `raise`, `assert`, `with ... as ...:`, `del`, `global`, `nonlocal`, `yield`/`yield from` (eager `list[T]`), `lambda`, custom `@decorator`.
 - **Comprehensions**: `[expr for ...]`, `{expr for ...}`, `{k: v for ...}`, `(expr for ...)` (fused directly into zero-allocation loops for `sum(...)`, `any(...)`, and `all(...)`, and stack-allocated when non-escaping).
-- **Modules & Packages**: `import mod [as alias]`, `from mod import name [as alias]` resolving `.str` modules and `pkg/__init__.str` packages, plus `sys.argv`, `abc`, `dataclasses`, and `typing`.
+- **Modules & Packages**: `import mod [as alias]`, `from mod import name [as alias]`, and `from owner/repo import mod` resolving `.str` modules and `pkg/__init__.str` packages across the local directory, `-I <dir>`, `.stricta/pkgs/`, and `STRICTA_PATH`, plus `@extern("c_sym")` C-FFI bindings, `abc`, `dataclasses`, and `typing`. Standard library modules (`sys`, `os`, `time`, `date`, `datetime`) live in the companion `lucianmarin/strlib` package.
 
 ---
 
@@ -74,7 +74,7 @@ Because values have a single owner and cannot be implicitly aliased across mutab
 ## 5. Compiler & Runtime Architecture
 
 - **`stricta.c`**: Single-file C11 compiler containing the arena allocator, indentation lexer, recursive-descent parser, strict semantic/type analyzer, ownership/borrow checker, monomorphization registry, and LLVM IR code generator.
-- **`runtime.h` / `runtime.c`**: Lean C11 runtime providing UTF-8 string operations (`is_static`/clone/free), `bytes`, `bigint`, `File` I/O, compiler-lowered exception state and bounds-failure traps, CLI `sys.argv`, and typed print helpers—with zero NaN-boxing, ARC, or GC.
+- **`runtime.h` / `runtime.c`**: Lean C11 runtime providing UTF-8 string operations (`is_static`/clone/free), `bytes`, `bigint`, `File` I/O, compiler-lowered exception state and bounds-failure traps, CLI `sys.argv`, OS/time `@extern` primitives, and typed print helpers—with zero NaN-boxing, ARC, or GC.
 - **Build & Test**:
   ```bash
   make       # builds ./stricta from stricta.c

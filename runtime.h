@@ -67,6 +67,8 @@ StrictaStr* stricta_str_clone(StrictaStr* s);
 StrictaStr* stricta_str_concat(StrictaStr* a, StrictaStr* b);
 StrictaStr* stricta_str_repeat(StrictaStr* s, int64_t count);
 StrictaStr* stricta_str_slice(StrictaStr* s, int64_t start, int64_t end);
+int64_t stricta_slice_adjust(int64_t len, int64_t start, int32_t has_start, int64_t stop, int32_t has_stop, int64_t step, int64_t* out_start);
+StrictaStr* stricta_str_slice_step(StrictaStr* s, int64_t start, int32_t has_start, int64_t stop, int32_t has_stop, int64_t step);
 StrictaStr* stricta_str_char_at(StrictaStr* s, int64_t idx);
 int32_t stricta_str_eq(StrictaStr* a, StrictaStr* b);
 int32_t stricta_str_cmp(StrictaStr* a, StrictaStr* b);
@@ -105,6 +107,8 @@ int64_t stricta_pow_i64(int64_t base, int64_t exp);
 StrictaBytes* stricta_bytes_new(const uint8_t* data, int32_t len);
 void stricta_bytes_free(StrictaBytes* b);
 StrictaBytes* stricta_bytes_clone(StrictaBytes* b);
+StrictaBytes* stricta_bytes_slice(StrictaBytes* b, int64_t start, int64_t end);
+StrictaBytes* stricta_bytes_slice_step(StrictaBytes* b, int64_t start, int32_t has_start, int64_t stop, int32_t has_stop, int64_t step);
 int32_t stricta_bytes_eq(StrictaBytes* a, StrictaBytes* b);
 
 /* BigInt */
@@ -140,5 +144,43 @@ void stricta_print_cstr(const char* s);
 void stricta_print_space(void);
 void stricta_print_newline(void);
 StrictaStr* stricta_input(StrictaStr* prompt);
+
+/* OS & Process Primitives */
+StrictaPtrList* stricta_os_exec_list(StrictaStr* cmd);
+int64_t stricta_os_system(StrictaStr* cmd);
+int64_t stricta_os_exists(StrictaStr* path);
+int64_t stricta_os_isdir(StrictaStr* path);
+int64_t stricta_os_mkdir(StrictaStr* path);
+StrictaPtrList* stricta_os_listdir(StrictaStr* path);
+StrictaStr* stricta_os_getenv(StrictaStr* name);
+StrictaStr* stricta_os_getcwd(void);
+int64_t stricta_os_remove(StrictaStr* path);
+int64_t stricta_os_symlink(StrictaStr* target, StrictaStr* linkpath);
+
+/* Time & Date Primitives */
+double stricta_time_now(void);
+double stricta_time_monotonic(void);
+void stricta_time_sleep(double secs);
+StrictaPtrList* stricta_time_localtime(int64_t epoch_sec);
+StrictaPtrList* stricta_time_gmtime(int64_t epoch_sec);
+int64_t stricta_time_mktime(int64_t y, int64_t m, int64_t d, int64_t H, int64_t M, int64_t S);
+
+/* Sys Primitives */
+StrictaPtrList* stricta_sys_get_argv(void);
+void stricta_sys_exit(int64_t code);
+StrictaStr* stricta_sys_platform(void);
+
+/* Async Tasks */
+typedef struct StrictaTask StrictaTask;
+StrictaTask* stricta_task_spawn(void* (*entry)(void*), void* arg_block, void (*drop_result)(uint64_t));
+void* stricta_task_args(StrictaTask* t);
+void stricta_task_finish(StrictaTask* t, uint64_t bits);
+void stricta_task_capture_exc(StrictaTask* t);
+uint64_t stricta_task_await(StrictaTask* t);
+void stricta_task_free(StrictaTask* t);
+
+/* Regex & Concurrency Helpers */
+StrictaPtrList* stricta_re_find(StrictaStr* pattern, StrictaStr* text, int64_t start_pos, int64_t flags);
+int64_t stricta_unique_id(void);
 
 #endif

@@ -1,0 +1,91 @@
+from dataclasses import dataclass
+import helper_mod
+
+assert __name__ == "__main__"
+assert helper_mod.__name__ == "helper_mod"
+assert helper_mod.MOD_NAME == "helper_mod"
+
+# Keyword arguments on functions
+def calc(a: int, b: int = 10, c: int = 100) -> int:
+    return a * 1 + b * 2 + c * 3
+
+assert calc(1) == 321
+assert calc(1, c=2) == 27
+assert calc(c=0, b=5, a=3) == 13
+assert helper_mod.greet(punct="?", name="Stricta") == "Hello, Stricta?"
+
+# Generic function with kwargs + defaults
+def pick(first, second: str = "def") -> str:
+    return f"{first}:{second}"
+
+assert pick(second="ok", first=42) == "42:ok"
+assert pick(first=7) == "7:def"
+
+# @dataclass + class __init__ + methods + super() with kwargs
+@dataclass
+class Config:
+    host: str = "localhost"
+    port: int = 8080
+    tls: bool = False
+
+c1: Config = Config(tls=True, host="127.0.0.1")
+assert c1.host == "127.0.0.1"
+assert c1.port == 8080
+assert c1.tls == True
+
+class Base:
+    x: int
+    y: int
+    def __init__(self, x: int = 1, y: int = 2):
+        self.x = x
+        self.y = y
+
+class Sub(Base):
+    z: int
+    def __init__(self, z: int = 3, x: int = 10, y: int = 20):
+        super().__init__(y=y, x=x)
+        self.z = z
+
+    def scale(self, sx: int = 1, sy: int = 1) -> int:
+        return self.x * sx + self.y * sy + self.z
+
+s_obj: Sub = Sub(y=5, z=9)
+assert s_obj.x == 10 and s_obj.y == 5 and s_obj.z == 9
+assert s_obj.scale(sy=3) == 10 + 15 + 9
+
+b_imp: helper_mod.Box = helper_mod.Box(height=7, width=6)
+assert b_imp.area() == 42
+
+# Slice step on str, list[int], list[str], bytes
+txt: str = "abcdefg"
+assert txt[::2] == "aceg"
+assert txt[1:6:2] == "bdf"
+assert txt[::-1] == "gfedcba"
+assert txt[5:1:-2] == "fd"
+assert txt[::-10] == "g"
+assert txt[10:0:-2] == "gec"
+
+nums: list[int] = [0, 1, 2, 3, 4, 5, 6]
+assert nums[::2] == [0, 2, 4, 6]
+assert nums[::-1] == [6, 5, 4, 3, 2, 1, 0]
+assert nums[5:1:-2] == [5, 3]
+assert nums[1:1:2] == []
+
+words: list[str] = ["aa", "bb", "cc", "dd", "ee"]
+rev_words: list[str] = words[::-2]
+assert rev_words == ["ee", "cc", "aa"]
+
+raw: bytes = b"012345"
+assert raw[::2] == b"024"
+assert raw[::-1] == b"543210"
+
+zero_step: int = 0
+caught: bool = False
+try:
+    bad: str = txt[::zero_step]
+    assert len(bad) >= 0
+except Exception as e:
+    caught = True
+assert caught
+
+print("test_kwargs_slice passed!")

@@ -1,0 +1,99 @@
+@extern("stricta_time_sleep")
+def c_sleep(secs: float) -> None:
+    pass
+
+@extern("stricta_time_monotonic")
+def c_mono() -> float:
+    return 0.0
+
+async def add_async(a: int, b: int = 10) -> int:
+    return a + b
+
+async def make_greeting(name: str, excited: bool = True) -> str:
+    if excited:
+        return f"hi {name}!"
+    return f"hi {name}"
+
+async def make_pair(x: int, label: str) -> tuple[int, str]:
+    return (x * 2, label + "_ok")
+
+async def maybe_val(flag: bool) -> int | None:
+    if flag:
+        return 99
+    return None
+
+async def slow_step(val: int, delay: float) -> int:
+    c_sleep(delay)
+    return val * 10
+
+async def might_fail(fail: bool) -> str:
+    if fail:
+        raise "boom in task"
+    return "fine"
+
+async def side_effect_void(xs: list[int]) -> None:
+    if len(xs) == 0:
+        raise "empty"
+
+class AsyncWorker:
+    factor: int
+
+    def __init__(self, factor: int):
+        self.factor = factor
+
+    async def compute(self, x: int) -> int:
+        return self.factor * x
+
+def main() -> None:
+    # 1. Basic await & keyword arguments
+    t_add: Task[int] = add_async(b=5, a=3)
+    assert await t_add == 8
+    assert await add_async(4) == 14
+
+    s_msg: str = "world"
+    assert await make_greeting(s_msg) == "hi world!"
+
+    p_res: tuple[int, str] = await make_pair(7, "tag")
+    assert p_res[0] == 14 and p_res[1] == "tag_ok"
+
+    mv1: int | None = await maybe_val(True)
+    mv2: int | None = await maybe_val(False)
+    assert mv1 is not None and mv1 == 99
+    assert mv2 is None
+
+    # 2. True concurrency: two 0.08s sleeps run in parallel (< 0.14s total)
+    t0: float = c_mono()
+    ta: Task[int] = slow_step(3, 0.08)
+    tb: Task[int] = slow_step(4, 0.08)
+    ra: int = await ta
+    rb: int = await tb
+    elapsed: float = c_mono() - t0
+    assert ra == 30 and rb == 40
+    assert elapsed < 0.15
+
+    # 3. Dropped un-awaited tasks must join and free cleanly without leaking
+    dropped_str: Task[str] = make_greeting("unused")
+    dropped_pair: Task[tuple[int, str]] = make_pair(1, "drop")
+    dropped_fail: Task[str] = might_fail(True)
+    tv: Task[None] = side_effect_void([1, 2])
+    await tv
+
+    # 4. Exception propagation across await
+    caught: str = ""
+    try:
+        res_fail: str = await might_fail(True)
+        assert len(res_fail) >= 0
+    except Exception as e:
+        caught = e.copy()
+    assert caught == "boom in task"
+
+    assert await might_fail(False) == "fine"
+
+    # 5. Async method
+    w: AsyncWorker = AsyncWorker(6)
+    assert await w.compute(7) == 42
+
+    print("test_async passed!")
+
+if __name__ == "__main__":
+    main()

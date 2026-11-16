@@ -21,9 +21,8 @@ Implementation status of Python features in Stricta (`stricta.c` + `runtime.c`).
 - [x] `raise` — raises a catchable exception via compiler-lowered propagation and `stricta_set_exc()`; prints error and exits if unhandled
 - [x] `assert` — checks condition and exits on failure; evaluates and prints optional assertion message
 - [x] `with` — full context manager protocol (`__enter__`, `try`/`finally` error propagation, `__exit__`, re-raises when `__exit__` returns false)
-- [x] `async` / `await` — parsed and executed synchronously
-- [ ] True async event loop / coroutines (`async def` / `await` suspension)
-- [x] `match` / `case` — pattern matching supporting literal, capture, and wildcard (`_`) patterns
+- [x] `async` / `await` — concurrent `pthread`-backed `Task[T]` spawning (`PM_MOVE` ownership transfer on owned args, thread-local exception propagation, deterministic join/drop on un-awaited tasks)
+- [x] `match` / `case` — soft-keyword pattern matching supporting literal, capture, and wildcard (`_`) patterns
 - [x] `for` / `else`, `while` / `else` — else clauses on loops
 - [x] `del` — removes list elements and dict keys
 - [x] `global` / `nonlocal` — module-level globals and nested-function variable access
@@ -92,13 +91,13 @@ Implementation status of Python features in Stricta (`stricta.c` + `runtime.c`).
 
 ## Module System
 
-- [x] `import` / `from ... import ...` — resolves `.str` modules and `pkg/__init__.str` packages
-- [x] Built-in modules: `sys.argv`, `abc`, `dataclasses`, `typing`
-- [ ] Standard library: `os`, `math`, `json`, `re`, `time`, full `sys`, etc.
+- [x] `import` / `from ... import ...` — resolves `.str` modules and `pkg/__init__.str` packages (including `owner/repo` paths) across local dir, `-I`, `.stricta/pkgs/`, and `STRICTA_PATH`
+- [x] `@extern` C FFI & companion stdlib (`lucianmarin/strlib`: `sys`, `os`, `time`, `date`, `datetime`, `lmon`, `json`, `http`, `math`, `re`, `path`, `hashlib`); built-in `abc`, `dataclasses`, `typing`
 
 ## Typing, Memory, and Other
 
 - [x] Static type checking & compile-time inference — parameter/return/field checking, default-value inference, local/container/lambda inference, `is None` & `isinstance()` flow narrowing, stack allocation of non-escaping locals
 - [x] Rust-style memory safety without ARC/GC — compile-time ownership & borrow checking (`BORROW`/`MUT_BORROW`/`MOVE` modes, NLL), monomorphized `@_drop_T`/`@_clone_T`, runtime drop flags, and bounds traps
-- [ ] `__name__ == "__main__"` module guard variable
-- [ ] Step parameter in slicing: `seq[start:stop:step]`
+- [x] Keyword arguments (`fn(b=2, a=1)`) with parameter reordering and default-value resolution across functions, methods, constructors, `@dataclass`, `super()`, and generics
+- [x] `__name__ == "__main__"` module guard variable (`"__main__"` for entry module, module name for imports)
+- [x] Step parameter in slicing: `seq[start:stop:step]` (including negative steps on `str`, `bytes`, and `list[T]`)
