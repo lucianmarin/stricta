@@ -1,0 +1,65 @@
+def test_basic() -> None:
+    r: list[int] = (x * 2 for x in [1, 2, 3, 4, 5])
+    print("basic:", r)
+    assert r == [2, 4, 6, 8, 10]
+
+def test_with_if() -> None:
+    r: list[int] = (x for x in [1, 2, 3, 4, 5] if x > 2)
+    print("with_if:", r)
+    assert r == [3, 4, 5]
+
+def test_with_if_else() -> None:
+    r: list[int] = (x * 10 if x > 3 else x for x in [1, 2, 3, 4, 5])
+    print("with_if_else:", r)
+    assert r == [1, 2, 3, 40, 50]
+
+def test_range() -> None:
+    r: list[int] = (x ** 2 for x in range(5))
+    print("range:", r)
+    assert r == [0, 1, 4, 9, 16]
+
+def test_string() -> None:
+    r: list[str] = (c for c in "hello")
+    print("string:", r)
+    assert r == ["h", "e", "l", "l", "o"]
+
+def test_empty() -> None:
+    empty_in: list[int] = []
+    r: list[int] = (x for x in empty_in)
+    print("empty:", r)
+    assert r == empty_in
+
+def test_tuple_iter() -> None:
+    r: list[int] = (x * 2 for x in (10, 20, 30))
+    print("tuple_iter:", r)
+    assert r == [20, 40, 60]
+
+def test_nested_for() -> None:
+    r: list[int] = (x + y for x in [1, 2, 3] for y in [10, 20])
+    print("nested_for:", r)
+    assert r == [11, 21, 12, 22, 13, 23]
+
+def test_nested_with_if() -> None:
+    r: list[int] = (x + y for x in [1, 2, 3] if x > 1 for y in [10, 20] if y < 20)
+    print("nested_with_if:", r)
+    assert r == [12, 13]
+
+def test_double_filter() -> None:
+    r: list[int] = (x for x in [1, 2, 3, 4, 5, 6] if x > 2 if x < 5)
+    print("double_filter:", r)
+    assert r == [3, 4]
+
+def main() -> None:
+    test_basic()
+    test_with_if()
+    test_with_if_else()
+    test_range()
+    test_string()
+    test_empty()
+    test_tuple_iter()
+    test_nested_for()
+    test_nested_with_if()
+    test_double_filter()
+    print("ALL PASSED")
+
+main()

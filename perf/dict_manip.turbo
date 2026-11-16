@@ -1,0 +1,51 @@
+def run_dict_benchmark(n: int, rounds: int) -> int:
+    checksum: int = 0
+    r: int = 0
+    while r < rounds:
+        d: dict[int, int] = {}
+        i: int = 0
+        while i < n:
+            k: int = (i * 1103515245 + r * 12345) % (n * 2)
+            v: int = (i * 37 + r) % 10000
+            d[k] = d.get(k, 0) + v
+            i = i + 1
+
+        d2: dict[int, int] = {}
+        j: int = 0
+        while j < n // 2:
+            k2: int = (j * 2654435761 + r * 17) % (n * 2)
+            d2[k2] = j * 3 + r
+            j = j + 1
+
+        merged: dict[int, int] = d | d2
+
+        m: int = 0
+        evicted: int = 0
+        while m < n:
+            probe: int = (m * 1664525 + r) % (n * 2)
+            cur: int = merged.setdefault(probe, m)
+            if cur % 3 == 0:
+                popped: int = merged.pop(probe)
+                evicted = (evicted + popped) % 1000000007
+            elif cur % 5 == 0:
+                del merged[probe]
+                evicted = evicted + 1
+            m = m + 1
+
+        filtered: dict[int, int] = {k: v * 2 for k, v in merged.items() if v % 2 == 1}
+        d.update(filtered)
+
+        val_sum: int = 0
+        for v in d.values():
+            val_sum = (val_sum + v) % 1000000007
+
+        checksum = (checksum + len(d) + len(filtered) + evicted + val_sum) % 1000000007
+        r = r + 1
+
+    return checksum
+
+def main() -> None:
+    res: int = run_dict_benchmark(4000, 25)
+    print(res)
+
+main()

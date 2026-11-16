@@ -1,0 +1,7 @@
+def greet(name: str) -> None:
+    print("Hello from mymod, " + name + "!")
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+ANSWER: int = 42

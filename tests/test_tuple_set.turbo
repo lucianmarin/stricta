@@ -1,0 +1,48 @@
+print("=== tuple() tests ===")
+lst: list[int] = [1, 2, 3]
+t: list[int] = tuple(lst)
+print("tuple from list:", t)
+print("len:", len(t))
+print("first:", t[0])
+
+t2: list[str] = tuple("abc")
+print("tuple from str:", t2)
+
+s: set[int] = {1, 2, 3}
+t3: list[int] = tuple(s)
+print("tuple from set:", t3)
+
+t4: tuple[int, int, int] = tuple((4, 5, 6))
+print("tuple from tuple:", t4)
+
+print("=== set() tests ===")
+s1: set[int] = set([1, 2, 3, 2, 1])
+print("set from list:", s1)
+print("len:", len(s1))
+
+s2: set[str] = set("abracadabra")
+print("set from str:", s2)
+
+s3: set[int] = set((1, 2, 3))
+print("set from tuple:", s3)
+
+s4: set[int] = set({4, 5, 6})
+print("set from set:", s4)
+
+print("=== iter/next tests ===")
+it: list[int] = iter([10, 20, 30])
+print("next:", next(it))
+print("next:", next(it))
+print("next:", next(it))
+print("next on empty:", next(it, -1))
+
+it2: list[str] = iter("xyz")
+print("next from str iter:", next(it2))
+print("next from str iter:", next(it2))
+print("next from str iter:", next(it2))
+print("next from empty:", next(it2, "done"))
+
+it3: list[str] = iter({"a": 1, "b": 2})
+print("next from dict:", next(it3))
+print("next from dict:", next(it3))
+print("next from empty:", next(it3, "none"))

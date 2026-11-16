@@ -1,0 +1,20 @@
+def collatz(limit: int) -> int:
+    total_steps: int = 0
+    for i in range(1, limit):
+        n: int = i
+        steps: int = 0
+        while n > 1:
+            if n % 2 == 0:
+                n = n // 2
+            else:
+                n = 3 * n + 1
+            steps = steps + 1
+        total_steps = total_steps + steps
+    return total_steps
+
+def main() -> None:
+    print("Collatz sequence")
+    res: int = collatz(1000000)
+    print(res)
+
+main()

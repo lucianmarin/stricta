@@ -1,0 +1,29 @@
+def describe_int(val: int) -> None:
+    match val:
+        case 1:
+            print("one")
+        case 2:
+            print("two")
+        case _:
+            print("something else")
+
+def describe_str(val: str) -> None:
+    match val:
+        case "hello":
+            print("greeting")
+        case _:
+            print("something else")
+
+describe_int(1)
+describe_int(2)
+describe_str("hello")
+describe_int(42)
+
+x: int = 99
+match x:
+    case y:
+        print(y)
+
+match "anything":
+    case _:
+        print("wildcard matched")

@@ -1,0 +1,18 @@
+name: str = "Turbo"
+version: int = 42
+msg: str = f"hello {name}, version {version}"
+print("fstr1:", msg)
+
+x: int = 10
+y: int = 20
+result: str = f"{x} + {y} = {x + y}"
+print("fstr2:", result)
+
+val: float = 3.14
+print(f"pi is {val}")
+
+escaped: str = f"{{curly}} and {name}"
+print("fstr3:", escaped)
+
+nested: str = f"items: {[1, 2, 3]}"
+print("fstr4:", nested)

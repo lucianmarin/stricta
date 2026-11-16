@@ -1,0 +1,4 @@
+PKG_NAME: str = "mypkg"
+
+def pkg_info() -> None:
+    print("This is package: mypkg")

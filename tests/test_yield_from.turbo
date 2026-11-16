@@ -1,0 +1,13 @@
+def gen1() -> list[int]:
+    yield 1
+    yield 2
+
+def gen2() -> list[int]:
+    yield from gen1()
+    yield 3
+
+def main() -> None:
+    result: list[int] = gen2()
+    print("gen2():", result)
+
+main()

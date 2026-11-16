@@ -1,0 +1,12 @@
+x: str = "module"
+
+def outer() -> None:
+    x: str = "outer"
+    def inner() -> None:
+        nonlocal x
+        x = "inner"
+    inner()
+    print("outer x:", x)
+
+outer()
+print("module x:", x)

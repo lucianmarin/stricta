@@ -1,0 +1,132 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+@dataclass
+class Vec2D:
+    x: int = 0
+    y: int = 0
+
+    def norm_sq(self) -> int:
+        return self.x * self.x + self.y * self.y
+
+    def __add__(self, other: Vec2D) -> Vec2D:
+        return Vec2D(self.x + other.x, self.y + other.y)
+
+@dataclass
+class Vec3D(Vec2D):
+    z: int = 0
+
+    def norm_sq(self) -> int:
+        return self.x * self.x + self.y * self.y + self.z * self.z
+
+class Component(ABC):
+    base_val: int
+
+    def __init__(self, base_val: int) -> None:
+        self.base_val = base_val
+
+    @abstractmethod
+    def compute(self, factor: int) -> int:
+        return self.base_val * factor
+
+    @property
+    def tag_weight(self) -> int:
+        return self.base_val + 7
+
+class ScaleMixin(Component):
+    def compute(self, factor: int) -> int:
+        prev: int = super().compute(factor)
+        return (prev * 3 + 11) % 1000003
+
+    def bonus(self) -> int:
+        return self.base_val * 2
+
+class OffsetMixin(Component):
+    def compute(self, factor: int) -> int:
+        prev: int = super().compute(factor)
+        return (prev + 97) % 1000003
+
+    def penalty(self) -> int:
+        return self.base_val // 2
+
+class SmartNode(ScaleMixin, OffsetMixin):
+    node_Registry_count = 0
+    extra: int
+
+    def __init__(self, base_val: int, extra: int) -> None:
+        super().__init__(base_val)
+        self.extra = extra
+
+    def compute(self, factor: int) -> int:
+        res: int = super().compute(factor)
+        return (res + self.extra + self.bonus() - self.penalty()) % 1000003
+
+    @staticmethod
+    def combine(a: int, b: int) -> int:
+        return (a * 17 + b * 31) % 1000003
+
+    @classmethod
+    def bump_registry(cls) -> int:
+        cls.node_Registry_count = cls.node_Registry_count + 1
+        return cls.node_Registry_count
+
+class LeafNode(OffsetMixin):
+    def __init__(self, base_val: int) -> None:
+        super().__init__(base_val)
+
+    def compute(self, factor: int) -> int:
+        return (super().compute(factor) + self.tag_weight) % 1000003
+
+def main() -> None:
+    checksum: int = 0
+
+    abc_blocked: int = 0
+    try:
+        bad = Component(10)
+    except:
+        abc_blocked = 1
+    checksum = checksum + abc_blocked
+
+    r: int = 0
+    while r < 40:
+        nodes: list[Component] = []
+        i: int = 0
+        while i < 500:
+            if i % 3 == 0:
+                nodes.append(SmartNode(i + r, (i * 7) % 50))
+                SmartNode.bump_registry()
+            else:
+                nodes.append(LeafNode(i + r))
+            i = i + 1
+
+        round_acc: int = 0
+        idx: int = 0
+        while idx < len(nodes):
+            n_obj: Component = nodes[idx]
+            val: int = n_obj.compute((idx % 13) + 1)
+            if isinstance(n_obj, ScaleMixin):
+                val = SmartNode.combine(val, n_obj.tag_weight)
+            elif isinstance(n_obj, Component):
+                val = val + n_obj.tag_weight
+            round_acc = (round_acc + val) % 1000000007
+            idx = idx + 1
+
+        v_acc: Vec2D = Vec2D(0, 0)
+        eq_hits: int = 0
+        k: int = 0
+        while k < 500:
+            v1 = Vec2D(k, k * 2)
+            v2 = Vec2D(r, k)
+            v_acc = v_acc + v1 + v2
+            v3 = Vec3D(k, k * 2, r)
+            v4 = Vec3D(k, k * 2, r)
+            if v3 == v4:
+                eq_hits = eq_hits + v3.norm_sq()
+            k = k + 1
+
+        checksum = (checksum + round_acc + v_acc.norm_sq() + eq_hits + SmartNode.node_Registry_count) % 1000000007
+        r = r + 1
+
+    print(checksum)
+
+main()

@@ -1,0 +1,7 @@
+d: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+pair: tuple[str, int] = d.popitem()
+print("popped:", pair)
+print("remaining:", d)
+pair2: tuple[str, int] = d.popitem()
+print("popped:", pair2)
+print("remaining:", d)

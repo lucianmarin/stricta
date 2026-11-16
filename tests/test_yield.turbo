@@ -1,0 +1,19 @@
+def count(n: int) -> list[int]:
+    i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+def collect(gen: list[int]) -> list[int]:
+    result: list[int] = []
+    for val in gen:
+        result.append(val)
+    return result
+
+def main() -> None:
+    result: list[int] = count(5)
+    print("count(5):", result)
+    merged: list[int] = collect(count(3))
+    print("collect:", merged)
+
+main()

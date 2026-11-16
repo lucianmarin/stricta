@@ -1,0 +1,235 @@
+from dataclasses import dataclass
+
+def assert_eq_int(a: int, b: int) -> None:
+    if a != b:
+        print("FAIL:", a, "!=", b)
+        assert False
+
+def assert_eq_float(a: float, b: float) -> None:
+    if a != b:
+        print("FAIL:", a, "!=", b)
+        assert False
+
+def assert_eq_str(a: str, b: str) -> None:
+    if a != b:
+        print("FAIL:", a, "!=", b)
+        assert False
+
+def assert_eq_bool(a: bool, b: bool) -> None:
+    if a != b:
+        print("FAIL:", a, "!=", b)
+        assert False
+
+class WithStr:
+    val: str
+
+    def __init__(self, val: str) -> None:
+        self.val = val
+
+    def __str__(self) -> str:
+        return "WithStr(" + self.val + ")"
+
+def test_str() -> None:
+    print("Test __str__:")
+    obj = WithStr("hello")
+    s: str = str(obj)
+    print("  str(obj):", s)
+    assert_eq_str(s, "WithStr(hello)")
+    print("  OK")
+
+class WithRepr:
+    val: str
+
+    def __init__(self, val: str) -> None:
+        self.val = val
+
+    def __repr__(self) -> str:
+        return "WithRepr(" + self.val + ")"
+
+def test_repr() -> None:
+    print("Test __repr__:")
+    obj = WithRepr("world")
+    r: str = repr(obj)
+    print("  repr(obj):", r)
+    assert_eq_str(r, "WithRepr(world)")
+    print("  OK")
+
+class MathUtils:
+    @staticmethod
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    @staticmethod
+    def mul(a: int, b: int) -> int:
+        return a * b
+
+def test_staticmethod() -> None:
+    print("Test @staticmethod:")
+    r1: int = MathUtils.add(10, 20)
+    print("  MathUtils.add(10, 20):", r1)
+    assert_eq_int(r1, 30)
+    r2: int = MathUtils.mul(3, 4)
+    print("  MathUtils.mul(3, 4):", r2)
+    assert_eq_int(r2, 12)
+    inst = MathUtils()
+    r3: int = inst.add(5, 6)
+    print("  inst.add(5, 6):", r3)
+    assert_eq_int(r3, 11)
+    print("  OK")
+
+class Counter:
+    count = 0
+
+    @classmethod
+    def get_count(cls) -> int:
+        return cls.count
+
+    @classmethod
+    def inc(cls) -> None:
+        cls.count = cls.count + 1
+
+def test_classmethod() -> None:
+    print("Test @classmethod:")
+    c1 = Counter()
+    c2 = Counter()
+    print("  initial count:", Counter.get_count())
+    assert_eq_int(Counter.get_count(), 0)
+    Counter.inc()
+    print("  after inc:", Counter.get_count())
+    assert_eq_int(Counter.get_count(), 1)
+    c1.inc()
+    print("  after c1.inc:", Counter.get_count())
+    assert_eq_int(Counter.get_count(), 2)
+    print("  OK")
+
+class Rectangle:
+    _w: int
+    _h: int
+
+    def __init__(self, w: int, h: int) -> None:
+        self._w = w
+        self._h = h
+
+    @property
+    def area(self) -> int:
+        return self._w * self._h
+
+    @property
+    def perimeter(self) -> int:
+        return 2 * (self._w + self._h)
+
+def test_property() -> None:
+    print("Test @property:")
+    r = Rectangle(3, 4)
+    a: int = r.area
+    print("  r.area:", a)
+    assert_eq_int(a, 12)
+    p: int = r.perimeter
+    print("  r.perimeter:", p)
+    assert_eq_int(p, 14)
+    r2 = Rectangle(10, 5)
+    print("  r2.area:", r2.area)
+    assert_eq_int(r2.area, 50)
+    print("  OK")
+
+@dataclass
+class Point:
+    x: int = 0
+    y: int = 0
+
+@dataclass
+class Person:
+    name: str = ""
+    age: int = 0
+
+def test_dataclass() -> None:
+    print("Test @dataclass:")
+    p = Point(3, 4)
+    print("  p.x:", p.x, "p.y:", p.y)
+    assert_eq_int(p.x, 3)
+    assert_eq_int(p.y, 4)
+    p2 = Point()
+    print("  p2.x:", p2.x, "p2.y:", p2.y)
+    assert_eq_int(p2.x, 0)
+    assert_eq_int(p2.y, 0)
+    person = Person("Alice", 30)
+    print("  person.name:", person.name, "person.age:", person.age)
+    assert_eq_str(person.name, "Alice")
+    assert_eq_int(person.age, 30)
+    print("  OK")
+
+class Vector:
+    x: int
+    y: int
+
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+
+    def __add__(self, other: Vector) -> Vector:
+        return Vector(self.x + other.x, self.y + other.y)
+
+    def __eq__(self, other: Vector) -> bool:
+        return self.x == other.x and self.y == other.y
+
+def test_operator_overloading() -> None:
+    print("Test operator overloading:")
+    v1 = Vector(1, 2)
+    v2 = Vector(3, 4)
+    v3: Vector = v1 + v2
+    print("  v1 + v2 = Vector(", v3.x, ",", v3.y, ")")
+    assert_eq_int(v3.x, 4)
+    assert_eq_int(v3.y, 6)
+    v4 = Vector(1, 2)
+    print("  v1 == v4:", v1 == v4)
+    assert_eq_bool(v1 == v4, True)
+    print("  v1 == v2:", v1 == v2)
+    assert_eq_bool(v1 == v2, False)
+    print("  OK")
+
+class Temperature:
+    _c: float
+
+    def __init__(self, celsius: float) -> None:
+        self._c = celsius
+
+    @property
+    def fahrenheit(self) -> float:
+        return self._c * 9 / 5 + 32
+
+    @staticmethod
+    def from_f(f: float) -> Temperature:
+        return Temperature((f - 32) * 5 / 9)
+
+    def __str__(self) -> str:
+        return str(int(self._c)) + "C"
+
+    def __repr__(self) -> str:
+        return "Temperature(" + str(int(self._c)) + ")"
+
+def test_combined() -> None:
+    print("Test combined OOP:")
+    t = Temperature(100.0)
+    print("  t:", t)
+    assert_eq_str(str(t), "100C")
+    print("  repr(t):", repr(t))
+    assert_eq_str(repr(t), "Temperature(100)")
+    print("  t.fahrenheit:", t.fahrenheit)
+    assert_eq_float(t.fahrenheit, 212.0)
+    t2 = Temperature.from_f(32.0)
+    print("  from_f(32):", t2)
+    assert_eq_str(str(t2), "0C")
+    print("  OK")
+
+def main() -> None:
+    test_str()
+    test_repr()
+    test_staticmethod()
+    test_classmethod()
+    test_property()
+    test_dataclass()
+    test_operator_overloading()
+    test_combined()
+    print("=== ALL OOP TESTS PASSED ===")
+
+main()

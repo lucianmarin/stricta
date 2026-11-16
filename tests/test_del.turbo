@@ -1,0 +1,35 @@
+def test_del_list() -> None:
+    print("del list:")
+    lst: list[int] = [10, 20, 30, 40]
+    print("before:", lst)
+    del lst[1]
+    print("after del lst[1]:", lst)
+    print("len after:", len(lst))
+
+def test_del_list_negative() -> None:
+    print("del list negative:")
+    lst: list[int] = [1, 2, 3]
+    del lst[-1]
+    print("after del lst[-1]:", lst)
+
+def test_del_dict() -> None:
+    print("del dict:")
+    d: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    print("before:", d)
+    del d["b"]
+    print("after del d['b']:", d)
+
+def test_del_var() -> None:
+    print("del var:")
+    x: int = 42
+    del x
+    x = 99
+    print("x after reassign:", x)
+
+def main() -> None:
+    test_del_list()
+    test_del_list_negative()
+    test_del_dict()
+    test_del_var()
+
+main()
