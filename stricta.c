@@ -6807,24 +6807,28 @@ static void own_check_stmts(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Stmt** s
             }
             case STMT_IF: {
                 OwnCtx brs[32];
+                int mcnt = 0;
                 int bc = s->if_s.branch_count;
-                for (int b = 0; b < bc; b++) {
+                for (int b = 0; b < bc && mcnt < 31; b++) {
                     own_check_expr(mod, fn, ctx, s->if_s.conds[b], false);
-                    brs[b] = *ctx;
-                    own_check_stmts(mod, fn, &brs[b], s->if_s.bodies[b], s->if_s.body_counts[b]);
-                    own_sync_to_fn(fn, &brs[b]);
-                }
-                if (s->if_s.else_count > 0 && bc < 31) {
-                    brs[bc] = *ctx;
-                    own_check_stmts(mod, fn, &brs[bc], s->if_s.else_body, s->if_s.else_count);
-                    own_sync_to_fn(fn, &brs[bc]);
-                    own_merge_ctx(ctx, brs, bc + 1);
-                } else {
-                    if (bc < 31) {
-                        brs[bc] = *ctx;
-                        own_merge_ctx(ctx, brs, bc + 1);
+                    OwnCtx bctx = *ctx;
+                    own_check_stmts(mod, fn, &bctx, s->if_s.bodies[b], s->if_s.body_counts[b]);
+                    own_sync_to_fn(fn, &bctx);
+                    if (!stmts_definitely_returns(s->if_s.bodies[b], s->if_s.body_counts[b])) {
+                        brs[mcnt++] = bctx;
                     }
                 }
+                if (s->if_s.else_count > 0) {
+                    OwnCtx ectx = *ctx;
+                    own_check_stmts(mod, fn, &ectx, s->if_s.else_body, s->if_s.else_count);
+                    own_sync_to_fn(fn, &ectx);
+                    if (!stmts_definitely_returns(s->if_s.else_body, s->if_s.else_count) && mcnt < 32) {
+                        brs[mcnt++] = ectx;
+                    }
+                } else if (mcnt < 32) {
+                    brs[mcnt++] = *ctx;
+                }
+                if (mcnt > 0) own_merge_ctx(ctx, brs, mcnt);
                 break;
             }
             case STMT_WHILE: {
@@ -6942,22 +6946,26 @@ static void own_check_stmts(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Stmt** s
             case STMT_MATCH: {
                 own_check_expr(mod, fn, ctx, s->match_s.subject, false);
                 OwnCtx brs[32];
+                int mcnt = 0;
                 int cc = s->match_s.case_count;
                 for (int c = 0; c < cc && c < 32; c++) {
                     own_check_expr(mod, fn, ctx, s->match_s.cases[c].pattern, false);
-                    brs[c] = *ctx;
+                    OwnCtx cctx = *ctx;
                     if (s->match_s.cases[c].capture) {
                         VarSym* cv = resolve_var(mod, fn, s->match_s.cases[c].capture, NULL);
-                        int cidx = own_ensure(&brs[c], s->match_s.cases[c].capture, cv ? cv->type : NULL, fn == NULL);
+                        int cidx = own_ensure(&cctx, s->match_s.cases[c].capture, cv ? cv->type : NULL, fn == NULL);
                         if (cidx >= 0) {
-                            brs[c].slots[cidx].state = OWN_ALIVE;
-                            brs[c].slots[cidx].is_view = true;
+                            cctx.slots[cidx].state = OWN_ALIVE;
+                            cctx.slots[cidx].is_view = true;
                         }
                     }
-                    own_check_stmts(mod, fn, &brs[c], s->match_s.cases[c].body, s->match_s.cases[c].body_count);
-                    own_sync_to_fn(fn, &brs[c]);
+                    own_check_stmts(mod, fn, &cctx, s->match_s.cases[c].body, s->match_s.cases[c].body_count);
+                    own_sync_to_fn(fn, &cctx);
+                    if (!stmts_definitely_returns(s->match_s.cases[c].body, s->match_s.cases[c].body_count)) {
+                        brs[mcnt++] = cctx;
+                    }
                 }
-                if (cc > 0) own_merge_ctx(ctx, brs, cc < 32 ? cc : 32);
+                if (mcnt > 0) own_merge_ctx(ctx, brs, mcnt);
                 break;
             }
             default: break;

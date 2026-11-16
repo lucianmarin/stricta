@@ -14,40 +14,39 @@ class BSTNode:
         self.size = 1
         self.subtree_sum = val
 
+def bst_insert_node(node: BSTNode | None, key: int, val: int) -> tuple[int, int]:
+    if node is None:
+        return (0, 0)
+    if key == node.key:
+        diff: int = val - node.val
+        node.val = val
+        node.subtree_sum = node.subtree_sum + diff
+        return (0, diff)
+    elif key < node.key:
+        if node.left is None:
+            node.left = BSTNode(key, val)
+            node.size = node.size + 1
+            node.subtree_sum = node.subtree_sum + val
+            return (1, val)
+        ds, dsum = bst_insert_node(node.left, key, val)
+        node.size = node.size + ds
+        node.subtree_sum = node.subtree_sum + dsum
+        return (ds, dsum)
+    else:
+        if node.right is None:
+            node.right = BSTNode(key, val)
+            node.size = node.size + 1
+            node.subtree_sum = node.subtree_sum + val
+            return (1, val)
+        ds, dsum = bst_insert_node(node.right, key, val)
+        node.size = node.size + ds
+        node.subtree_sum = node.subtree_sum + dsum
+        return (ds, dsum)
+
 def bst_insert(root: BSTNode | None, key: int, val: int) -> BSTNode:
     if root is None:
         return BSTNode(key, val)
-    curr: BSTNode = root
-    path: list[BSTNode] = []
-    while True:
-        path.append(curr)
-        if key == curr.key:
-            diff: int = val - curr.val
-            curr.val = val
-            p_i: int = 0
-            while p_i < len(path):
-                path[p_i].subtree_sum = path[p_i].subtree_sum + diff
-                p_i = p_i + 1
-            return root
-        elif key < curr.key:
-            nxt_l: BSTNode | None = curr.left
-            if nxt_l is None:
-                curr.left = BSTNode(key, val)
-                break
-            curr = nxt_l
-        else:
-            nxt_r: BSTNode | None = curr.right
-            if nxt_r is None:
-                curr.right = BSTNode(key, val)
-                break
-            curr = nxt_r
-
-    p_i: int = 0
-    while p_i < len(path):
-        node: BSTNode = path[p_i]
-        node.size = node.size + 1
-        node.subtree_sum = node.subtree_sum + val
-        p_i = p_i + 1
+    bst_insert_node(root, key, val)
     return root
 
 def bst_range_sum(node: BSTNode | None, low: int, high: int) -> int:
@@ -65,9 +64,6 @@ def bst_range_sum(node: BSTNode | None, low: int, high: int) -> int:
 def bst_mirror_weighted(node: BSTNode | None, depth: int) -> int:
     if node is None:
         return 0
-    tmp: BSTNode | None = node.left
-    node.left = node.right
-    node.right = tmp
     l_val: int = bst_mirror_weighted(node.left, depth + 1)
     r_val: int = bst_mirror_weighted(node.right, depth + 1)
     return (node.key * depth + node.val + l_val + r_val) % 1000000007
