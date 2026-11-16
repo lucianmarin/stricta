@@ -1,34 +1,35 @@
 # Stricta TODO
 
-Features from Python not yet implemented in Stricta.
+Implementation status of Python features in Stricta (`stricta.c` + `runtime.c`).
 
 ## Types
 
-- [x] `float` — float literal parsing (`3.14`, `2.5e2`)
-- [x] `complex` — imaginary literal parsing (`4j`, `3+4j`)
-- [x] `bytes` / `bytearray` — `b"..."` literal parsing
-- [x] `tuple` — tuple literal parsing (`(1,)`, `(1, 2)`, `()`)
-- [x] `set` / `frozenset` — set literal parsing (`{1, 2}`)
-- [x] Arbitrary-precision integers (currently `long long` only, 64-bit signed)
+- [x] `int` / sized integers (`i8`–`i64`, `u8`–`u64`)
+- [x] `float` / `f32` / `f64` — float literal parsing (`3.14`, `2.5e2`)
+- [ ] `complex` — imaginary literals (`4j`, `3+4j`) and complex arithmetic
+- [x] `bytes` — `b"..."` literals and immutable byte sequences
+- [ ] `bytearray` — mutable byte arrays
+- [x] `tuple` — unboxed value structs and literals (`(1,)`, `(1, 2)`, `()`)
+- [x] `set` — monomorphized open-addressing hash sets (`{1, 2}`)
+- [ ] `frozenset` — immutable hash sets
+- [x] `bigint` — arbitrary-precision integers
+- [x] `T | None` (`Optional[T]`) & `Callable[[...], Ret]`
 
 ## Control Flow
 
-- [x] `try` / `except` / `else` / `finally` — implemented with setjmp/longjmp; supports bare `except:`, typed `except ExcType:`, `except ExcType as e:`, `else`, and `finally`
-- [x] `raise` — raises a catchable exception via `stricta_raise()`; prints "Unhandled exception" and exits if no matching handler
-- [x] `assert` — parsed, codegen checks truthiness and calls `exit(1)` on failure; assertion message is evaluated and printed when present
-- [x] `with` — parsed, codegen assigns context manager to variable and wraps body in bare block; no `__enter__` / `__exit__` calls
-  - [x] calls `__enter__()` and binds result to `as` variable
-  - [x] wraps body in try/finally via setjmp/longjmp
-  - [x] calls `__exit__(exc_type, exc_val, None)` with proper args
-  - [x] re-raises exception if `__exit__` returns false
-- [x] `async` / `await` — parsed and codegen produces sync C code; `async def/for/with` are handled; `await` evaluates the expression synchronously
-- [x] `match` / `case` — pattern matching implemented via if/elif chain; supports literal, capture, and wildcard (`_`) patterns
+- [x] `try` / `except` / `else` / `finally` — implemented via `setjmp`/`longjmp`; supports bare `except:`, typed `except ExcType:`, `except ExcType as e:`, `else`, and `finally`
+- [x] `raise` — raises a catchable exception via `stricta_raise()`; prints error and exits if unhandled
+- [x] `assert` — checks condition and exits on failure; evaluates and prints optional assertion message
+- [x] `with` — full context manager protocol (`__enter__`, `try`/`finally` via `setjmp`/`longjmp`, `__exit__`, re-raises when `__exit__` returns false)
+- [x] `async` / `await` — parsed and executed synchronously
+- [ ] True async event loop / coroutines (`async def` / `await` suspension)
+- [x] `match` / `case` — pattern matching supporting literal, capture, and wildcard (`_`) patterns
 - [x] `for` / `else`, `while` / `else` — else clauses on loops
-- [x] `del` — removes list elements and dict keys via `stricta_delitem`; variables set to `stricta_none`
-- [x] `global` / `nonlocal` — names excluded from local variable declarations; `global` resolves to module-level globals; `nonlocal` prevents local shadowing (full closure support not yet implemented)
-- [x] `yield` / `yield from` — implemented via eager list collection: generator functions collect yielded values into a list and return it at the end; `yield from` iterates the sub-iterator and appends each value
-- [x] `lambda` — codegen generates a proper C function and returns `make_func(...)`
-- [x] `@decorator` — parsed and applied in codegen via `stricta_call`; supports stacking and class decorators
+- [x] `del` — removes list elements and dict keys
+- [x] `global` / `nonlocal` — module-level globals and nested-function variable access
+- [x] `yield` / `yield from` — eager list collection (`list[T]`); `yield from` extends from sub-iterables
+- [x] `lambda` — compiled to typed LLVM functions with bidirectional type inference
+- [x] `@decorator` — parsed and applied to functions and classes; supports stacking
 - [x] Ternary conditional: `x if cond else y`
 - [x] Walrus operator: `:=`
 
@@ -38,106 +39,66 @@ Features from Python not yet implemented in Stricta.
 - [x] `//` — floor division
 - [x] Bitwise: `&`, `|`, `^`, `~`, `<<`, `>>`
 - [x] `@` — matrix multiplication on lists of lists with dimension validation
-- [x] Augmented assignments: `*=`, `/=`, `%=`, `//=`, `**=`, `&=`, `|=`, `^=`, `>>=`, `<<=`, `@=`
+- [x] Augmented assignments: `+=`, `-=`, `*=`, `/=`, `%=`, `//=`, `**=`, `&=`, `|=`, `^=`, `>>=`, `<<=`, `@=`
 
 ## Comprehensions
 
 - [x] List comprehensions: `[x for x in y]`
 - [x] Dict comprehensions: `{k: v for k, v in x}`
 - [x] Set comprehensions: `{x for x in y}`
-- [x] Generator expressions: `(x for x in y)`
+- [x] Generator expressions: `(x for x in y)` (fused into zero-allocation loops for `sum(...)`)
 
 ## String Methods
 
-- [x] `.join(iterable)` — join strings with separator
+- [x] `.split()` / `.join(iterable)` — split and join strings
 - [x] `.upper()` / `.lower()` — case conversion
 - [x] `.replace(old, new)` — substring replacement
 - [x] `.find(sub)` / `.index(sub)` — substring search
 - [x] `.strip()` / `.lstrip()` / `.rstrip()` — trim whitespace
 - [x] `.startswith(prefix)` / `.endswith(suffix)` — prefix/suffix check
 - [x] `.count(sub)` — count occurrences
-- [x] `.format(*args)` — string formatting
-- [x] f-strings: `f"hello {name}"` — lexer tokenizes as plain string, no expression interpolation
+- [x] `.format(*args)` — string formatting (including `:.Nf` float precision)
+- [x] f-strings: `f"hello {name}"` — full expression interpolation and `{{`/`}}` escaping
 - [x] Triple-quoted strings: `"""..."""` / `'''...'''`
 
-## List Methods
+## List, Set, and Dict Methods
 
-- [x] `.extend(iterable)` — extend list with elements
-- [x] `.insert(index, item)` — insert at position
-- [x] `.remove(item)` — remove first occurrence
-- [x] `.index(item)` — find first index
-- [x] `.count(item)` — count occurrences
-- [x] `.sort()` / `.reverse()` — in-place sorting / reversal
-- [x] `.copy()` / `.clear()` — shallow copy / clear
-
-## Dict Methods
-
-- [x] `.keys()` — view of keys
-- [x] `.values()` — view of values
-- [x] `.items()` — view of key-value pairs
-- [x] `.get(key, default)` — safe lookup with fallback
-- [x] `.pop(key)` — remove and return
-- [x] `.popitem()` — remove and return arbitrary pair
-- [x] `.update(other)` — merge another dict
-- [x] `.clear()` / `.copy()` — clear / shallow copy
-- [x] `.setdefault(key, default)` — insert if missing
+- [x] List: `.append()`, `.extend()`, `.insert()`, `.remove()`, `.pop()`, `.index()`, `.count()`, `.sort()`, `.reverse()`, `.copy()`, `.clear()`
+- [x] Set: `.add()`, `.remove()`, `.discard()`, `.pop()`, `.clear()`, `.copy()`, `.union()`, `.intersection()`, `.difference()`, `.symmetric_difference()`, `.update()`, `.intersection_update()`, `.difference_update()`, `.symmetric_difference_update()`, `.issubset()`, `.issuperset()`, `.isdisjoint()`
+- [x] Dict: `.keys()`, `.values()`, `.items()`, `.get()`, `.pop()`, `.popitem()`, `.update()`, `.clear()`, `.copy()`, `.setdefault()`
 
 ## Built-in Functions
 
-- [x] `input(prompt)` — read from stdin
-- [x] `type(obj)` — get type name
-- [x] `isinstance(obj, type)` — type check
-- [x] `hasattr` / `getattr` / `setattr` — attribute introspection
-- [x] `repr(obj)` — unambiguous string representation
-- [x] `abs(x)` — absolute value
-- [x] `round(x)` — round to nearest integer
-- [x] `pow(x, y)` — exponentiation
-- [x] `hex(x)` / `bin(x)` / `oct(x)` — base conversion
-- [x] `float(x)` — convert to float
-- [x] `bool(x)` — convert to bool
-- [x] `list(x)` / `dict(x)` — type constructors
-- [x] `tuple(x)` / `set(x)` — type constructors
-- [ ] `super()` — access parent class (stub, returns None; requires inheritance support)
+- [x] `print`, `len`, `str`, `repr`, `int` (`i8`–`i64`, `u8`–`u64`), `float` (`f32`, `f64`), `bool`, `bigint`
+- [x] `ord`, `chr`, `hex`, `bin`, `oct`, `abs`, `round`, `pow`
+- [x] `sum`, `min`, `max`, `all`, `any`, `sorted(..., key=...)`, `reversed`
+- [x] `map`, `filter`, `enumerate`, `zip` (2 iterables), `range`
+- [x] `list`, `set`, `dict`, `tuple`
+- [x] `open` (default `"r"`), `input`, `isinstance`, `super()`, `iter`, `next`
+- [ ] `type(obj)` — runtime type inspection
+- [ ] `hasattr` / `getattr` / `setattr` — dynamic attribute introspection
 - [ ] `eval(expr)` / `exec(code)` — dynamic evaluation (requires runtime compiler embedding)
-- [x] `iter(obj)` / `next(obj)` — iterator protocol (`iter` returns list; `next` pops from front with optional default)
-- [x] `all(iterable)` / `any(iterable)` — predicate checks
-- [x] `sum(iterable)` / `min(iterable)` / `max(iterable)` — aggregation
-- [x] `sorted(iterable)` — return sorted list
-- [x] `reversed(iterable)` — return reversed list copy
-- [x] `enumerate(iterable)` — indexed iteration
-- [x] `zip(*iterables)` — parallel iteration
-- [x] `map(func, iterable)` / `filter(func, iterable)` — functional tools
 
 ## Object-Oriented Programming
 
-- [x] `@staticmethod` — static methods
-- [x] `@classmethod` — class methods
-- [x] `@property` — computed attributes
-- [x] `@dataclass` — auto-generated boilerplate
-- [ ] `super()` — parent class method resolution (runtime stub only)
+- [x] `@staticmethod`, `@classmethod`, `@property`
+- [x] `@dataclass` — auto-generated constructor/equality; by-value structs for non-recursive dataclasses
+- [x] `super()` — cooperative C3 MRO method dispatch
+- [x] `ABC` / `@abstractmethod` — abstract base class enforcement
 - [x] `__str__` / `__repr__` — string representation protocol
 - [x] Operator overloading: `__add__`, `__eq__`, `__lt__`, etc.
-- [ ] `__slots__` — memory-efficient attribute declaration
+- [ ] `__slots__` — explicit slot enforcement
 - [ ] `__new__` / metaclasses — custom instance creation
-- [ ] Abstract base classes
 
 ## Module System
 
-- [x] Real `import` — actual module loading (currently a stub)
-- [x] `__init__.py` — package initialization
-- [ ] Standard library: `sys`, `os`, `math`, `json`, `re`, `time`, etc.
+- [x] `import` / `from ... import ...` — resolves `.str` modules and `pkg/__init__.str` packages
+- [x] Built-in modules: `sys.argv`, `abc`, `dataclasses`, `typing`
+- [ ] Standard library: `os`, `math`, `json`, `re`, `time`, full `sys`, etc.
 
-## Other
+## Typing, Memory, and Other
 
-- [ ] Type hints: `def foo(x: int) -> str:` — parsed and silently skipped (no effect)
-- [ ] `__name__ == "__main__"` idiom
-- [ ] Docstrings (triple-quoted expression statements) — lexer parses, not extracted or used
+- [x] Static type checking & compile-time inference — parameter/return/field checking, default-value inference, local/container/lambda inference, `is None` & `isinstance()` flow narrowing, stack allocation of non-escaping locals
+- [ ] `__name__ == "__main__"` module guard variable
 - [ ] Step parameter in slicing: `seq[start:stop:step]`
-- [ ] Garbage collector or reference counting (currently malloc-only)
-- [x] Package system / `__init__.py`
-
-## Extras
-
-- [x] File context manager protocol — `open()` file objects support `__enter__`/`__exit__`
-- [x] `open()` default mode — accepts 1 arg, defaults to `"r"`
-- [x] `str.format()` format specifiers — supports `:.Nf` for float precision
+- [ ] Garbage collector or reference counting (currently stack allocation for non-escaping locals + `malloc`)

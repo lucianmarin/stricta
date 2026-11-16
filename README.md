@@ -1,4 +1,4 @@
-# Stricta: A Strict Compiled Version of Python
+# Stricta Programming Language
 
 Stricta is a **strict compiled version of Python** (`.str` extension)—an ahead-of-time statically typed language with Python syntax that compiles directly to native machine code via a single-file C11 compiler (`stricta.c`), LLVM IR (`.ll`), and `clang -O2`, with **zero dynamic fallback or NaN-boxing**.
 
