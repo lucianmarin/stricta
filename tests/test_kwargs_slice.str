@@ -21,6 +21,13 @@ def pick(first, second: str = "def") -> str:
 assert pick(second="ok", first=42) == "42:ok"
 assert pick(first=7) == "7:def"
 
+# Generic function calling a keyword-arg function across multiple type instantiations
+def wrap_pick(val) -> str:
+    return pick(second="wrapped", first=val)
+
+assert wrap_pick(99) == "99:wrapped"
+assert wrap_pick("hi") == "hi:wrapped"
+
 # @dataclass + class __init__ + methods + super() with kwargs
 @dataclass
 class Config:

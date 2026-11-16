@@ -162,7 +162,7 @@ typedef enum {
     TOK_IN, TOK_NOT, TOK_AND, TOK_OR, TOK_IS, TOK_RETURN, TOK_PASS,
     TOK_BREAK, TOK_CONTINUE, TOK_RAISE, TOK_ASSERT, TOK_DEL, TOK_GLOBAL,
     TOK_NONLOCAL, TOK_TRY, TOK_EXCEPT, TOK_FINALLY, TOK_WITH, TOK_AS,
-    TOK_IMPORT, TOK_FROM, TOK_MATCH, TOK_CASE, TOK_YIELD, TOK_LAMBDA,
+    TOK_IMPORT, TOK_FROM, TOK_YIELD, TOK_LAMBDA,
     TOK_TRUE, TOK_FALSE, TOK_NONE, TOK_ASYNC, TOK_AWAIT,
     /* Operators & Punctuation */
     TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_DSLASH, TOK_PERCENT, TOK_DSTAR,
@@ -2821,6 +2821,10 @@ static Expr* clone_expr(Expr* e) {
             if (e->call.arg_count > 0) {
                 c->call.args = (Expr**)arena_alloc(sizeof(Expr*) * (size_t)e->call.arg_count);
                 for (int i = 0; i < e->call.arg_count; i++) c->call.args[i] = clone_expr(e->call.args[i]);
+                if (e->call.kw_names) {
+                    c->call.kw_names = (const char**)arena_alloc(sizeof(char*) * (size_t)e->call.arg_count);
+                    memcpy(c->call.kw_names, e->call.kw_names, sizeof(char*) * (size_t)e->call.arg_count);
+                }
             }
             break;
         case EXPR_ATTR:
@@ -3287,6 +3291,15 @@ static bool call_has_kwargs(Expr* call) {
     return false;
 }
 
+static void reject_unexpected_kwargs(Expr* call, const char* fn_desc) {
+    if (!call || call->kind != EXPR_CALL || !call->call.kw_names) return;
+    for (int i = 0; i < call->call.arg_count; i++) {
+        if (call->call.kw_names[i]) {
+            error_at(call->call.args[i]->loc, "%s got an unexpected keyword argument '%s'", fn_desc, call->call.kw_names[i]);
+        }
+    }
+}
+
 static void normalize_call_args(Expr* call, const char** pnames, Expr** pdefaults,
                                 int param_count, int start_p, const char* fn_desc) {
     if (!call_has_kwargs(call)) return;
@@ -3349,6 +3362,10 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
     (void)hint;
     int argc = call->call.arg_count;
     Expr** args = call->call.args;
+
+    if (obj_ty->kind != TY_CLASS && obj_ty->kind != TY_MODULE) {
+        reject_unexpected_kwargs(call, arena_sprintf("%s.%s()", type_str(obj_ty), mname));
+    }
 
     if (obj_ty->kind == TY_STR) {
         if (strcmp(mname, "split") == 0) {
@@ -3583,6 +3600,7 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
 
         FuncInfo* m = find_method_in_class(cls, mname);
         if (!m && strcmp(mname, "copy") == 0 && argc == 0) {
+            reject_unexpected_kwargs(call, arena_sprintf("%s.copy()", cls->name));
             return obj_ty;
         }
         if (!m) error_at(call->loc, "class '%s' has no method '%s'", cls->name, mname);
@@ -3676,6 +3694,8 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
                 normalize_dataclass_args(call, mci);
                 args = call->call.args; argc = call->call.arg_count;
                 for (int i = 0; i < argc && i < mci->field_count; i++) check_expr(mod, fn, args[i], mci->fields[i].type);
+            } else {
+                reject_unexpected_kwargs(call, arena_sprintf("%s.%s()", mmod->name, mname));
             }
             return mci->type;
         }
@@ -4260,10 +4280,13 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 }
                 if (strcmp(cname, "sorted") == 0) {
                     if (argc < 1 || argc > 2) error_at(e->loc, "sorted() takes 1 or 2 arguments");
+                    if (e->call.kw_names && e->call.kw_names[0]) {
+                        error_at(args[0]->loc, "sorted() first argument must be positional");
+                    }
                     Type* at = check_expr(mod, fn, args[0], NULL);
                     Type* el = iter_element_type(at, args[0]->loc);
                     if (argc == 2) {
-                        if (e->call.kw_names[1] && strcmp(e->call.kw_names[1], "key") != 0) {
+                        if (e->call.kw_names && e->call.kw_names[1] && strcmp(e->call.kw_names[1], "key") != 0) {
                             error_at(args[1]->loc, "sorted() unsupported keyword argument '%s'", e->call.kw_names[1]);
                         }
                         Type* kh_params[1] = {el};
@@ -4273,6 +4296,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                             error_at(args[1]->loc, "sorted() key function must accept '%s'", type_str(el));
                         }
                     }
+                    e->call.kw_names = NULL;
                     res = make_list_type(el); break;
                 }
                 if (strcmp(cname, "reversed") == 0) {
@@ -4493,6 +4517,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
 
             Type* ct = check_expr(mod, fn, callee, NULL);
             if (ct->kind != TY_FUNC) error_at(e->loc, "expression of type '%s' is not callable", type_str(ct));
+            reject_unexpected_kwargs(e, "callable");
             if (argc != ct->func_param_count) error_at(e->loc, "callable expects %d args, got %d", ct->func_param_count, argc);
             for (int i = 0; i < argc; i++) {
                 Type* at = check_expr(mod, fn, args[i], ct->func_params[i]);
@@ -4503,6 +4528,10 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
             res = ct->func_ret;
             break;
         }
+    }
+
+    if (e->kind == EXPR_CALL) {
+        reject_unexpected_kwargs(e, (e->call.callee->kind == EXPR_VAR) ? arena_sprintf("%s()", e->call.callee->var.name) : "call");
     }
 
     if (!res) res = g_ty_void;
@@ -14313,7 +14342,7 @@ int main(int argc, char** argv) {
         free(ecopy);
     }
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <input.str> [-o <output>] [-I <dir>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input.str> [-o <output>] [-I <dir>] [-M <[scope:]alias=dir>]\n", argv[0]);
         return 1;
     }
     const char* input_file = NULL;
@@ -14334,7 +14363,7 @@ int main(int argc, char** argv) {
         }
     }
     if (!input_file) {
-        fprintf(stderr, "Usage: %s <input.str> [-o <output>] [-I <dir>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input.str> [-o <output>] [-I <dir>] [-M <[scope:]alias=dir>]\n", argv[0]);
         return 1;
     }
     if (!output_file) {
