@@ -1,0 +1,149 @@
+class Box:
+    label: str
+    items: list[str]
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.items = []
+
+    def push(self, v: str) -> None:
+        self.items.append(v)
+
+class BaseItem:
+    tag: str
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+class SubItem(BaseItem):
+    extra: list[str]
+    def __init__(self, tag: str, x: str) -> None:
+        super().__init__(tag)
+        self.extra = [x]
+
+def take_str(s: str) -> int:
+    owned = s
+    return len(owned)
+
+def borrow_str(s: str) -> int:
+    return len(s)
+
+def mutate_box(b: Box, item: str) -> None:
+    b.push(item)
+
+def test_moves_and_borrows() -> None:
+    s = "hello" + " world"
+    assert borrow_str(s) == 11
+    assert borrow_str(s) == 11
+    assert take_str(s) == 11
+
+    b = Box("bag")
+    mutate_box(b, "alpha" + "_1")
+    mutate_box(b, "beta" + "_2")
+    assert len(b.items) == 2
+    assert b.items[0] == "alpha_1"
+
+    # NLL dead-view release: borrow ends after last use of view
+    lbl = b.label
+    assert lbl == "bag"
+    b.label = "renamed" + "!"
+    assert b.label == "renamed!"
+
+def test_copy_all_owned_types() -> None:
+    s1 = "abc" + "def"
+    s2 = s1.copy()
+    assert take_str(s1) == 6
+    assert s2 == "abcdef"
+
+    bs1 = b"xyz"
+    bs2 = bs1.copy()
+    assert bs1 == bs2
+
+    bi1: bigint = bigint(1234567890) * bigint(1000000000)
+    bi2 = bi1.copy()
+    assert bi1 == bi2
+
+    t1: tuple[str, int] = ("k" + "1", 42)
+    t2 = t1.copy()
+    assert t1[0] == t2[0] and t1[1] == t2[1]
+
+    b1 = Box("orig")
+    b1.push("item" + "1")
+    b2 = b1.copy()
+    b2.push("item" + "2")
+    assert len(b1.items) == 1
+    assert len(b2.items) == 2
+
+def test_container_drops() -> None:
+    xs: list[str] = ["a" + "1", "b" + "2", "c" + "3"]
+    xs[0] = "x" + "1"
+    popped = xs.pop(1)
+    assert popped == "b2"
+    del xs[0]
+    assert len(xs) == 1
+    xs.clear()
+    assert len(xs) == 0
+
+    st: set[str] = {"p" + "1", "p" + "1", "q" + "2"}
+    assert len(st) == 2
+    st.add("p" + "1")
+    assert len(st) == 2
+    st.discard("p1")
+    assert len(st) == 1
+    st.clear()
+
+    d: dict[str, str] = {"k" + "1": "v" + "1"}
+    d["k" + "1"] = "v" + "2"
+    got = d.get("k1", "def" + "!")
+    assert got == "v2"
+    got2 = d.get("missing", "def" + "!")
+    assert got2 == "def!"
+    sd = d.setdefault("k1", "unused" + "!")
+    assert sd == "v2"
+    sd2 = d.setdefault("k" + "2", "added" + "!")
+    assert sd2 == "added!"
+    pv = d.pop("k1")
+    assert pv == "v2"
+    k, v = d.popitem()
+    assert k == "k2" and v == "added!"
+    d.clear()
+
+def may_fail(flag: bool) -> str:
+    tmp = "temp_" + "local"
+    if flag:
+        raise "boom"
+    return tmp
+
+def test_unwind_and_polymorphic_drops() -> None:
+    caught = ""
+    cleanup_ran = False
+    try:
+        local_before = "keep_" + "then_drop"
+        assert len(local_before) == 14
+        s = "prefix_" + may_fail(True)
+        print(s)
+    except Exception as e:
+        caught = e.copy()
+    finally:
+        cleanup_ran = True
+    assert caught == "boom"
+    assert cleanup_ran
+
+    ok = may_fail(False)
+    assert ok == "temp_local"
+
+    # Polymorphic drop through base class reference
+    poly: BaseItem = SubItem("t" + "1", "x" + "1")
+    assert poly.tag == "t1"
+
+    # Non-escaping stack-allocated list of owned strings
+    stk = ["s" + "1", "s" + "2", "s" + "3"]
+    assert len(stk) == 3 and stk[2] == "s3"
+
+def main() -> None:
+    test_moves_and_borrows()
+    test_copy_all_owned_types()
+    test_container_drops()
+    test_unwind_and_polymorphic_drops()
+    print("ALL OWNERSHIP TESTS PASSED")
+
+main()

@@ -17,10 +17,10 @@ Implementation status of Python features in Stricta (`stricta.c` + `runtime.c`).
 
 ## Control Flow
 
-- [x] `try` / `except` / `else` / `finally` — implemented via `setjmp`/`longjmp`; supports bare `except:`, typed `except ExcType:`, `except ExcType as e:`, `else`, and `finally`
-- [x] `raise` — raises a catchable exception via `stricta_raise()`; prints error and exits if unhandled
+- [x] `try` / `except` / `else` / `finally` — implemented via compiler-lowered `{ i1, T }` error propagation (with deterministic unwind drops); supports bare `except:`, typed `except ExcType:`, `except ExcType as e:`, `else`, and `finally`
+- [x] `raise` — raises a catchable exception via compiler-lowered propagation and `stricta_set_exc()`; prints error and exits if unhandled
 - [x] `assert` — checks condition and exits on failure; evaluates and prints optional assertion message
-- [x] `with` — full context manager protocol (`__enter__`, `try`/`finally` via `setjmp`/`longjmp`, `__exit__`, re-raises when `__exit__` returns false)
+- [x] `with` — full context manager protocol (`__enter__`, `try`/`finally` error propagation, `__exit__`, re-raises when `__exit__` returns false)
 - [x] `async` / `await` — parsed and executed synchronously
 - [ ] True async event loop / coroutines (`async def` / `await` suspension)
 - [x] `match` / `case` — pattern matching supporting literal, capture, and wildcard (`_`) patterns
@@ -99,6 +99,6 @@ Implementation status of Python features in Stricta (`stricta.c` + `runtime.c`).
 ## Typing, Memory, and Other
 
 - [x] Static type checking & compile-time inference — parameter/return/field checking, default-value inference, local/container/lambda inference, `is None` & `isinstance()` flow narrowing, stack allocation of non-escaping locals
+- [x] Rust-style memory safety without ARC/GC — compile-time ownership & borrow checking (`BORROW`/`MUT_BORROW`/`MOVE` modes, NLL), monomorphized `@_drop_T`/`@_clone_T`, runtime drop flags, and bounds traps
 - [ ] `__name__ == "__main__"` module guard variable
 - [ ] Step parameter in slicing: `seq[start:stop:step]`
-- [ ] Garbage collector or reference counting (currently stack allocation for non-escaping locals + `malloc`)

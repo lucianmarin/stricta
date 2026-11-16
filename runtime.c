@@ -49,46 +49,27 @@ void stricta_init_args(int32_t argc, char** argv) {
     stricta_sys_argv = lst;
 }
 
-/* --- Exception Handling --- */
+/* --- Exception Handling (Compiler-Lowered Propagation) --- */
 
-#define STRICTA_MAX_TRY_DEPTH 128
-static jmp_buf _try_stack[STRICTA_MAX_TRY_DEPTH];
-static int32_t _try_depth = 0;
 static int32_t _exc_type_id = 0;
 static void* _exc_obj = NULL;
 static StrictaStr* _exc_msg = NULL;
 
-jmp_buf* stricta_try_push(void) {
-    if (_try_depth >= STRICTA_MAX_TRY_DEPTH) {
-        fprintf(stderr, "RuntimeError: maximum try nesting depth exceeded\n");
-        exit(1);
-    }
-    return &_try_stack[_try_depth++];
-}
-
-void stricta_try_pop(void) {
-    if (_try_depth > 0) _try_depth--;
-}
-
-void stricta_raise(int32_t type_id, void* exc_obj, const char* msg) {
+void stricta_set_exc(int32_t type_id, void* exc_obj, const char* msg) {
+    if (_exc_msg) { stricta_str_free(_exc_msg); _exc_msg = NULL; }
     _exc_type_id = type_id;
     _exc_obj = exc_obj;
     _exc_msg = msg ? stricta_str_cstr(msg) : stricta_str_cstr("");
-    if (_try_depth > 0) {
-        longjmp(_try_stack[_try_depth - 1], 1);
-    }
-    if (msg && msg[0] != '\0') {
-        fprintf(stderr, "Unhandled exception: %s\n", msg);
-    } else {
-        fprintf(stderr, "Unhandled exception (type_id=%d)\n", type_id);
-    }
-    exit(1);
 }
 
-void stricta_reraise(void) {
-    if (_try_depth > 0) {
-        longjmp(_try_stack[_try_depth - 1], 1);
-    }
+void stricta_clear_exc(int32_t free_obj) {
+    if (_exc_msg) { stricta_str_free(_exc_msg); _exc_msg = NULL; }
+    if (free_obj && _exc_obj) { free(_exc_obj); }
+    _exc_obj = NULL;
+    _exc_type_id = 0;
+}
+
+void stricta_unhandled_exc(void) {
     if (_exc_msg && _exc_msg->length > 0) {
         fprintf(stderr, "Unhandled exception: %s\n", _exc_msg->chars);
     } else {
@@ -110,6 +91,12 @@ void stricta_assert_fail(const char* msg, const char* file, int32_t line) {
     exit(1);
 }
 
+void stricta_bounds_fail(int64_t idx, int64_t len, const char* file, int32_t line) {
+    fprintf(stderr, "IndexError (%s:%d): index %lld out of range for length %lld\n",
+            file ? file : "<unknown>", line, (long long)idx, (long long)len);
+    exit(1);
+}
+
 /* --- Strings --- */
 
 static uint32_t fnv1a_32(const char* s, int32_t len) {
@@ -125,10 +112,23 @@ StrictaStr* stricta_str_new(const char* s, int32_t len) {
     StrictaStr* st = (StrictaStr*)stricta_alloc(sizeof(StrictaStr));
     st->length = len;
     st->hash = 0;
+    st->is_static = 0;
     st->chars = (char*)stricta_alloc((size_t)len + 1);
     if (len > 0 && s) memcpy(st->chars, s, (size_t)len);
     st->chars[len] = '\0';
     return st;
+}
+
+void stricta_str_free(StrictaStr* s) {
+    if (s && !s->is_static) {
+        free(s->chars);
+        free(s);
+    }
+}
+
+StrictaStr* stricta_str_clone(StrictaStr* s) {
+    if (!s || s->is_static) return s;
+    return stricta_str_new(s->chars, s->length);
 }
 
 StrictaStr* stricta_str_cstr(const char* s) {
@@ -142,6 +142,7 @@ StrictaStr* stricta_str_concat(StrictaStr* a, StrictaStr* b) {
     StrictaStr* st = (StrictaStr*)stricta_alloc(sizeof(StrictaStr));
     st->length = la + lb;
     st->hash = 0;
+    st->is_static = 0;
     st->chars = (char*)stricta_alloc((size_t)st->length + 1);
     if (la > 0) memcpy(st->chars, a->chars, (size_t)la);
     if (lb > 0) memcpy(st->chars + la, b->chars, (size_t)lb);
@@ -155,6 +156,7 @@ StrictaStr* stricta_str_repeat(StrictaStr* s, int64_t count) {
     StrictaStr* st = (StrictaStr*)stricta_alloc(sizeof(StrictaStr));
     st->length = (int32_t)total;
     st->hash = 0;
+    st->is_static = 0;
     st->chars = (char*)stricta_alloc((size_t)total + 1);
     for (int64_t i = 0; i < count; i++) {
         memcpy(st->chars + i * s->length, s->chars, (size_t)s->length);
@@ -176,11 +178,11 @@ StrictaStr* stricta_str_slice(StrictaStr* s, int64_t start, int64_t end) {
 
 StrictaStr* stricta_str_char_at(StrictaStr* s, int64_t idx) {
     if (!s || s->length == 0) {
-        stricta_raise(1, NULL, "IndexError: string index out of range");
+        stricta_bounds_fail(idx, 0, "<str>", 0);
     }
     if (idx < 0) idx += s->length;
     if (idx < 0 || idx >= s->length) {
-        stricta_raise(1, NULL, "IndexError: string index out of range");
+        stricta_bounds_fail(idx, s->length, "<str>", 0);
     }
     return stricta_str_new(&s->chars[idx], 1);
 }
@@ -250,7 +252,8 @@ StrictaPtrList* stricta_str_split(StrictaStr* s, StrictaStr* sep) {
     }
 
     if (sep->length == 0) {
-        stricta_raise(2, NULL, "ValueError: empty separator");
+        stricta_set_exc(2, NULL, "ValueError: empty separator");
+        stricta_unhandled_exc();
     }
 
     int32_t pos = 0;
@@ -279,6 +282,7 @@ StrictaStr* stricta_str_join(StrictaStr* sep, StrictaPtrList* list) {
     StrictaStr* out = (StrictaStr*)stricta_alloc(sizeof(StrictaStr));
     out->length = (int32_t)total;
     out->hash = 0;
+    out->is_static = 0;
     out->chars = (char*)stricta_alloc(total + 1);
     size_t off = 0;
     for (int32_t i = 0; i < list->length; i++) {
@@ -311,18 +315,19 @@ StrictaStr* stricta_str_lower(StrictaStr* s) {
 }
 
 StrictaStr* stricta_str_replace(StrictaStr* s, StrictaStr* old_s, StrictaStr* new_s) {
-    if (!s || !old_s || !new_s || old_s->length == 0) return s ? s : stricta_str_new("", 0);
+    if (!s || !old_s || !new_s || old_s->length == 0) return s ? stricta_str_clone(s) : stricta_str_new("", 0);
     int32_t count = 0;
     const char* p = s->chars;
     while ((p = strstr(p, old_s->chars)) != NULL) {
         count++;
         p += old_s->length;
     }
-    if (count == 0) return s;
+    if (count == 0) return stricta_str_clone(s);
     size_t new_len = (size_t)s->length + (size_t)count * (size_t)(new_s->length - old_s->length);
     StrictaStr* out = (StrictaStr*)stricta_alloc(sizeof(StrictaStr));
     out->length = (int32_t)new_len;
     out->hash = 0;
+    out->is_static = 0;
     out->chars = (char*)stricta_alloc(new_len + 1);
     char* dst = out->chars;
     p = s->chars;
@@ -350,7 +355,10 @@ int64_t stricta_str_find(StrictaStr* s, StrictaStr* sub) {
 
 int64_t stricta_str_index(StrictaStr* s, StrictaStr* sub) {
     int64_t idx = stricta_str_find(s, sub);
-    if (idx < 0) stricta_raise(2, NULL, "ValueError: substring not found");
+    if (idx < 0) {
+        stricta_set_exc(2, NULL, "ValueError: substring not found");
+        stricta_unhandled_exc();
+    }
     return idx;
 }
 
@@ -510,11 +518,23 @@ int64_t stricta_pow_i64(int64_t base, int64_t exp) {
 StrictaBytes* stricta_bytes_new(const uint8_t* data, int32_t len) {
     StrictaBytes* b = (StrictaBytes*)stricta_alloc(sizeof(StrictaBytes));
     b->length = len;
-    b->_pad = 0;
+    b->is_static = 0;
     b->data = (uint8_t*)stricta_alloc((size_t)len + 1);
     if (len > 0 && data) memcpy(b->data, data, (size_t)len);
     b->data[len] = 0;
     return b;
+}
+
+void stricta_bytes_free(StrictaBytes* b) {
+    if (b && !b->is_static) {
+        free(b->data);
+        free(b);
+    }
+}
+
+StrictaBytes* stricta_bytes_clone(StrictaBytes* b) {
+    if (!b || b->is_static) return b;
+    return stricta_bytes_new(b->data, b->length);
 }
 
 int32_t stricta_bytes_eq(StrictaBytes* a, StrictaBytes* b) {
@@ -646,7 +666,8 @@ StrictaBigInt* stricta_bigint_mul(StrictaBigInt* a, StrictaBigInt* b) {
 
 StrictaBigInt* stricta_bigint_div(StrictaBigInt* a, StrictaBigInt* b) {
     if (b->length == 1 && b->digits[0] == '0') {
-        stricta_raise(3, NULL, "ZeroDivisionError: integer division by zero");
+        stricta_set_exc(3, NULL, "ZeroDivisionError: integer division by zero");
+        stricta_unhandled_exc();
     }
     if (bi_abs_cmp(a->digits, a->length, b->digits, b->length) < 0) {
         if (a->sign == b->sign || (a->length == 1 && a->digits[0] == '0')) return stricta_bigint_from_str("0");
@@ -654,9 +675,14 @@ StrictaBigInt* stricta_bigint_div(StrictaBigInt* a, StrictaBigInt* b) {
     }
     char* res = (char*)stricta_calloc((size_t)a->length + 1, 1);
     int ri = 0;
-    char* cur = (char*)stricta_alloc((size_t)a->length + 1);
+    size_t cur_cap = (size_t)a->length + 2;
+    char* cur = (char*)stricta_alloc(cur_cap);
     int cl = 0;
     for (int i = 0; i < a->length; i++) {
+        if ((size_t)cl + 2 > cur_cap) {
+            cur_cap = (size_t)cl + 16;
+            cur = (char*)stricta_realloc(cur, cur_cap);
+        }
         cur[cl++] = a->digits[i];
         cur[cl] = '\0';
         bi_strip(cur, &cl);
@@ -665,7 +691,13 @@ StrictaBigInt* stricta_bigint_div(StrictaBigInt* a, StrictaBigInt* b) {
         int q = 0;
         while (cmp >= 0) {
             char* nc = bi_sub_abs(cur, cl, b->digits, b->length, &cl);
-            free(cur); cur = nc; q++;
+            if ((size_t)cl + 2 > cur_cap) {
+                cur_cap = (size_t)cl + 16;
+                cur = (char*)stricta_realloc(cur, cur_cap);
+            }
+            memcpy(cur, nc, (size_t)cl + 1);
+            free(nc);
+            q++;
             cmp = bi_abs_cmp(cur, cl, b->digits, b->length);
         }
         res[ri++] = (char)(q + '0');
@@ -678,27 +710,55 @@ StrictaBigInt* stricta_bigint_div(StrictaBigInt* a, StrictaBigInt* b) {
     if (a->sign != b->sign && has_rem) {
         StrictaBigInt* one = stricta_bigint_from_str("1");
         StrictaBigInt* adj = stricta_bigint_sub(q, one);
+        stricta_bigint_free(q);
+        stricta_bigint_free(one);
         return adj;
     }
     return q;
 }
 
+void stricta_bigint_free(StrictaBigInt* a) {
+    if (a) {
+        free(a->digits);
+        free(a);
+    }
+}
+
+StrictaBigInt* stricta_bigint_clone(StrictaBigInt* a) {
+    if (!a) return NULL;
+    char* d = (char*)stricta_alloc((size_t)a->length + 1);
+    memcpy(d, a->digits, (size_t)a->length + 1);
+    return bi_make(d, a->length, a->sign);
+}
+
 StrictaBigInt* stricta_bigint_mod(StrictaBigInt* a, StrictaBigInt* b) {
     StrictaBigInt* q = stricta_bigint_div(a, b);
     StrictaBigInt* p = stricta_bigint_mul(q, b);
-    return stricta_bigint_sub(a, p);
+    StrictaBigInt* r = stricta_bigint_sub(a, p);
+    stricta_bigint_free(q);
+    stricta_bigint_free(p);
+    return r;
 }
 
 StrictaBigInt* stricta_bigint_pow(StrictaBigInt* a, StrictaBigInt* b) {
     if (b->sign < 0) return stricta_bigint_from_str("0");
     long long e = strtoll(b->digits, NULL, 10);
     StrictaBigInt* res = stricta_bigint_from_str("1");
-    StrictaBigInt* base = a;
+    StrictaBigInt* base = stricta_bigint_clone(a);
     while (e > 0) {
-        if (e & 1) res = stricta_bigint_mul(res, base);
+        if (e & 1) {
+            StrictaBigInt* next_res = stricta_bigint_mul(res, base);
+            stricta_bigint_free(res);
+            res = next_res;
+        }
         e >>= 1;
-        if (e > 0) base = stricta_bigint_mul(base, base);
+        if (e > 0) {
+            StrictaBigInt* next_base = stricta_bigint_mul(base, base);
+            stricta_bigint_free(base);
+            base = next_base;
+        }
     }
+    stricta_bigint_free(base);
     return res;
 }
 
@@ -735,7 +795,10 @@ StrictaStr* stricta_bigint_to_str(StrictaBigInt* a) {
 StrictaFile* stricta_open(StrictaStr* path, StrictaStr* mode) {
     const char* m = (mode && mode->length > 0) ? mode->chars : "r";
     FILE* h = fopen(path ? path->chars : "", m);
-    if (!h) stricta_raise(4, NULL, "FileNotFoundError: cannot open file");
+    if (!h) {
+        stricta_set_exc(4, NULL, "FileNotFoundError: cannot open file");
+        stricta_unhandled_exc();
+    }
     StrictaFile* f = (StrictaFile*)stricta_alloc(sizeof(StrictaFile));
     f->handle = h;
     return f;
@@ -765,6 +828,16 @@ void stricta_file_close(StrictaFile* f) {
     if (f && f->handle) {
         fclose(f->handle);
         f->handle = NULL;
+    }
+}
+
+void stricta_file_free(StrictaFile* f) {
+    if (f) {
+        if (f->handle) {
+            fclose(f->handle);
+            f->handle = NULL;
+        }
+        free(f);
     }
 }
 

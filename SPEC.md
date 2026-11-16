@@ -52,10 +52,29 @@ Stricta enforces strict static types on all bindings, parameters, fields, and co
 
 ---
 
-## 4. Compiler & Runtime Architecture
+## 4. Memory Safety, Ownership, and Error Propagation
 
-- **`stricta.c`**: Single-file C11 compiler containing the arena allocator, indentation lexer, recursive-descent parser, strict semantic/type analyzer, monomorphization registry, and LLVM IR code generator.
-- **`runtime.h` / `runtime.c`**: Lean C11 runtime providing UTF-8 string operations, `bytes`, `bigint`, `File` I/O, `setjmp`/`longjmp` exception stack, CLI `sys.argv`, and typed print helpers—with zero NaN-boxing or dynamic attribute lookup.
+Stricta provides **compile-time Rust-style memory safety without garbage collection (GC) or automatic reference counting (ARC)**:
+
+- **Single Ownership & Deterministic Drops**: Every heap-allocated value (`str`, `bytes`, `bigint`, `File`, `list[T]`, `set[T]`, `dict[K, V]`, owned `tuple`, and non-value `class` instances) has a single owning binding, field, or container slot. The compiler emits monomorphized `@_drop_<T>` and `@_clone_<T>` helpers, tracks runtime drop flags (`alloca i1`) for conditionally moved/initialized variables, flushes statement temporaries, and drops all alive locals on normal return and exception unwinding. Static string/bytes literals carry an `is_static` flag so drops are zero-cost no-ops.
+- **Inferred Parameter Modes & Non-Lexical Lifetimes (NLL)**: Function parameters default to `BORROW` (read-only), upgrade automatically to `MUT_BORROW` when mutated, or `MOVE` when stored/returned/consumed—without requiring lifetime annotations in Python syntax. Local views created by field access (`obj.field`), indexing (`lst[i]`), or iteration (`for x in xs:`) borrow their owner until their last lexical use (NLL), rejecting mutation or moves of the owner while the borrow is live, as well as double mutable borrows (`f(x, x)`).
+- **Compiler-Lowered Error Propagation**: Functions that may `raise` lower to `{ i1 is_exc, T val }` (or `i1` for `-> None`) returns instead of `setjmp`/`longjmp`, guaranteeing deterministic stack unwinding and drop execution across `try`/`except`/`else`/`finally` and `with` blocks. Container indexing (`list`, `bytes`, `str`) traps via `stricta_bounds_fail` whenever `0 <= i < len(arr)` is not statically proved.
+
+### 4.1 When Stricta Breaks Python Aliasing
+
+Because values have a single owner and cannot be implicitly aliased across mutable slots, a few dynamic Python idioms become compile-time ownership errors and require `.copy()` or index-based access:
+
+1. **Assigning or Passing a Variable Moves Ownership**: If `b = a` or `consume(a)` moves an owned variable `a`, reading `a` afterward is rejected (`use of moved value 'a'`). Use `b = a.copy()` to keep both.
+2. **No Moving Out of Borrowed Fields, Indices, or Globals**: Extracting an owned value from `obj.field`, `lst[i]`, `d[k]`, a borrowed parameter, or a module global into an owning sink (e.g. `return obj.name`, `xs.append(other[0])`) is rejected (`cannot move out of borrowed ...`). Use `.copy()` (or `lst.pop(i)` / `d.pop(k)` to transfer ownership out of a container).
+3. **No Mutating or Moving While Borrowed / Iterating**: Holding a borrowed view (e.g. `v = box.items` or `for x in xs:`) prevents mutating or reassigning `box` / `xs` until after the last use of `v` or after the loop ends.
+4. **No Shared Mutable Cyclic/DAG Object Graphs**: Patterns that store the same heap node pointer in two owning places at once—for example, recording a traversal path of `TreeNode` pointers via `path.append(curr)` while the tree still owns `curr` (as in `perf/tree_structures.str`)—are rejected. Represent shared references with indices/IDs or clone explicitly with `.copy()`.
+
+---
+
+## 5. Compiler & Runtime Architecture
+
+- **`stricta.c`**: Single-file C11 compiler containing the arena allocator, indentation lexer, recursive-descent parser, strict semantic/type analyzer, ownership/borrow checker, monomorphization registry, and LLVM IR code generator.
+- **`runtime.h` / `runtime.c`**: Lean C11 runtime providing UTF-8 string operations (`is_static`/clone/free), `bytes`, `bigint`, `File` I/O, compiler-lowered exception state and bounds-failure traps, CLI `sys.argv`, and typed print helpers—with zero NaN-boxing, ARC, or GC.
 - **Build & Test**:
   ```bash
   make       # builds ./stricta from stricta.c

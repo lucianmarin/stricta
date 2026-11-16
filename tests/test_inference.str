@@ -129,7 +129,7 @@ def test_all():
 
 # 8. Call-site monomorphization (top-level, recursive, default args, nested, non-vtable method)
 def first_elem(xs):
-    return xs[0]
+    return xs.pop(0)
 
 def add_pair(a, b):
     return a + b

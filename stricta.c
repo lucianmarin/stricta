@@ -554,6 +554,7 @@ struct Expr {
     Type* ty; /* resolved by sema */
     bool is_nonneg;
     bool is_inbounds;
+    bool is_move;
     union {
         struct { const char* raw; int64_t ival; uint64_t uval; bool is_big; } int_lit;
         struct { double fval; } float_lit;
@@ -1979,6 +1980,9 @@ struct ClassInfo {
     int subclass_count;
 };
 
+typedef enum { PM_BORROW = 0, PM_MUT_BORROW = 1, PM_MOVE = 2 } ParamMode;
+typedef enum { OWN_UNINIT = 0, OWN_ALIVE = 1, OWN_MOVED = 2, OWN_MAYBE_MOVED = 3, OWN_BORROWED = 4 } OwnState;
+
 typedef struct VarSym {
     const char* name;
     Type* type;
@@ -1989,6 +1993,11 @@ typedef struct VarSym {
     bool is_nonneg;
     const char* bound_arrs[4];
     int bound_arr_count;
+    OwnState own_state;
+    bool is_borrowed_view;
+    const char* borrow_owner;
+    const char* drop_flag_llvm;
+    bool is_stack_owned;
     const char* llvm_name;
     SrcLoc loc;
 } VarSym;
@@ -2005,9 +2014,11 @@ struct FuncInfo {
     const char** param_names;
     Type** param_types;
     Expr** param_defaults;
+    ParamMode* param_modes;
     int param_count;
     Type* ret_type;
     bool infer_ret;
+    bool can_raise;
     bool is_generic;
     FuncInfo** mono_specs;
     int mono_spec_count;
@@ -2130,6 +2141,34 @@ static bool type_is_heap_ref(Type* t) {
     if (t->kind == TY_CLASS) return !t->cls->is_value_type;
     if (t->kind == TY_OPTIONAL) return type_is_heap_ref(t->elem);
     return false;
+}
+
+static bool type_is_owned_d(Type* t, int depth) {
+    if (!t || depth > 16) return false;
+    switch (t->kind) {
+        case TY_STR: case TY_BYTES: case TY_BIGINT: case TY_FILE:
+        case TY_LIST: case TY_SET: case TY_DICT:
+            return true;
+        case TY_OPTIONAL:
+            return type_is_owned_d(t->elem, depth + 1);
+        case TY_TUPLE:
+            for (int i = 0; i < t->tuple_count; i++) {
+                if (type_is_owned_d(t->tuple_elems[i], depth + 1)) return true;
+            }
+            return false;
+        case TY_CLASS:
+            if (!t->cls->is_value_type) return true;
+            for (int i = 0; i < t->cls->field_count; i++) {
+                if (type_is_owned_d(t->cls->fields[i].type, depth + 1)) return true;
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+static bool type_is_owned(Type* t) {
+    return type_is_owned_d(t, 0);
 }
 
 static bool type_eq(Type* a, Type* b) {
@@ -3169,7 +3208,19 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
             for (int i = 0; i < argc; i++) check_expr(mod, fn, args[i], NULL);
             return g_ty_str;
         }
+        if (strcmp(mname, "copy") == 0) {
+            if (argc != 0) error_at(call->loc, "str.copy() takes 0 arguments");
+            return g_ty_str;
+        }
         error_at(call->loc, "unknown str method '%s'", mname);
+    }
+
+    if (obj_ty->kind == TY_BYTES || obj_ty->kind == TY_BIGINT || obj_ty->kind == TY_TUPLE) {
+        if (strcmp(mname, "copy") == 0) {
+            if (argc != 0) error_at(call->loc, "%s.copy() takes 0 arguments", type_str(obj_ty));
+            return obj_ty;
+        }
+        error_at(call->loc, "unknown %s method '%s'", type_str(obj_ty), mname);
     }
 
     if (obj_ty->kind == TY_FILE) {
@@ -3327,6 +3378,7 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
                 if (target_m) break;
             }
             if (!target_m) error_at(call->loc, "super() has no method '%s'", mname);
+            call->call.resolved_fn = target_m;
             int expected_args = target_m->param_count - 1;
             if (argc != expected_args) error_at(call->loc, "super().%s() expects %d arguments, got %d", mname, expected_args, argc);
             for (int i = 0; i < argc; i++) {
@@ -3340,6 +3392,9 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
         }
 
         FuncInfo* m = find_method_in_class(cls, mname);
+        if (!m && strcmp(mname, "copy") == 0 && argc == 0) {
+            return obj_ty;
+        }
         if (!m) error_at(call->loc, "class '%s' has no method '%s'", cls->name, mname);
         int start_p = m->is_static ? 0 : 1;
         int max_args = m->param_count - start_p;
@@ -5807,6 +5862,1142 @@ static ModuleInfo* load_module_by_name(const char* mod_name, const char* from_di
 }
 
 /* =========================================================================
+ * 4B. OWNERSHIP, BORROWING & MOVE CHECKER
+ * ========================================================================= */
+
+static bool is_mutating_container_method(Type* ot, const char* mname) {
+    if (!ot) return false;
+    if (ot->kind == TY_LIST) {
+        return strcmp(mname, "append") == 0 || strcmp(mname, "extend") == 0 ||
+               strcmp(mname, "insert") == 0 || strcmp(mname, "pop") == 0 ||
+               strcmp(mname, "remove") == 0 || strcmp(mname, "sort") == 0 ||
+               strcmp(mname, "reverse") == 0 || strcmp(mname, "clear") == 0;
+    }
+    if (ot->kind == TY_SET) {
+        return strcmp(mname, "add") == 0 || strcmp(mname, "discard") == 0 ||
+               strcmp(mname, "remove") == 0 || strcmp(mname, "pop") == 0 ||
+               strcmp(mname, "clear") == 0 || strcmp(mname, "update") == 0 ||
+               strcmp(mname, "intersection_update") == 0 ||
+               strcmp(mname, "difference_update") == 0 ||
+               strcmp(mname, "symmetric_difference_update") == 0;
+    }
+    if (ot->kind == TY_DICT) {
+        return strcmp(mname, "setdefault") == 0 || strcmp(mname, "pop") == 0 ||
+               strcmp(mname, "popitem") == 0 || strcmp(mname, "update") == 0 ||
+               strcmp(mname, "clear") == 0;
+    }
+    if (ot->kind == TY_FILE) {
+        return strcmp(mname, "write") == 0 || strcmp(mname, "close") == 0 || strcmp(mname, "read") == 0;
+    }
+    return false;
+}
+
+static const char* expr_root_var(Expr* e) {
+    while (e) {
+        if (e->kind == EXPR_VAR) return e->var.name;
+        if (e->kind == EXPR_ATTR) { e = e->attr.obj; continue; }
+        if (e->kind == EXPR_INDEX) { e = e->index.obj; continue; }
+        break;
+    }
+    return NULL;
+}
+
+static bool expr_is_borrow_source(Expr* e) {
+    if (!e || !e->ty || !type_is_owned(e->ty)) return false;
+    if (e->kind == EXPR_ATTR) {
+        if (!e->attr.obj->ty || e->attr.obj->ty->kind != TY_CLASS) return false;
+        FuncInfo* prop = find_method_in_class(e->attr.obj->ty->cls, e->attr.attr);
+        if (prop && prop->is_property) return false;
+        return true;
+    }
+    if (e->kind == EXPR_INDEX) {
+        Type* ot = e->index.obj->ty;
+        return ot && (ot->kind == TY_LIST || ot->kind == TY_DICT || ot->kind == TY_TUPLE);
+    }
+    return false;
+}
+
+static bool expr_mentions_var(Expr* e, const char* vname) {
+    if (!e) return false;
+    switch (e->kind) {
+        case EXPR_VAR: return strcmp(e->var.name, vname) == 0;
+        case EXPR_FSTRING:
+            for (int i = 0; i < e->fstr.count; i++) {
+                if (e->fstr.parts[i].is_expr && expr_mentions_var(e->fstr.parts[i].expr, vname)) return true;
+            }
+            return false;
+        case EXPR_BINOP: return expr_mentions_var(e->binop.left, vname) || expr_mentions_var(e->binop.right, vname);
+        case EXPR_UNOP: return expr_mentions_var(e->unop.operand, vname);
+        case EXPR_TERNARY:
+            return expr_mentions_var(e->ternary.cond, vname) ||
+                   expr_mentions_var(e->ternary.then_e, vname) ||
+                   expr_mentions_var(e->ternary.else_e, vname);
+        case EXPR_WALRUS: return strcmp(e->walrus.name, vname) == 0 || expr_mentions_var(e->walrus.val, vname);
+        case EXPR_ATTR: return expr_mentions_var(e->attr.obj, vname);
+        case EXPR_INDEX: return expr_mentions_var(e->index.obj, vname) || expr_mentions_var(e->index.index, vname);
+        case EXPR_SLICE:
+            return expr_mentions_var(e->slice.obj, vname) ||
+                   expr_mentions_var(e->slice.start, vname) ||
+                   expr_mentions_var(e->slice.stop, vname);
+        case EXPR_LIST: case EXPR_TUPLE: case EXPR_SET:
+            for (int i = 0; i < e->seq.count; i++) if (expr_mentions_var(e->seq.items[i], vname)) return true;
+            return false;
+        case EXPR_DICT:
+            for (int i = 0; i < e->dict.count; i++) {
+                if (expr_mentions_var(e->dict.keys[i], vname) || expr_mentions_var(e->dict.vals[i], vname)) return true;
+            }
+            return false;
+        case EXPR_LISTCOMP: case EXPR_SETCOMP: case EXPR_DICTCOMP: case EXPR_GENEXPR:
+            if (expr_mentions_var(e->comp.elt, vname) || expr_mentions_var(e->comp.val, vname)) return true;
+            for (int i = 0; i < e->comp.gen_count; i++) {
+                if (expr_mentions_var(e->comp.gens[i].iter, vname)) return true;
+                for (int f = 0; f < e->comp.gens[i].if_count; f++) {
+                    if (expr_mentions_var(e->comp.gens[i].ifs[f], vname)) return true;
+                }
+            }
+            return false;
+        case EXPR_CALL:
+            if (expr_mentions_var(e->call.callee, vname)) return true;
+            for (int i = 0; i < e->call.arg_count; i++) if (expr_mentions_var(e->call.args[i], vname)) return true;
+            return false;
+        case EXPR_LAMBDA:
+            return expr_mentions_var(e->lambda.body, vname);
+        default:
+            return false;
+    }
+}
+
+static bool stmts_mention_var(Stmt** stmts, int count, const char* vname) {
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        switch (s->kind) {
+            case STMT_RETURN: if (expr_mentions_var(s->ret.expr, vname)) return true; break;
+            case STMT_EXPR: case STMT_YIELD: case STMT_YIELD_FROM:
+                if (expr_mentions_var(s->expr_s.expr, vname)) return true; break;
+            case STMT_ASSIGN:
+                if (expr_mentions_var(s->assign.target, vname) || expr_mentions_var(s->assign.value, vname)) return true; break;
+            case STMT_MULTI_ASSIGN:
+                for (int k = 0; k < s->multi_assign.target_count; k++) {
+                    if (expr_mentions_var(s->multi_assign.targets[k], vname)) return true;
+                }
+                if (expr_mentions_var(s->multi_assign.value, vname)) return true;
+                break;
+            case STMT_AUG_ASSIGN:
+                if (expr_mentions_var(s->aug_assign.target, vname) || expr_mentions_var(s->aug_assign.value, vname)) return true; break;
+            case STMT_IF:
+                for (int b = 0; b < s->if_s.branch_count; b++) {
+                    if (expr_mentions_var(s->if_s.conds[b], vname) ||
+                        stmts_mention_var(s->if_s.bodies[b], s->if_s.body_counts[b], vname)) return true;
+                }
+                if (stmts_mention_var(s->if_s.else_body, s->if_s.else_count, vname)) return true;
+                break;
+            case STMT_WHILE:
+                if (expr_mentions_var(s->while_s.cond, vname) ||
+                    stmts_mention_var(s->while_s.body, s->while_s.body_count, vname) ||
+                    stmts_mention_var(s->while_s.else_body, s->while_s.else_count, vname)) return true;
+                break;
+            case STMT_FOR:
+                if (expr_mentions_var(s->for_s.iter, vname) ||
+                    stmts_mention_var(s->for_s.body, s->for_s.body_count, vname) ||
+                    stmts_mention_var(s->for_s.else_body, s->for_s.else_count, vname)) return true;
+                break;
+            case STMT_TRY:
+                if (stmts_mention_var(s->try_s.try_body, s->try_s.try_count, vname)) return true;
+                for (int h = 0; h < s->try_s.handler_count; h++) {
+                    if (stmts_mention_var(s->try_s.handlers[h].body, s->try_s.handlers[h].body_count, vname)) return true;
+                }
+                if (stmts_mention_var(s->try_s.else_body, s->try_s.else_count, vname) ||
+                    stmts_mention_var(s->try_s.finally_body, s->try_s.finally_count, vname)) return true;
+                break;
+            case STMT_RAISE: if (expr_mentions_var(s->raise_s.exc, vname)) return true; break;
+            case STMT_ASSERT:
+                if (expr_mentions_var(s->assert_s.cond, vname) || expr_mentions_var(s->assert_s.msg, vname)) return true; break;
+            case STMT_WITH:
+                if (expr_mentions_var(s->with_s.ctx, vname) ||
+                    stmts_mention_var(s->with_s.body, s->with_s.body_count, vname)) return true;
+                break;
+            case STMT_DEL: if (expr_mentions_var(s->del_s.target, vname)) return true; break;
+            case STMT_MATCH:
+                if (expr_mentions_var(s->match_s.subject, vname)) return true;
+                for (int c = 0; c < s->match_s.case_count; c++) {
+                    if (expr_mentions_var(s->match_s.cases[c].pattern, vname) ||
+                        stmts_mention_var(s->match_s.cases[c].body, s->match_s.cases[c].body_count, vname)) return true;
+                }
+                break;
+            default: break;
+        }
+    }
+    return false;
+}
+
+static int fn_param_index(FuncInfo* fn, const char* name) {
+    if (!fn) return -1;
+    for (int i = 0; i < fn->param_count; i++) {
+        if (strcmp(fn->param_names[i], name) == 0) return i;
+    }
+    return -1;
+}
+
+static void raise_param_mode(FuncInfo* fn, int p, ParamMode m, bool* changed) {
+    if (p < 0 || p >= fn->param_count) return;
+    if (!type_is_owned(fn->param_types[p])) return;
+    if (fn->param_modes[p] < m) {
+        fn->param_modes[p] = m;
+        *changed = true;
+    }
+}
+
+static void scan_expr_param_modes(FuncInfo* fn, Expr* e, bool moved_ctx, bool* changed) {
+    if (!e) return;
+    if (moved_ctx && e->kind == EXPR_VAR && type_is_owned(e->ty)) {
+        int p = fn_param_index(fn, e->var.name);
+        if (p >= 0) raise_param_mode(fn, p, PM_MOVE, changed);
+        return;
+    }
+    switch (e->kind) {
+        case EXPR_FSTRING:
+            for (int i = 0; i < e->fstr.count; i++) {
+                if (e->fstr.parts[i].is_expr) scan_expr_param_modes(fn, e->fstr.parts[i].expr, false, changed);
+            }
+            break;
+        case EXPR_BINOP:
+            scan_expr_param_modes(fn, e->binop.left, false, changed);
+            scan_expr_param_modes(fn, e->binop.right, false, changed);
+            break;
+        case EXPR_UNOP:
+            scan_expr_param_modes(fn, e->unop.operand, false, changed);
+            break;
+        case EXPR_TERNARY:
+            scan_expr_param_modes(fn, e->ternary.cond, false, changed);
+            scan_expr_param_modes(fn, e->ternary.then_e, moved_ctx, changed);
+            scan_expr_param_modes(fn, e->ternary.else_e, moved_ctx, changed);
+            break;
+        case EXPR_WALRUS:
+            scan_expr_param_modes(fn, e->walrus.val, true, changed);
+            break;
+        case EXPR_ATTR:
+            scan_expr_param_modes(fn, e->attr.obj, false, changed);
+            break;
+        case EXPR_INDEX:
+            scan_expr_param_modes(fn, e->index.obj, false, changed);
+            scan_expr_param_modes(fn, e->index.index, false, changed);
+            break;
+        case EXPR_SLICE:
+            scan_expr_param_modes(fn, e->slice.obj, false, changed);
+            scan_expr_param_modes(fn, e->slice.start, false, changed);
+            scan_expr_param_modes(fn, e->slice.stop, false, changed);
+            break;
+        case EXPR_LIST: case EXPR_TUPLE: case EXPR_SET:
+            for (int i = 0; i < e->seq.count; i++) {
+                scan_expr_param_modes(fn, e->seq.items[i], true, changed);
+            }
+            break;
+        case EXPR_DICT:
+            for (int i = 0; i < e->dict.count; i++) {
+                scan_expr_param_modes(fn, e->dict.keys[i], true, changed);
+                scan_expr_param_modes(fn, e->dict.vals[i], true, changed);
+            }
+            break;
+        case EXPR_LISTCOMP: case EXPR_SETCOMP: case EXPR_GENEXPR:
+            scan_expr_param_modes(fn, e->comp.elt, true, changed);
+            for (int i = 0; i < e->comp.gen_count; i++) {
+                scan_expr_param_modes(fn, e->comp.gens[i].iter, false, changed);
+                for (int f = 0; f < e->comp.gens[i].if_count; f++) {
+                    scan_expr_param_modes(fn, e->comp.gens[i].ifs[f], false, changed);
+                }
+            }
+            break;
+        case EXPR_DICTCOMP:
+            scan_expr_param_modes(fn, e->comp.elt, true, changed);
+            scan_expr_param_modes(fn, e->comp.val, true, changed);
+            for (int i = 0; i < e->comp.gen_count; i++) {
+                scan_expr_param_modes(fn, e->comp.gens[i].iter, false, changed);
+                for (int f = 0; f < e->comp.gens[i].if_count; f++) {
+                    scan_expr_param_modes(fn, e->comp.gens[i].ifs[f], false, changed);
+                }
+            }
+            break;
+        case EXPR_CALL: {
+            Expr* ce = e->call.callee;
+            if (ce->kind == EXPR_ATTR) {
+                Type* ot = ce->attr.obj->ty;
+                const char* mn = ce->attr.attr;
+                if (ot && (ot->kind == TY_LIST || ot->kind == TY_SET || ot->kind == TY_DICT || ot->kind == TY_FILE)) {
+                    if (is_mutating_container_method(ot, mn)) {
+                        const char* rv = expr_root_var(ce->attr.obj);
+                        if (rv) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
+                    }
+                    scan_expr_param_modes(fn, ce->attr.obj, false, changed);
+                    bool arg_move = (ot->kind == TY_LIST && (strcmp(mn, "append") == 0 || strcmp(mn, "insert") == 0)) ||
+                                    (ot->kind == TY_SET && strcmp(mn, "add") == 0) ||
+                                    (ot->kind == TY_DICT && strcmp(mn, "setdefault") == 0);
+                    for (int i = 0; i < e->call.arg_count; i++) {
+                        bool mv = arg_move && (ot->kind != TY_LIST || strcmp(mn, "insert") != 0 || i == 1);
+                        scan_expr_param_modes(fn, e->call.args[i], mv, changed);
+                    }
+                    break;
+                }
+                if (ot && ot->kind == TY_CLASS) {
+                    FuncInfo* m = e->call.resolved_fn ? e->call.resolved_fn : find_method_in_class(ot->cls, mn);
+                    if (m && m->param_modes) {
+                        int sp = m->is_static ? 0 : 1;
+                        if (!m->is_static && !m->is_classmethod && m->param_count > 0) {
+                            if (ce->attr.obj->kind == EXPR_VAR) {
+                                int p = fn_param_index(fn, ce->attr.obj->var.name);
+                                if (p >= 0 && m->param_modes[0] != PM_BORROW) {
+                                    raise_param_mode(fn, p, m->param_modes[0], changed);
+                                }
+                            } else {
+                                scan_expr_param_modes(fn, ce->attr.obj, false, changed);
+                            }
+                        }
+                        for (int i = 0; i < e->call.arg_count && i + sp < m->param_count; i++) {
+                            scan_expr_param_modes(fn, e->call.args[i], m->param_modes[i + sp] == PM_MOVE, changed);
+                            if (m->param_modes[i + sp] == PM_MUT_BORROW && e->call.args[i]->kind == EXPR_VAR) {
+                                raise_param_mode(fn, fn_param_index(fn, e->call.args[i]->var.name), PM_MUT_BORROW, changed);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            if (ce->kind == EXPR_VAR) {
+                const char* cname = ce->var.name;
+                ClassInfo* ci = fn ? find_class_in_mod(fn->mod, cname) : NULL;
+                if (ci) {
+                    FuncInfo* init_fn = find_method_in_class(ci, "__init__");
+                    if (init_fn && init_fn->param_modes) {
+                        for (int i = 0; i < e->call.arg_count && i + 1 < init_fn->param_count; i++) {
+                            scan_expr_param_modes(fn, e->call.args[i], init_fn->param_modes[i + 1] == PM_MOVE, changed);
+                        }
+                    } else {
+                        for (int i = 0; i < e->call.arg_count; i++) scan_expr_param_modes(fn, e->call.args[i], true, changed);
+                    }
+                    break;
+                }
+                FuncInfo* tf = e->call.resolved_fn ? e->call.resolved_fn : (fn ? find_func_in_mod(fn->mod, cname) : NULL);
+                if (tf && tf->param_modes) {
+                    for (int i = 0; i < e->call.arg_count && i < tf->param_count; i++) {
+                        scan_expr_param_modes(fn, e->call.args[i], tf->param_modes[i] == PM_MOVE, changed);
+                        if (tf->param_modes[i] == PM_MUT_BORROW && e->call.args[i]->kind == EXPR_VAR) {
+                            raise_param_mode(fn, fn_param_index(fn, e->call.args[i]->var.name), PM_MUT_BORROW, changed);
+                        }
+                    }
+                    break;
+                }
+            }
+            for (int i = 0; i < e->call.arg_count; i++) scan_expr_param_modes(fn, e->call.args[i], false, changed);
+            break;
+        }
+        default: break;
+    }
+}
+
+static void scan_stmts_param_modes(FuncInfo* fn, Stmt** stmts, int count, bool* changed) {
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        switch (s->kind) {
+            case STMT_RETURN:
+                scan_expr_param_modes(fn, s->ret.expr, true, changed);
+                break;
+            case STMT_YIELD:
+                scan_expr_param_modes(fn, s->expr_s.expr, true, changed);
+                break;
+            case STMT_YIELD_FROM:
+                scan_expr_param_modes(fn, s->expr_s.expr, false, changed);
+                break;
+            case STMT_EXPR:
+                scan_expr_param_modes(fn, s->expr_s.expr, false, changed);
+                break;
+            case STMT_ASSIGN: {
+                Expr* tgt = s->assign.target;
+                if (tgt->kind == EXPR_VAR) {
+                    bool is_global_t = fn && find_global_in_mod(fn->mod, tgt->var.name) != NULL &&
+                                       find_local_in_fn(fn, tgt->var.name) == NULL;
+                    bool is_borrow = expr_is_borrow_source(s->assign.value) && !is_global_t;
+                    scan_expr_param_modes(fn, s->assign.value, !is_borrow, changed);
+                } else if (tgt->kind == EXPR_ATTR) {
+                    const char* rv = expr_root_var(tgt->attr.obj);
+                    if (rv) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
+                    scan_expr_param_modes(fn, s->assign.value, true, changed);
+                } else if (tgt->kind == EXPR_INDEX) {
+                    const char* rv = expr_root_var(tgt->index.obj);
+                    if (rv) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
+                    scan_expr_param_modes(fn, tgt->index.index,
+                                          tgt->index.obj->ty && tgt->index.obj->ty->kind == TY_DICT, changed);
+                    scan_expr_param_modes(fn, s->assign.value, true, changed);
+                }
+                break;
+            }
+            case STMT_MULTI_ASSIGN:
+                scan_expr_param_modes(fn, s->multi_assign.value, false, changed);
+                break;
+            case STMT_AUG_ASSIGN: {
+                const char* rv = expr_root_var(s->aug_assign.target);
+                if (rv) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
+                scan_expr_param_modes(fn, s->aug_assign.value, false, changed);
+                break;
+            }
+            case STMT_IF:
+                for (int b = 0; b < s->if_s.branch_count; b++) {
+                    scan_expr_param_modes(fn, s->if_s.conds[b], false, changed);
+                    scan_stmts_param_modes(fn, s->if_s.bodies[b], s->if_s.body_counts[b], changed);
+                }
+                scan_stmts_param_modes(fn, s->if_s.else_body, s->if_s.else_count, changed);
+                break;
+            case STMT_WHILE:
+                scan_expr_param_modes(fn, s->while_s.cond, false, changed);
+                scan_stmts_param_modes(fn, s->while_s.body, s->while_s.body_count, changed);
+                scan_stmts_param_modes(fn, s->while_s.else_body, s->while_s.else_count, changed);
+                break;
+            case STMT_FOR:
+                scan_expr_param_modes(fn, s->for_s.iter, false, changed);
+                scan_stmts_param_modes(fn, s->for_s.body, s->for_s.body_count, changed);
+                scan_stmts_param_modes(fn, s->for_s.else_body, s->for_s.else_count, changed);
+                break;
+            case STMT_TRY:
+                scan_stmts_param_modes(fn, s->try_s.try_body, s->try_s.try_count, changed);
+                for (int h = 0; h < s->try_s.handler_count; h++) {
+                    scan_stmts_param_modes(fn, s->try_s.handlers[h].body, s->try_s.handlers[h].body_count, changed);
+                }
+                scan_stmts_param_modes(fn, s->try_s.else_body, s->try_s.else_count, changed);
+                scan_stmts_param_modes(fn, s->try_s.finally_body, s->try_s.finally_count, changed);
+                break;
+            case STMT_WITH:
+                scan_expr_param_modes(fn, s->with_s.ctx, false, changed);
+                scan_stmts_param_modes(fn, s->with_s.body, s->with_s.body_count, changed);
+                break;
+            case STMT_DEL:
+                if (s->del_s.target->kind == EXPR_VAR) {
+                    int p = fn_param_index(fn, s->del_s.target->var.name);
+                    if (p >= 0) raise_param_mode(fn, p, PM_MOVE, changed);
+                } else if (s->del_s.target->kind == EXPR_INDEX) {
+                    const char* rv = expr_root_var(s->del_s.target->index.obj);
+                    if (rv) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
+                }
+                break;
+            case STMT_ASSERT:
+                scan_expr_param_modes(fn, s->assert_s.cond, false, changed);
+                scan_expr_param_modes(fn, s->assert_s.msg, false, changed);
+                break;
+            case STMT_RAISE:
+                scan_expr_param_modes(fn, s->raise_s.exc, true, changed);
+                break;
+            case STMT_MATCH:
+                scan_expr_param_modes(fn, s->match_s.subject, false, changed);
+                for (int c = 0; c < s->match_s.case_count; c++) {
+                    scan_expr_param_modes(fn, s->match_s.cases[c].pattern, false, changed);
+                    scan_stmts_param_modes(fn, s->match_s.cases[c].body, s->match_s.cases[c].body_count, changed);
+                }
+                break;
+            default: break;
+        }
+    }
+}
+
+static void analyze_ownership_modes(void) {
+    for (int i = 0; i < g_all_func_count; i++) {
+        FuncInfo* fn = g_all_funcs[i];
+        if (fn->is_generic) continue;
+        fn->param_modes = fn->param_count ? (ParamMode*)arena_alloc(sizeof(ParamMode) * (size_t)fn->param_count) : NULL;
+        for (int p = 0; p < fn->param_count; p++) {
+            fn->param_modes[p] = PM_BORROW;
+            if (fn->is_method && strcmp(fn->name, "__init__") == 0 && p == 0) {
+                fn->param_modes[p] = PM_MUT_BORROW;
+            }
+        }
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < g_all_func_count; i++) {
+            FuncInfo* fn = g_all_funcs[i];
+            if (fn->is_generic) continue;
+            if (fn->is_lambda && fn->lambda_ast) {
+                scan_expr_param_modes(fn, fn->lambda_ast->lambda.body, true, &changed);
+            } else if (fn->ast) {
+                scan_stmts_param_modes(fn, fn->ast->def_s.body, fn->ast->def_s.body_count, &changed);
+            }
+        }
+        /* Propagate parameter modes across vtable families */
+        for (int c = 0; c < g_all_class_count; c++) {
+            ClassInfo* cls = g_all_classes[c];
+            for (int v = 0; v < cls->vtable_count; v++) {
+                FuncInfo* vm = cls->vtable[v].fn;
+                if (!vm || !vm->param_modes) continue;
+                for (int m = 0; m < cls->mro_count; m++) {
+                    FuncInfo* am = find_method_in_class_exact(cls->mro[m], cls->vtable[v].name);
+                    if (!am || !am->param_modes || am->param_count != vm->param_count) continue;
+                    for (int p = 0; p < vm->param_count; p++) {
+                        if (am->param_modes[p] > vm->param_modes[p]) { vm->param_modes[p] = am->param_modes[p]; changed = true; }
+                        else if (vm->param_modes[p] > am->param_modes[p]) { am->param_modes[p] = vm->param_modes[p]; changed = true; }
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef struct {
+    const char* name;
+    Type* type;
+    OwnState state;
+    bool is_view;
+    bool is_mut_borrow;
+    const char* borrow_owner;
+    bool is_global;
+    int imm_borrows;
+    int mut_borrows;
+    int decl_depth;
+} OwnSlot;
+
+typedef struct {
+    OwnSlot slots[256];
+    int count;
+    int loop_depth;
+} OwnCtx;
+
+static int own_find(OwnCtx* ctx, const char* name) {
+    for (int i = 0; i < ctx->count; i++) {
+        if (strcmp(ctx->slots[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static int own_ensure(OwnCtx* ctx, const char* name, Type* ty, bool is_global) {
+    int idx = own_find(ctx, name);
+    if (idx >= 0) return idx;
+    if (ctx->count >= 256) return -1;
+    idx = ctx->count++;
+    memset(&ctx->slots[idx], 0, sizeof(OwnSlot));
+    ctx->slots[idx].name = name;
+    ctx->slots[idx].type = ty;
+    ctx->slots[idx].state = OWN_UNINIT;
+    ctx->slots[idx].is_global = is_global;
+    ctx->slots[idx].decl_depth = ctx->loop_depth;
+    return idx;
+}
+
+static void own_release_view(OwnCtx* ctx, int idx) {
+    if (idx < 0 || !ctx->slots[idx].is_view || ctx->slots[idx].state != OWN_ALIVE) return;
+    if (ctx->slots[idx].borrow_owner) {
+        int oi = own_find(ctx, ctx->slots[idx].borrow_owner);
+        if (oi >= 0 && ctx->slots[oi].imm_borrows > 0) ctx->slots[oi].imm_borrows--;
+    }
+    ctx->slots[idx].state = OWN_UNINIT;
+    ctx->slots[idx].is_view = false;
+    ctx->slots[idx].borrow_owner = NULL;
+}
+
+static void own_end_dead_views(OwnCtx* ctx, Stmt** rem, int rem_count) {
+    for (int i = 0; i < ctx->count; i++) {
+        if (ctx->slots[i].is_view && ctx->slots[i].state == OWN_ALIVE &&
+            ctx->slots[i].decl_depth >= ctx->loop_depth &&
+            !stmts_mention_var(rem, rem_count, ctx->slots[i].name)) {
+            own_release_view(ctx, i);
+        }
+    }
+}
+
+static void own_sync_to_fn(FuncInfo* fn, OwnCtx* ctx) {
+    if (!fn) return;
+    for (int i = 0; i < fn->local_count; i++) {
+        int idx = own_find(ctx, fn->locals[i].name);
+        if (idx >= 0 && ctx->slots[idx].is_view) {
+            fn->locals[i].is_borrowed_view = true;
+            fn->locals[i].borrow_owner = ctx->slots[idx].borrow_owner;
+        }
+    }
+}
+
+static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, bool want_move);
+
+static void own_check_mutate_var(OwnCtx* ctx, const char* name, SrcLoc loc) {
+    int idx = own_find(ctx, name);
+    if (idx < 0) return;
+    if (ctx->slots[idx].is_view && !ctx->slots[idx].is_mut_borrow) {
+        error_at(loc, "cannot mutate borrowed value '%s'", name);
+    }
+    if (type_is_owned(ctx->slots[idx].type) &&
+        (ctx->slots[idx].state == OWN_MOVED || ctx->slots[idx].state == OWN_MAYBE_MOVED)) {
+        error_at(loc, "use of moved value '%s'", name);
+    }
+    if (ctx->slots[idx].imm_borrows > 0 || ctx->slots[idx].mut_borrows > 0) {
+        error_at(loc, "cannot mutate '%s' while it is borrowed", name);
+    }
+}
+
+static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, bool want_move) {
+    if (!e) return;
+    switch (e->kind) {
+        case EXPR_VAR: {
+            int idx = own_find(ctx, e->var.name);
+            if (idx < 0) {
+                VarSym* gv = find_global_in_mod(mod, e->var.name);
+                if (gv && type_is_owned(gv->type) && want_move) {
+                    error_at(e->loc, "cannot move out of global '%s'; use '.copy()' to clone", e->var.name);
+                }
+                return;
+            }
+            if (!type_is_owned(ctx->slots[idx].type)) return;
+            if (ctx->slots[idx].state == OWN_MOVED || ctx->slots[idx].state == OWN_MAYBE_MOVED) {
+                error_at(e->loc, "use of moved value '%s'", e->var.name);
+            }
+            if (want_move) {
+                if (ctx->slots[idx].is_global) {
+                    error_at(e->loc, "cannot move out of global '%s'; use '.copy()' to clone", e->var.name);
+                }
+                if (ctx->slots[idx].is_view) {
+                    error_at(e->loc, "cannot move out of borrowed value '%s'; use '.copy()' to clone", e->var.name);
+                }
+                if (ctx->slots[idx].imm_borrows > 0 || ctx->slots[idx].mut_borrows > 0) {
+                    error_at(e->loc, "cannot move '%s' while it is borrowed", e->var.name);
+                }
+                e->is_move = true;
+                ctx->slots[idx].state = OWN_MOVED;
+            } else {
+                if (ctx->slots[idx].mut_borrows > 0) {
+                    error_at(e->loc, "cannot borrow '%s' while it is mutably borrowed", e->var.name);
+                }
+            }
+            break;
+        }
+        case EXPR_ATTR:
+            if (want_move && type_is_owned(e->ty) && e->attr.obj->ty && e->attr.obj->ty->kind == TY_CLASS) {
+                if (expr_root_var(e->attr.obj)) {
+                    error_at(e->loc, "cannot move out of borrowed field '%s'; use '.copy()' to clone", e->attr.attr);
+                }
+            }
+            own_check_expr(mod, fn, ctx, e->attr.obj, false);
+            break;
+        case EXPR_INDEX: {
+            Type* ot = e->index.obj->ty;
+            if (want_move && type_is_owned(e->ty) && ot && ot->kind != TY_STR && ot->kind != TY_BYTES) {
+                if (expr_root_var(e->index.obj)) {
+                    error_at(e->loc, "cannot move out of indexed element; use '.copy()' to clone");
+                }
+            }
+            own_check_expr(mod, fn, ctx, e->index.obj, false);
+            own_check_expr(mod, fn, ctx, e->index.index, false);
+            break;
+        }
+        case EXPR_SLICE:
+            own_check_expr(mod, fn, ctx, e->slice.obj, false);
+            own_check_expr(mod, fn, ctx, e->slice.start, false);
+            own_check_expr(mod, fn, ctx, e->slice.stop, false);
+            break;
+        case EXPR_FSTRING:
+            for (int i = 0; i < e->fstr.count; i++) {
+                if (e->fstr.parts[i].is_expr) own_check_expr(mod, fn, ctx, e->fstr.parts[i].expr, false);
+            }
+            break;
+        case EXPR_BINOP:
+            own_check_expr(mod, fn, ctx, e->binop.left, false);
+            own_check_expr(mod, fn, ctx, e->binop.right, false);
+            break;
+        case EXPR_UNOP:
+            own_check_expr(mod, fn, ctx, e->unop.operand, false);
+            break;
+        case EXPR_TERNARY: {
+            own_check_expr(mod, fn, ctx, e->ternary.cond, false);
+            OwnCtx then_ctx = *ctx;
+            OwnCtx else_ctx = *ctx;
+            own_check_expr(mod, fn, &then_ctx, e->ternary.then_e, want_move);
+            own_check_expr(mod, fn, &else_ctx, e->ternary.else_e, want_move);
+            for (int i = 0; i < ctx->count; i++) {
+                if (then_ctx.slots[i].state == else_ctx.slots[i].state) {
+                    ctx->slots[i].state = then_ctx.slots[i].state;
+                } else if (then_ctx.slots[i].state == OWN_MOVED || else_ctx.slots[i].state == OWN_MOVED ||
+                           then_ctx.slots[i].state == OWN_MAYBE_MOVED || else_ctx.slots[i].state == OWN_MAYBE_MOVED) {
+                    ctx->slots[i].state = OWN_MAYBE_MOVED;
+                }
+            }
+            break;
+        }
+        case EXPR_WALRUS:
+            own_check_expr(mod, fn, ctx, e->walrus.val, type_is_owned(e->ty));
+            {
+                int idx = own_ensure(ctx, e->walrus.name, e->ty, fn == NULL);
+                if (idx >= 0) ctx->slots[idx].state = OWN_ALIVE;
+            }
+            break;
+        case EXPR_LIST: case EXPR_TUPLE: case EXPR_SET:
+            for (int i = 0; i < e->seq.count; i++) {
+                own_check_expr(mod, fn, ctx, e->seq.items[i], type_is_owned(e->seq.items[i]->ty));
+            }
+            break;
+        case EXPR_DICT:
+            for (int i = 0; i < e->dict.count; i++) {
+                own_check_expr(mod, fn, ctx, e->dict.keys[i], type_is_owned(e->dict.keys[i]->ty));
+                own_check_expr(mod, fn, ctx, e->dict.vals[i], type_is_owned(e->dict.vals[i]->ty));
+            }
+            break;
+        case EXPR_LISTCOMP: case EXPR_SETCOMP: case EXPR_GENEXPR: {
+            OwnCtx comp_ctx = *ctx;
+            for (int g = 0; g < e->comp.gen_count; g++) {
+                CompGen* cg = &e->comp.gens[g];
+                own_check_expr(mod, fn, &comp_ctx, cg->iter, false);
+                for (int k = 0; k < cg->target_count; k++) {
+                    int tidx = own_ensure(&comp_ctx, cg->targets[k], g_ty_i64, false);
+                    if (tidx >= 0) {
+                        comp_ctx.slots[tidx].state = OWN_ALIVE;
+                        comp_ctx.slots[tidx].is_view = false;
+                        Type* it = cg->iter->ty;
+                        if (it && it->kind == TY_STR) {
+                            comp_ctx.slots[tidx].type = g_ty_str;
+                            comp_ctx.slots[tidx].is_view = false;
+                        } else if (it && (it->kind == TY_LIST || it->kind == TY_SET) && type_is_owned(it->elem)) {
+                            comp_ctx.slots[tidx].type = it->elem;
+                            comp_ctx.slots[tidx].is_view = true;
+                        } else if (it && it->kind == TY_DICT && type_is_owned(it->key)) {
+                            comp_ctx.slots[tidx].type = it->key;
+                            comp_ctx.slots[tidx].is_view = true;
+                        }
+                    }
+                }
+                for (int f = 0; f < cg->if_count; f++) own_check_expr(mod, fn, &comp_ctx, cg->ifs[f], false);
+            }
+            own_check_expr(mod, fn, &comp_ctx, e->comp.elt, type_is_owned(e->comp.elt->ty));
+            break;
+        }
+        case EXPR_DICTCOMP: {
+            OwnCtx comp_ctx = *ctx;
+            for (int g = 0; g < e->comp.gen_count; g++) {
+                CompGen* cg = &e->comp.gens[g];
+                own_check_expr(mod, fn, &comp_ctx, cg->iter, false);
+                for (int k = 0; k < cg->target_count; k++) {
+                    int tidx = own_ensure(&comp_ctx, cg->targets[k], g_ty_i64, false);
+                    if (tidx >= 0) {
+                        comp_ctx.slots[tidx].state = OWN_ALIVE;
+                        comp_ctx.slots[tidx].is_view = false;
+                        Type* it = cg->iter->ty;
+                        if (it && it->kind == TY_STR) {
+                            comp_ctx.slots[tidx].type = g_ty_str;
+                            comp_ctx.slots[tidx].is_view = false;
+                        } else if (it && (it->kind == TY_LIST || it->kind == TY_SET) && type_is_owned(it->elem)) {
+                            comp_ctx.slots[tidx].type = it->elem;
+                            comp_ctx.slots[tidx].is_view = true;
+                        } else if (it && it->kind == TY_DICT && type_is_owned(it->key)) {
+                            comp_ctx.slots[tidx].type = it->key;
+                            comp_ctx.slots[tidx].is_view = true;
+                        }
+                    }
+                }
+                for (int f = 0; f < cg->if_count; f++) own_check_expr(mod, fn, &comp_ctx, cg->ifs[f], false);
+            }
+            own_check_expr(mod, fn, &comp_ctx, e->comp.elt, type_is_owned(e->comp.elt->ty));
+            own_check_expr(mod, fn, &comp_ctx, e->comp.val, type_is_owned(e->comp.val->ty));
+            break;
+        }
+        case EXPR_CALL: {
+            Expr* ce = e->call.callee;
+            if (ce->kind == EXPR_ATTR) {
+                Type* ot = ce->attr.obj->ty;
+                const char* mn = ce->attr.attr;
+                if (ot && (ot->kind == TY_LIST || ot->kind == TY_SET || ot->kind == TY_DICT || ot->kind == TY_FILE)) {
+                    bool mut = is_mutating_container_method(ot, mn);
+                    if (mut) {
+                        const char* rv = expr_root_var(ce->attr.obj);
+                        if (rv) own_check_mutate_var(ctx, rv, e->loc);
+                    }
+                    own_check_expr(mod, fn, ctx, ce->attr.obj, false);
+                    bool arg_move = (ot->kind == TY_LIST && (strcmp(mn, "append") == 0 || strcmp(mn, "insert") == 0)) ||
+                                    (ot->kind == TY_SET && strcmp(mn, "add") == 0) ||
+                                    (ot->kind == TY_DICT && strcmp(mn, "setdefault") == 0);
+                    for (int i = 0; i < e->call.arg_count; i++) {
+                        bool mv = arg_move && (ot->kind != TY_LIST || strcmp(mn, "insert") != 0 || i == 1) &&
+                                  type_is_owned(e->call.args[i]->ty);
+                        own_check_expr(mod, fn, ctx, e->call.args[i], mv);
+                    }
+                    break;
+                }
+                if (ot && ot->kind == TY_CLASS) {
+                    FuncInfo* m = e->call.resolved_fn ? e->call.resolved_fn : find_method_in_class(ot->cls, mn);
+                    if (m && m->param_modes) {
+                        int sp = m->is_static ? 0 : 1;
+                        const char* mut_vars[16];
+                        int mut_cnt = 0;
+                        if (!m->is_static && !m->is_classmethod && m->param_count > 0 && m->param_modes[0] == PM_MUT_BORROW) {
+                            const char* rv = expr_root_var(ce->attr.obj);
+                            if (rv) {
+                                own_check_mutate_var(ctx, rv, e->loc);
+                                if (mut_cnt < 16) mut_vars[mut_cnt++] = rv;
+                            }
+                        }
+                        own_check_expr(mod, fn, ctx, ce->attr.obj, false);
+                        for (int i = 0; i < e->call.arg_count && i + sp < m->param_count; i++) {
+                            ParamMode pm = m->param_modes[i + sp];
+                            if (pm == PM_MUT_BORROW && e->call.args[i]->kind == EXPR_VAR) {
+                                const char* av = e->call.args[i]->var.name;
+                                for (int k = 0; k < mut_cnt; k++) {
+                                    if (strcmp(mut_vars[k], av) == 0) error_at(e->loc, "cannot borrow '%s' as mutable more than once", av);
+                                }
+                                own_check_mutate_var(ctx, av, e->call.args[i]->loc);
+                                if (mut_cnt < 16) mut_vars[mut_cnt++] = av;
+                            }
+                            own_check_expr(mod, fn, ctx, e->call.args[i], pm == PM_MOVE && type_is_owned(e->call.args[i]->ty));
+                        }
+                        break;
+                    }
+                }
+                own_check_expr(mod, fn, ctx, ce->attr.obj, false);
+                for (int i = 0; i < e->call.arg_count; i++) own_check_expr(mod, fn, ctx, e->call.args[i], false);
+                break;
+            }
+            if (ce->kind == EXPR_VAR) {
+                const char* cname = ce->var.name;
+                ClassInfo* ci = find_class_in_mod(mod, cname);
+                if (ci) {
+                    FuncInfo* init_fn = find_method_in_class(ci, "__init__");
+                    for (int i = 0; i < e->call.arg_count; i++) {
+                        bool mv = type_is_owned(e->call.args[i]->ty);
+                        if (init_fn && init_fn->param_modes && i + 1 < init_fn->param_count) {
+                            mv = (init_fn->param_modes[i + 1] == PM_MOVE) && type_is_owned(e->call.args[i]->ty);
+                        }
+                        own_check_expr(mod, fn, ctx, e->call.args[i], mv);
+                    }
+                    break;
+                }
+                FuncInfo* tf = e->call.resolved_fn ? e->call.resolved_fn : find_func_in_mod(mod, cname);
+                if (!tf && fn) {
+                    for (int i = 0; i < g_all_func_count; i++) {
+                        if (g_all_funcs[i]->parent_fn == fn && strcmp(g_all_funcs[i]->name, cname) == 0) {
+                            tf = g_all_funcs[i]; break;
+                        }
+                    }
+                }
+                if (tf && tf->param_modes) {
+                    const char* mut_vars[16];
+                    int mut_cnt = 0;
+                    for (int i = 0; i < e->call.arg_count && i < tf->param_count; i++) {
+                        ParamMode pm = tf->param_modes[i];
+                        if (pm == PM_MUT_BORROW && e->call.args[i]->kind == EXPR_VAR) {
+                            const char* av = e->call.args[i]->var.name;
+                            for (int k = 0; k < mut_cnt; k++) {
+                                if (strcmp(mut_vars[k], av) == 0) error_at(e->loc, "cannot borrow '%s' as mutable more than once", av);
+                            }
+                            own_check_mutate_var(ctx, av, e->call.args[i]->loc);
+                            if (mut_cnt < 16) mut_vars[mut_cnt++] = av;
+                        }
+                        own_check_expr(mod, fn, ctx, e->call.args[i], pm == PM_MOVE && type_is_owned(e->call.args[i]->ty));
+                    }
+                    break;
+                }
+            }
+            for (int i = 0; i < e->call.arg_count; i++) own_check_expr(mod, fn, ctx, e->call.args[i], false);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static void own_merge_ctx(OwnCtx* dst, OwnCtx* brs, int br_count) {
+    for (int i = 0; i < dst->count; i++) {
+        OwnState st = brs[0].slots[i].state;
+        bool diff = false;
+        for (int b = 1; b < br_count; b++) {
+            if (brs[b].slots[i].state != st) diff = true;
+        }
+        if (diff) {
+            if (st == OWN_MOVED || st == OWN_MAYBE_MOVED) dst->slots[i].state = OWN_MAYBE_MOVED;
+            else {
+                bool any_moved = false;
+                for (int b = 0; b < br_count; b++) {
+                    if (brs[b].slots[i].state == OWN_MOVED || brs[b].slots[i].state == OWN_MAYBE_MOVED) any_moved = true;
+                }
+                dst->slots[i].state = any_moved ? OWN_MAYBE_MOVED : OWN_ALIVE;
+            }
+        } else {
+            dst->slots[i].state = st;
+        }
+    }
+}
+
+static void own_check_stmts(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Stmt** stmts, int count) {
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        switch (s->kind) {
+            case STMT_RETURN:
+                if (s->ret.expr) own_check_expr(mod, fn, ctx, s->ret.expr, type_is_owned(s->ret.expr->ty));
+                break;
+            case STMT_YIELD:
+                if (s->expr_s.expr) own_check_expr(mod, fn, ctx, s->expr_s.expr, type_is_owned(s->expr_s.expr->ty));
+                break;
+            case STMT_YIELD_FROM:
+                own_check_expr(mod, fn, ctx, s->expr_s.expr, false);
+                break;
+            case STMT_EXPR:
+                own_check_expr(mod, fn, ctx, s->expr_s.expr, false);
+                break;
+            case STMT_ASSIGN: {
+                Expr* tgt = s->assign.target;
+                if (tgt->kind == EXPR_VAR) {
+                    const char* vname = tgt->var.name;
+                    bool is_glob = fn ? (find_global_in_mod(mod, vname) != NULL && find_local_in_fn(fn, vname) == NULL) : true;
+                    if (!s->assign.value) {
+                        VarSym* vs = resolve_var(mod, fn, vname, NULL);
+                        own_ensure(ctx, vname, vs ? vs->type : NULL, is_glob);
+                        break;
+                    }
+                    VarSym* vs = resolve_var(mod, fn, vname, NULL);
+                    Type* vty = vs ? vs->type : s->assign.value->ty;
+                    bool is_borrow = !is_glob && expr_is_borrow_source(s->assign.value) && type_is_owned(vty);
+                    if (is_borrow) {
+                        own_check_expr(mod, fn, ctx, s->assign.value, false);
+                    } else {
+                        own_check_expr(mod, fn, ctx, s->assign.value, type_is_owned(vty));
+                    }
+                    int idx = own_find(ctx, vname);
+                    if (idx >= 0) {
+                        if (ctx->slots[idx].imm_borrows > 0 || ctx->slots[idx].mut_borrows > 0) {
+                            error_at(s->loc, "cannot reassign '%s' while it is borrowed", vname);
+                        }
+                        if (ctx->slots[idx].is_view) own_release_view(ctx, idx);
+                    } else {
+                        idx = own_ensure(ctx, vname, vty, is_glob);
+                    }
+                    if (idx >= 0) {
+                        ctx->slots[idx].state = OWN_ALIVE;
+                        ctx->slots[idx].is_view = is_borrow;
+                        if (is_borrow) {
+                            const char* rv = expr_root_var(s->assign.value);
+                            ctx->slots[idx].borrow_owner = rv;
+                            if (rv) {
+                                int oi = own_find(ctx, rv);
+                                if (oi >= 0) ctx->slots[oi].imm_borrows++;
+                            }
+                        } else {
+                            ctx->slots[idx].borrow_owner = NULL;
+                        }
+                    }
+                } else if (tgt->kind == EXPR_ATTR) {
+                    const char* rv = expr_root_var(tgt->attr.obj);
+                    if (rv) own_check_mutate_var(ctx, rv, s->loc);
+                    own_check_expr(mod, fn, ctx, tgt->attr.obj, false);
+                    own_check_expr(mod, fn, ctx, s->assign.value, type_is_owned(s->assign.value->ty));
+                } else if (tgt->kind == EXPR_INDEX) {
+                    const char* rv = expr_root_var(tgt->index.obj);
+                    if (rv) own_check_mutate_var(ctx, rv, s->loc);
+                    own_check_expr(mod, fn, ctx, tgt->index.obj, false);
+                    bool move_key = tgt->index.obj->ty && tgt->index.obj->ty->kind == TY_DICT &&
+                                    type_is_owned(tgt->index.obj->ty->key);
+                    own_check_expr(mod, fn, ctx, tgt->index.index, move_key);
+                    own_check_expr(mod, fn, ctx, s->assign.value, type_is_owned(s->assign.value->ty));
+                }
+                break;
+            }
+            case STMT_MULTI_ASSIGN:
+                own_check_expr(mod, fn, ctx, s->multi_assign.value, false);
+                for (int k = 0; k < s->multi_assign.target_count; k++) {
+                    Expr* t = s->multi_assign.targets[k];
+                    if (t->kind == EXPR_VAR) {
+                        VarSym* vs = resolve_var(mod, fn, t->var.name, NULL);
+                        int idx = own_ensure(ctx, t->var.name, vs ? vs->type : NULL, fn == NULL);
+                        if (idx >= 0) ctx->slots[idx].state = OWN_ALIVE;
+                    }
+                }
+                break;
+            case STMT_AUG_ASSIGN: {
+                const char* rv = expr_root_var(s->aug_assign.target);
+                if (rv) own_check_mutate_var(ctx, rv, s->loc);
+                own_check_expr(mod, fn, ctx, s->aug_assign.target, false);
+                own_check_expr(mod, fn, ctx, s->aug_assign.value, false);
+                break;
+            }
+            case STMT_IF: {
+                OwnCtx brs[32];
+                int bc = s->if_s.branch_count;
+                for (int b = 0; b < bc; b++) {
+                    own_check_expr(mod, fn, ctx, s->if_s.conds[b], false);
+                    brs[b] = *ctx;
+                    own_check_stmts(mod, fn, &brs[b], s->if_s.bodies[b], s->if_s.body_counts[b]);
+                    own_sync_to_fn(fn, &brs[b]);
+                }
+                if (s->if_s.else_count > 0 && bc < 31) {
+                    brs[bc] = *ctx;
+                    own_check_stmts(mod, fn, &brs[bc], s->if_s.else_body, s->if_s.else_count);
+                    own_sync_to_fn(fn, &brs[bc]);
+                    own_merge_ctx(ctx, brs, bc + 1);
+                } else {
+                    if (bc < 31) {
+                        brs[bc] = *ctx;
+                        own_merge_ctx(ctx, brs, bc + 1);
+                    }
+                }
+                break;
+            }
+            case STMT_WHILE: {
+                own_check_expr(mod, fn, ctx, s->while_s.cond, false);
+                OwnCtx body_ctx = *ctx;
+                body_ctx.loop_depth++;
+                own_check_stmts(mod, fn, &body_ctx, s->while_s.body, s->while_s.body_count);
+                own_sync_to_fn(fn, &body_ctx);
+                for (int k = 0; k < ctx->count; k++) {
+                    if (type_is_owned(ctx->slots[k].type) && ctx->slots[k].state == OWN_ALIVE &&
+                        (body_ctx.slots[k].state == OWN_MOVED || body_ctx.slots[k].state == OWN_MAYBE_MOVED)) {
+                        error_at(s->loc, "value '%s' moved inside loop without being reassigned", ctx->slots[k].name);
+                    }
+                }
+                if (s->while_s.else_count > 0) {
+                    own_check_stmts(mod, fn, ctx, s->while_s.else_body, s->while_s.else_count);
+                }
+                break;
+            }
+            case STMT_FOR: {
+                own_check_expr(mod, fn, ctx, s->for_s.iter, false);
+                const char* iter_owner = (s->for_s.iter->kind == EXPR_VAR) ? s->for_s.iter->var.name : NULL;
+                int iter_idx = iter_owner ? own_find(ctx, iter_owner) : -1;
+                if (iter_idx >= 0) ctx->slots[iter_idx].imm_borrows++;
+
+                OwnCtx body_ctx = *ctx;
+                body_ctx.loop_depth++;
+                bool iter_allocs_str = (s->for_s.iter->ty && s->for_s.iter->ty->kind == TY_STR);
+                for (int k = 0; k < s->for_s.target_count; k++) {
+                    VarSym* tv = resolve_var(mod, fn, s->for_s.targets[k], NULL);
+                    Type* tty = tv ? tv->type : NULL;
+                    int tidx = own_ensure(&body_ctx, s->for_s.targets[k], tty, fn == NULL);
+                    if (tidx >= 0) {
+                        body_ctx.slots[tidx].state = OWN_ALIVE;
+                        if (type_is_owned(tty) && !iter_allocs_str) {
+                            body_ctx.slots[tidx].is_view = true;
+                            body_ctx.slots[tidx].borrow_owner = iter_owner;
+                        } else {
+                            body_ctx.slots[tidx].is_view = false;
+                            body_ctx.slots[tidx].borrow_owner = NULL;
+                        }
+                    }
+                }
+                own_check_stmts(mod, fn, &body_ctx, s->for_s.body, s->for_s.body_count);
+                own_sync_to_fn(fn, &body_ctx);
+                for (int k = 0; k < ctx->count; k++) {
+                    if (type_is_owned(ctx->slots[k].type) && ctx->slots[k].state == OWN_ALIVE &&
+                        (body_ctx.slots[k].state == OWN_MOVED || body_ctx.slots[k].state == OWN_MAYBE_MOVED)) {
+                        error_at(s->loc, "value '%s' moved inside loop without being reassigned", ctx->slots[k].name);
+                    }
+                }
+                if (iter_idx >= 0 && ctx->slots[iter_idx].imm_borrows > 0) ctx->slots[iter_idx].imm_borrows--;
+                if (s->for_s.else_count > 0) own_check_stmts(mod, fn, ctx, s->for_s.else_body, s->for_s.else_count);
+                break;
+            }
+            case STMT_TRY: {
+                OwnCtx brs[32];
+                brs[0] = *ctx;
+                own_check_stmts(mod, fn, &brs[0], s->try_s.try_body, s->try_s.try_count);
+                own_sync_to_fn(fn, &brs[0]);
+                int bc = 1;
+                for (int h = 0; h < s->try_s.handler_count && bc < 32; h++) {
+                    brs[bc] = *ctx;
+                    if (s->try_s.handlers[h].as_name) {
+                        VarSym* ev = resolve_var(mod, fn, s->try_s.handlers[h].as_name, NULL);
+                        int eidx = own_ensure(&brs[bc], s->try_s.handlers[h].as_name, ev ? ev->type : NULL, fn == NULL);
+                        if (eidx >= 0) {
+                            brs[bc].slots[eidx].state = OWN_ALIVE;
+                            brs[bc].slots[eidx].is_view = true;
+                        }
+                    }
+                    own_check_stmts(mod, fn, &brs[bc], s->try_s.handlers[h].body, s->try_s.handlers[h].body_count);
+                    own_sync_to_fn(fn, &brs[bc]);
+                    bc++;
+                }
+                own_merge_ctx(ctx, brs, bc);
+                if (s->try_s.else_count > 0) own_check_stmts(mod, fn, ctx, s->try_s.else_body, s->try_s.else_count);
+                if (s->try_s.finally_count > 0) own_check_stmts(mod, fn, ctx, s->try_s.finally_body, s->try_s.finally_count);
+                break;
+            }
+            case STMT_WITH: {
+                own_check_expr(mod, fn, ctx, s->with_s.ctx, false);
+                if (s->with_s.as_name) {
+                    VarSym* av = resolve_var(mod, fn, s->with_s.as_name, NULL);
+                    int aidx = own_ensure(ctx, s->with_s.as_name, av ? av->type : NULL, fn == NULL);
+                    if (aidx >= 0) {
+                        ctx->slots[aidx].state = OWN_ALIVE;
+                        ctx->slots[aidx].is_view = (s->with_s.ctx->ty && s->with_s.ctx->ty->kind == TY_FILE);
+                        ctx->slots[aidx].is_mut_borrow = (s->with_s.ctx->ty && s->with_s.ctx->ty->kind == TY_FILE);
+                    }
+                }
+                own_check_stmts(mod, fn, ctx, s->with_s.body, s->with_s.body_count);
+                break;
+            }
+            case STMT_DEL:
+                if (s->del_s.target->kind == EXPR_VAR) {
+                    const char* vn = s->del_s.target->var.name;
+                    own_check_mutate_var(ctx, vn, s->loc);
+                    int idx = own_find(ctx, vn);
+                    if (idx >= 0) ctx->slots[idx].state = OWN_MOVED;
+                } else if (s->del_s.target->kind == EXPR_INDEX) {
+                    const char* rv = expr_root_var(s->del_s.target->index.obj);
+                    if (rv) own_check_mutate_var(ctx, rv, s->loc);
+                    own_check_expr(mod, fn, ctx, s->del_s.target->index.obj, false);
+                    own_check_expr(mod, fn, ctx, s->del_s.target->index.index, false);
+                }
+                break;
+            case STMT_ASSERT:
+                own_check_expr(mod, fn, ctx, s->assert_s.cond, false);
+                own_check_expr(mod, fn, ctx, s->assert_s.msg, false);
+                break;
+            case STMT_RAISE:
+                if (s->raise_s.exc) own_check_expr(mod, fn, ctx, s->raise_s.exc, type_is_owned(s->raise_s.exc->ty));
+                break;
+            case STMT_MATCH: {
+                own_check_expr(mod, fn, ctx, s->match_s.subject, false);
+                OwnCtx brs[32];
+                int cc = s->match_s.case_count;
+                for (int c = 0; c < cc && c < 32; c++) {
+                    own_check_expr(mod, fn, ctx, s->match_s.cases[c].pattern, false);
+                    brs[c] = *ctx;
+                    if (s->match_s.cases[c].capture) {
+                        VarSym* cv = resolve_var(mod, fn, s->match_s.cases[c].capture, NULL);
+                        int cidx = own_ensure(&brs[c], s->match_s.cases[c].capture, cv ? cv->type : NULL, fn == NULL);
+                        if (cidx >= 0) {
+                            brs[c].slots[cidx].state = OWN_ALIVE;
+                            brs[c].slots[cidx].is_view = true;
+                        }
+                    }
+                    own_check_stmts(mod, fn, &brs[c], s->match_s.cases[c].body, s->match_s.cases[c].body_count);
+                    own_sync_to_fn(fn, &brs[c]);
+                }
+                if (cc > 0) own_merge_ctx(ctx, brs, cc < 32 ? cc : 32);
+                break;
+            }
+            default: break;
+        }
+        own_end_dead_views(ctx, stmts + i + 1, count - i - 1);
+        own_sync_to_fn(fn, ctx);
+    }
+}
+
+static void check_program_ownership(void) {
+    analyze_ownership_modes();
+    for (int i = 0; i < g_all_func_count; i++) {
+        FuncInfo* fn = g_all_funcs[i];
+        if (fn->is_generic) continue;
+        OwnCtx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        for (int p = 0; p < fn->param_count; p++) {
+            int idx = own_ensure(&ctx, fn->param_names[p], fn->param_types[p], false);
+            if (idx >= 0) {
+                ctx.slots[idx].state = OWN_ALIVE;
+                ctx.slots[idx].is_view = (fn->param_modes && fn->param_modes[p] != PM_MOVE);
+                ctx.slots[idx].is_mut_borrow = (fn->param_modes && fn->param_modes[p] == PM_MUT_BORROW);
+            }
+        }
+        if (fn->is_lambda && fn->lambda_ast) {
+            own_check_expr(fn->mod, fn, &ctx, fn->lambda_ast->lambda.body, type_is_owned(fn->ret_type));
+        } else if (fn->ast) {
+            own_check_stmts(fn->mod, fn, &ctx, fn->ast->def_s.body, fn->ast->def_s.body_count);
+            own_sync_to_fn(fn, &ctx);
+        }
+    }
+    for (int m = 0; m < g_module_count; m++) {
+        ModuleInfo* mod = g_modules[m];
+        OwnCtx mctx;
+        memset(&mctx, 0, sizeof(mctx));
+        own_check_stmts(mod, NULL, &mctx, mod->stmts, mod->stmt_count);
+    }
+}
+
+/* =========================================================================
  * 5. LLVM IR CODE GENERATOR
  * ========================================================================= */
 
@@ -5815,6 +7006,7 @@ typedef struct {
     const char* cont_lbl;
     bool* broke_flag;
     const char* broke_alloca;
+    int body_temp_mark;
 } LoopCtx;
 
 typedef struct {
@@ -5832,6 +7024,8 @@ typedef struct {
     FuncInfo* cur_fn;
     ModuleInfo* cur_mod;
     const char* yield_list_reg;
+    const char* fn_unwind_lbl;
+    const char* cur_unwind_lbl;
     LoopCtx loop_stack[64];
     int loop_depth;
     /* String literal deduplication */
@@ -5840,11 +7034,16 @@ typedef struct {
     const char** lit_syms;
     int lit_count;
     int lit_cap;
-    /* Track which hash/eq helpers were emitted */
+    /* Track which hash/eq/drop/clone helpers were emitted */
     TypeRegistry emitted_hash_eq;
+    TypeRegistry emitted_drops;
+    TypeRegistry emitted_clones;
     /* Track declared globals/allocas in current func */
     const char** fn_allocas;
     int fn_alloca_count;
+    /* Track unconsumed heap temporaries in current statement */
+    struct { const char* reg; Type* ty; bool active; } temps[128];
+    int temp_count;
 } CG;
 
 static CG g_cg;
@@ -5956,6 +7155,71 @@ static const char* llvm_reg_ty(Type* t) {
 static const char* llvm_mem_ty(Type* t) {
     if (t && t->kind == TY_BOOL) return "i8";
     return llvm_reg_ty(t);
+}
+
+static const char* llvm_fn_ret_ty(FuncInfo* fn) {
+    if (!fn || !fn->can_raise) return llvm_reg_ty(fn ? fn->ret_type : NULL);
+    if (!fn->ret_type || fn->ret_type->kind == TY_VOID) return "i1";
+    return arena_sprintf("{ i1, %s }", llvm_reg_ty(fn->ret_type));
+}
+
+static bool cg_has_active_temps(int mark);
+static void cg_flush_temps_preserve(int mark);
+
+static void cg_raise_branch(void) {
+    if (g_cg.block_terminated) return;
+    if (g_cg.cur_unwind_lbl) {
+        cg_flush_temps_preserve(0);
+        cg_br(g_cg.cur_unwind_lbl);
+    } else {
+        cg_emit("call void @stricta_unhandled_exc()");
+        cg_emit("unreachable");
+        g_cg.block_terminated = true;
+    }
+}
+
+static const char* cg_emit_call_check(FuncInfo* target_fn, const char* call_sym, const char* args_str) {
+    if (!target_fn->can_raise) {
+        if (target_fn->ret_type->kind == TY_VOID) {
+            cg_emit("call void %s(%s)", call_sym, args_str);
+            return "0";
+        }
+        const char* r = cg_reg();
+        cg_emit("%s = call %s %s(%s)", r, llvm_reg_ty(target_fn->ret_type), call_sym, args_str);
+        return r;
+    }
+    const char* rty = llvm_fn_ret_ty(target_fn);
+    const char* raw = cg_reg();
+    cg_emit("%s = call %s %s(%s)", raw, rty, call_sym, args_str);
+    const char* is_exc = raw;
+    if (target_fn->ret_type->kind != TY_VOID) {
+        is_exc = cg_reg();
+        cg_emit("%s = extractvalue %s %s, 0", is_exc, rty, raw);
+    }
+    const char* l_ok = cg_lbl("call_ok");
+    if (g_cg.cur_unwind_lbl) {
+        if (cg_has_active_temps(0)) {
+            const char* l_ed = cg_lbl("call_ed");
+            cg_cond_br(is_exc, l_ed, l_ok);
+            cg_label(l_ed);
+            cg_flush_temps_preserve(0);
+            cg_br(g_cg.cur_unwind_lbl);
+        } else {
+            cg_cond_br(is_exc, g_cg.cur_unwind_lbl, l_ok);
+        }
+    } else {
+        const char* l_unh = cg_lbl("call_unh");
+        cg_cond_br(is_exc, l_unh, l_ok);
+        cg_label(l_unh);
+        cg_emit("call void @stricta_unhandled_exc()");
+        cg_emit("unreachable");
+        g_cg.block_terminated = true;
+    }
+    cg_label(l_ok);
+    if (target_fn->ret_type->kind == TY_VOID) return "0";
+    const char* val = cg_reg();
+    cg_emit("%s = extractvalue %s %s, 1", val, rty, raw);
+    return val;
 }
 
 static const char* llvm_zero(Type* t) {
@@ -6165,7 +7429,7 @@ static const char* cg_strictastr_lit(const char* s, size_t len) {
     int id = ++g_cg.str_id;
     const char* tsym = arena_sprintf("@.tstr.%d", id);
     uint32_t h = c_fnv1a(s, len);
-    sb_printf(&g_cg.strs, "%s = private constant %%StrictaStr { i32 %zu, i32 %u, ptr %s }\n",
+    sb_printf(&g_cg.strs, "%s = private constant %%StrictaStr { i32 %zu, i32 %u, ptr %s, i32 1 }\n",
               tsym, len, h, csym);
     return tsym;
 }
@@ -6302,9 +7566,299 @@ static void emit_hash_eq_for_type(Type* t) {
     }
 }
 
+static void emit_drop_for_type(Type* t);
+static void emit_clone_for_type(Type* t);
+
+static void emit_drop_for_type(Type* t) {
+    if (!t || !type_is_owned(t)) return;
+    for (int i = 0; i < g_cg.emitted_drops.count; i++) {
+        if (type_eq(g_cg.emitted_drops.items[i], t)) return;
+    }
+    reg_add_unique(&g_cg.emitted_drops, t);
+
+    if (t->kind == TY_OPTIONAL && !type_is_heap_ref(t->elem)) reg_add_unique(&g_mono_opts, t);
+    else if (t->kind == TY_TUPLE) reg_add_unique(&g_mono_tuples, t);
+    else if (t->kind == TY_LIST) reg_add_unique(&g_mono_lists, t);
+    else if (t->kind == TY_SET) reg_add_unique(&g_mono_sets, t);
+    else if (t->kind == TY_DICT) reg_add_unique(&g_mono_dicts, t);
+
+    if (t->kind == TY_OPTIONAL) emit_drop_for_type(t->elem);
+    else if (t->kind == TY_LIST || t->kind == TY_SET) emit_drop_for_type(t->elem);
+    else if (t->kind == TY_DICT) { emit_drop_for_type(t->key); emit_drop_for_type(t->val); }
+    else if (t->kind == TY_TUPLE) {
+        for (int i = 0; i < t->tuple_count; i++) emit_drop_for_type(t->tuple_elems[i]);
+    } else if (t->kind == TY_CLASS) {
+        for (int i = 0; i < t->cls->field_count; i++) emit_drop_for_type(t->cls->fields[i].type);
+        if (t->cls->has_subclasses) {
+            for (int c = 0; c < g_all_class_count; c++) {
+                ClassInfo* sub = g_all_classes[c];
+                if (sub != t->cls && class_is_subclass(sub, t->cls)) emit_drop_for_type(sub->type);
+            }
+        }
+    }
+
+    const char* m = t->mangled;
+    const char* mty = llvm_mem_ty(t);
+    StrBuf* b = &g_cg.mono;
+
+    if (t->kind == TY_STR) {
+        sb_printf(b, "define internal void @_drop_%s(ptr %%v) alwaysinline {\nentry:\n  call void @stricta_str_free(ptr %%v)\n  ret void\n}\n\n", m);
+        return;
+    }
+    if (t->kind == TY_BYTES) {
+        sb_printf(b, "define internal void @_drop_%s(ptr %%v) alwaysinline {\nentry:\n  call void @stricta_bytes_free(ptr %%v)\n  ret void\n}\n\n", m);
+        return;
+    }
+    if (t->kind == TY_BIGINT) {
+        sb_printf(b, "define internal void @_drop_%s(ptr %%v) alwaysinline {\nentry:\n  call void @stricta_bigint_free(ptr %%v)\n  ret void\n}\n\n", m);
+        return;
+    }
+    if (t->kind == TY_FILE) {
+        sb_printf(b, "define internal void @_drop_%s(ptr %%v) alwaysinline {\nentry:\n  call void @stricta_file_free(ptr %%v)\n  ret void\n}\n\n", m);
+        return;
+    }
+    if (t->kind == TY_OPTIONAL) {
+        if (type_is_heap_ref(t->elem)) {
+            sb_printf(b, "define internal void @_drop_%s(ptr %%v) alwaysinline {\nentry:\n  %s", m, "");
+            sb_printf(b, "call void @_drop_%s(ptr %%v)\n  ret void\n}\n\n", t->elem->mangled);
+        } else {
+            const char* emty = llvm_mem_ty(t->elem);
+            sb_printf(b, "define internal void @_drop_%s(%s %%v) alwaysinline {\nentry:\n", m, mty);
+            sb_printf(b, "  %%tag = extractvalue %s %%v, 0\n  %%ok = icmp ne i8 %%tag, 0\n  br i1 %%ok, label %%some, label %%done\nsome:\n", mty);
+            sb_printf(b, "  %%ev = extractvalue %s %%v, 1\n  call void @_drop_%s(%s %%ev)\n  br label %%done\ndone:\n  ret void\n}\n\n",
+                      mty, t->elem->mangled, emty);
+        }
+        return;
+    }
+    if (t->kind == TY_TUPLE) {
+        sb_printf(b, "define internal void @_drop_%s(%s %%v) alwaysinline {\nentry:\n", m, mty);
+        for (int i = 0; i < t->tuple_count; i++) {
+            if (type_is_owned(t->tuple_elems[i])) {
+                sb_printf(b, "  %%f%d = extractvalue %s %%v, %d\n  call void @_drop_%s(%s %%f%d)\n",
+                          i, mty, i, t->tuple_elems[i]->mangled, llvm_mem_ty(t->tuple_elems[i]), i);
+            }
+        }
+        sb_append(b, "  ret void\n}\n\n");
+        return;
+    }
+    if (t->kind == TY_LIST) {
+        const char* sty = arena_sprintf("%%%s", m);
+        const char* emty = llvm_mem_ty(t->elem);
+        sb_printf(b, "define internal void @_drop_fields_%s(ptr %%l) {\nentry:\n", m);
+        sb_printf(b, "  %%chk = icmp eq ptr %%l, null\n  br i1 %%chk, label %%done, label %%go\ngo:\n");
+        sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
+        if (type_is_owned(t->elem)) {
+            sb_printf(b, "  %%lp = getelementptr %s, ptr %%l, i32 0, i32 0\n  %%len = load i32, ptr %%lp\n  br label %%loop\n", sty);
+            sb_append(b, "loop:\n  %i = phi i32 [ 0, %go ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %after_elems\nbody:\n");
+            sb_printf(b, "  %%ep = getelementptr %s, ptr %%arr, i32 %%i\n  %%ev = load %s, ptr %%ep\n  call void @_drop_%s(%s %%ev)\n  %%in = add i32 %%i, 1\n  br label %%loop\nafter_elems:\n",
+                      emty, emty, t->elem->mangled, emty);
+        }
+        sb_printf(b, "  %%cp = getelementptr %s, ptr %%l, i32 0, i32 1\n  %%cap = load i32, ptr %%cp\n  %%is_heap = icmp sgt i32 %%cap, 0\n  br i1 %%is_heap, label %%free_buf, label %%done\nfree_buf:\n  call void @free(ptr %%arr)\n  br label %%done\ndone:\n  ret void\n}\n\n", sty);
+        sb_printf(b, "define internal void @_drop_%s(ptr %%l) {\nentry:\n  %%z = icmp eq ptr %%l, null\n  br i1 %%z, label %%done, label %%go\ngo:\n  call void @_drop_fields_%s(ptr %%l)\n  call void @free(ptr %%l)\n  br label %%done\ndone:\n  ret void\n}\n\n", m, m);
+        return;
+    }
+    if (t->kind == TY_SET) {
+        const char* sty = arena_sprintf("%%%s", m);
+        const char* emty = llvm_mem_ty(t->elem);
+        sb_printf(b, "define internal void @_drop_%s(ptr %%s) {\nentry:\n  %%z = icmp eq ptr %%s, null\n  br i1 %%z, label %%done, label %%go\ngo:\n", m);
+        sb_printf(b, "  %%p0 = getelementptr %s, ptr %%s, i32 0, i32 0\n  %%items = load ptr, ptr %%p0\n", sty);
+        sb_printf(b, "  %%p1 = getelementptr %s, ptr %%s, i32 0, i32 1\n  %%buckets = load ptr, ptr %%p1\n", sty);
+        if (type_is_owned(t->elem)) {
+            sb_printf(b, "  %%p2 = getelementptr %s, ptr %%s, i32 0, i32 2\n  %%len = load i32, ptr %%p2\n  br label %%loop\n", sty);
+            sb_append(b, "loop:\n  %i = phi i32 [ 0, %go ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %after_elems\nbody:\n");
+            sb_printf(b, "  %%ep = getelementptr %s, ptr %%items, i32 %%i\n  %%ev = load %s, ptr %%ep\n  call void @_drop_%s(%s %%ev)\n  %%in = add i32 %%i, 1\n  br label %%loop\nafter_elems:\n",
+                      emty, emty, t->elem->mangled, emty);
+        }
+        sb_append(b, "  call void @stricta_free(ptr %items)\n  call void @stricta_free(ptr %buckets)\n  call void @stricta_free(ptr %s)\n  br label %done\ndone:\n  ret void\n}\n\n");
+        return;
+    }
+    if (t->kind == TY_DICT) {
+        const char* sty = arena_sprintf("%%%s", m);
+        const char* kmty = llvm_mem_ty(t->key);
+        const char* vmty = llvm_mem_ty(t->val);
+        sb_printf(b, "define internal void @_drop_%s(ptr %%d) {\nentry:\n  %%z = icmp eq ptr %%d, null\n  br i1 %%z, label %%done, label %%go\ngo:\n", m);
+        sb_printf(b, "  %%p0 = getelementptr %s, ptr %%d, i32 0, i32 0\n  %%keys = load ptr, ptr %%p0\n", sty);
+        sb_printf(b, "  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n", sty);
+        sb_printf(b, "  %%p2 = getelementptr %s, ptr %%d, i32 0, i32 2\n  %%buckets = load ptr, ptr %%p2\n", sty);
+        if (type_is_owned(t->key) || type_is_owned(t->val)) {
+            sb_printf(b, "  %%p3 = getelementptr %s, ptr %%d, i32 0, i32 3\n  %%len = load i32, ptr %%p3\n  br label %%loop\n", sty);
+            sb_append(b, "loop:\n  %i = phi i32 [ 0, %go ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %after_elems\nbody:\n");
+            if (type_is_owned(t->key)) {
+                sb_printf(b, "  %%kp = getelementptr %s, ptr %%keys, i32 %%i\n  %%kv = load %s, ptr %%kp\n  call void @_drop_%s(%s %%kv)\n",
+                          kmty, kmty, t->key->mangled, kmty);
+            }
+            if (type_is_owned(t->val)) {
+                sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%i\n  %%vv = load %s, ptr %%vp\n  call void @_drop_%s(%s %%vv)\n",
+                          vmty, vmty, t->val->mangled, vmty);
+            }
+            sb_append(b, "  %in = add i32 %i, 1\n  br label %loop\nafter_elems:\n");
+        }
+        sb_append(b, "  call void @stricta_free(ptr %keys)\n  call void @stricta_free(ptr %vals)\n  call void @stricta_free(ptr %buckets)\n  call void @stricta_free(ptr %d)\n  br label %done\ndone:\n  ret void\n}\n\n");
+        return;
+    }
+    if (t->kind == TY_CLASS) {
+        ClassInfo* cls = t->cls;
+        if (cls->is_value_type) {
+            sb_printf(b, "define internal void @_drop_%s(%s %%v) alwaysinline {\nentry:\n", m, mty);
+            for (int f = 0; f < cls->field_count; f++) {
+                if (type_is_owned(cls->fields[f].type)) {
+                    sb_printf(b, "  %%f%d = extractvalue %s %%v, %d\n  call void @_drop_%s(%s %%f%d)\n",
+                              f, mty, cls->fields[f].slot_index, cls->fields[f].type->mangled, llvm_mem_ty(cls->fields[f].type), f);
+                }
+            }
+            sb_append(b, "  ret void\n}\n\n");
+            return;
+        }
+        sb_printf(b, "define internal void @_drop_fields_%s(ptr %%p) {\nentry:\n  %%z = icmp eq ptr %%p, null\n  br i1 %%z, label %%done, label %%go\ngo:\n", m);
+        for (int f = 0; f < cls->field_count; f++) {
+            Type* ft = cls->fields[f].type;
+            if (type_is_owned(ft)) {
+                const char* fmty = llvm_mem_ty(ft);
+                sb_printf(b, "  %%fp%d = getelementptr %s, ptr %%p, i32 0, i32 %d\n  %%fv%d = load %s, ptr %%fp%d\n  call void @_drop_%s(%s %%fv%d)\n",
+                          f, cls->llvm_name, cls->fields[f].slot_index, f, fmty, f, ft->mangled, fmty, f);
+            }
+        }
+        sb_append(b, "  br label %done\ndone:\n  ret void\n}\n\n");
+        sb_printf(b, "define internal void @_drop_%s(ptr %%p) {\nentry:\n  %%z = icmp eq ptr %%p, null\n  br i1 %%z, label %%done, label %%go\ngo:\n", m);
+        if (cls->needs_vtable && cls->has_subclasses) {
+            sb_printf(b, "  %%vpp = getelementptr %s, ptr %%p, i32 0, i32 0\n  %%vt = load ptr, ptr %%vpp\n  %%tid = load i32, ptr %%vt\n", cls->llvm_name);
+            sb_append(b, "  switch i32 %tid, label %def [");
+            for (int c = 0; c < g_all_class_count; c++) {
+                ClassInfo* sub = g_all_classes[c];
+                if (sub != cls && class_is_subclass(sub, cls)) {
+                    sb_printf(b, " i32 %d, label %%sub_%d", sub->type_id, sub->type_id);
+                }
+            }
+            sb_append(b, " ]\n");
+            for (int c = 0; c < g_all_class_count; c++) {
+                ClassInfo* sub = g_all_classes[c];
+                if (sub != cls && class_is_subclass(sub, cls)) {
+                    sb_printf(b, "sub_%d:\n  call void @_drop_fields_%s(ptr %%p)\n  br label %%after_f\n",
+                              sub->type_id, sub->type->mangled);
+                }
+            }
+            sb_printf(b, "def:\n  call void @_drop_fields_%s(ptr %%p)\n  br label %%after_f\nafter_f:\n", m);
+        } else {
+            sb_printf(b, "  call void @_drop_fields_%s(ptr %%p)\n", m);
+        }
+        sb_append(b, "  call void @free(ptr %p)\n  br label %done\ndone:\n  ret void\n}\n\n");
+    }
+}
+
+static void emit_clone_for_type(Type* t) {
+    if (!t || !type_is_owned(t)) return;
+    for (int i = 0; i < g_cg.emitted_clones.count; i++) {
+        if (type_eq(g_cg.emitted_clones.items[i], t)) return;
+    }
+    reg_add_unique(&g_cg.emitted_clones, t);
+
+    if (t->kind == TY_OPTIONAL && !type_is_heap_ref(t->elem)) reg_add_unique(&g_mono_opts, t);
+    else if (t->kind == TY_TUPLE) reg_add_unique(&g_mono_tuples, t);
+    else if (t->kind == TY_LIST) reg_add_unique(&g_mono_lists, t);
+    else if (t->kind == TY_SET) reg_add_unique(&g_mono_sets, t);
+    else if (t->kind == TY_DICT) reg_add_unique(&g_mono_dicts, t);
+
+    if (t->kind == TY_OPTIONAL) emit_clone_for_type(t->elem);
+    else if (t->kind == TY_TUPLE) {
+        for (int i = 0; i < t->tuple_count; i++) emit_clone_for_type(t->tuple_elems[i]);
+    } else if (t->kind == TY_CLASS) {
+        for (int i = 0; i < t->cls->field_count; i++) emit_clone_for_type(t->cls->fields[i].type);
+    }
+
+    const char* m = t->mangled;
+    const char* mty = llvm_mem_ty(t);
+    StrBuf* b = &g_cg.mono;
+
+    if (t->kind == TY_STR) {
+        sb_printf(b, "define internal ptr @_clone_%s(ptr %%v) alwaysinline {\nentry:\n  %%r = call ptr @stricta_str_clone(ptr %%v)\n  ret ptr %%r\n}\n\n", m);
+        return;
+    }
+    if (t->kind == TY_BYTES) {
+        sb_printf(b, "define internal ptr @_clone_%s(ptr %%v) alwaysinline {\nentry:\n  %%r = call ptr @stricta_bytes_clone(ptr %%v)\n  ret ptr %%r\n}\n\n", m);
+        return;
+    }
+    if (t->kind == TY_BIGINT) {
+        sb_printf(b, "define internal ptr @_clone_%s(ptr %%v) alwaysinline {\nentry:\n  %%r = call ptr @stricta_bigint_clone(ptr %%v)\n  ret ptr %%r\n}\n\n", m);
+        return;
+    }
+    if (t->kind == TY_FILE) {
+        sb_printf(b, "define internal ptr @_clone_%s(ptr %%v) alwaysinline {\nentry:\n  ret ptr %%v\n}\n\n", m);
+        return;
+    }
+    if (t->kind == TY_LIST || t->kind == TY_SET || t->kind == TY_DICT) {
+        sb_printf(b, "define internal ptr @_clone_%s(ptr %%v) alwaysinline {\nentry:\n  %%z = icmp eq ptr %%v, null\n  br i1 %%z, label %%rn, label %%rc\nrn:\n  ret ptr null\nrc:\n  %%r = call ptr @_%s_copy(ptr %%v)\n  ret ptr %%r\n}\n\n", m, m);
+        return;
+    }
+    if (t->kind == TY_OPTIONAL) {
+        if (type_is_heap_ref(t->elem)) {
+            sb_printf(b, "define internal ptr @_clone_%s(ptr %%v) alwaysinline {\nentry:\n  %%z = icmp eq ptr %%v, null\n  br i1 %%z, label %%rn, label %%rc\nrn:\n  ret ptr null\nrc:\n  %%r = call ptr @_clone_%s(ptr %%v)\n  ret ptr %%r\n}\n\n",
+                      m, t->elem->mangled);
+        } else {
+            const char* emty = llvm_mem_ty(t->elem);
+            sb_printf(b, "define internal %s @_clone_%s(%s %%v) alwaysinline {\nentry:\n", mty, m, mty);
+            sb_printf(b, "  %%tag = extractvalue %s %%v, 0\n  %%ok = icmp ne i8 %%tag, 0\n  br i1 %%ok, label %%some, label %%none\nnone:\n  ret %s %%v\nsome:\n", mty, mty);
+            sb_printf(b, "  %%ev = extractvalue %s %%v, 1\n  %%cv = call %s @_clone_%s(%s %%ev)\n",
+                      mty, emty, t->elem->mangled, emty);
+            sb_printf(b, "  %%res = insertvalue %s %%v, %s %%cv, 1\n  ret %s %%res\n}\n\n", mty, emty, mty);
+        }
+        return;
+    }
+    if (t->kind == TY_TUPLE) {
+        sb_printf(b, "define internal %s @_clone_%s(%s %%v) alwaysinline {\nentry:\n", mty, m, mty);
+        const char* cur = "%v";
+        for (int i = 0; i < t->tuple_count; i++) {
+            if (type_is_owned(t->tuple_elems[i])) {
+                const char* emty = llvm_mem_ty(t->tuple_elems[i]);
+                sb_printf(b, "  %%f%d = extractvalue %s %s, %d\n  %%cf%d = call %s @_clone_%s(%s %%f%d)\n  %%t%d = insertvalue %s %s, %s %%cf%d, %d\n",
+                          i, mty, cur, i, i, emty, t->tuple_elems[i]->mangled, emty, i, i, mty, cur, emty, i, i);
+                cur = arena_sprintf("%%t%d", i);
+            }
+        }
+        sb_printf(b, "  ret %s %s\n}\n\n", mty, cur);
+        return;
+    }
+    if (t->kind == TY_CLASS) {
+        ClassInfo* cls = t->cls;
+        if (cls->is_value_type) {
+            sb_printf(b, "define internal %s @_clone_%s(%s %%v) alwaysinline {\nentry:\n", mty, m, mty);
+            const char* cur = "%v";
+            for (int f = 0; f < cls->field_count; f++) {
+                Type* ft = cls->fields[f].type;
+                if (type_is_owned(ft)) {
+                    const char* fmty = llvm_mem_ty(ft);
+                    sb_printf(b, "  %%f%d = extractvalue %s %s, %d\n  %%cf%d = call %s @_clone_%s(%s %%f%d)\n  %%t%d = insertvalue %s %s, %s %%cf%d, %d\n",
+                              f, mty, cur, cls->fields[f].slot_index, f, fmty, ft->mangled, fmty, f, f, mty, cur, fmty, f, cls->fields[f].slot_index);
+                    cur = arena_sprintf("%%t%d", f);
+                }
+            }
+            sb_printf(b, "  ret %s %s\n}\n\n", mty, cur);
+            return;
+        }
+        sb_printf(b, "define internal ptr @_clone_%s(ptr %%p) {\nentry:\n  %%z = icmp eq ptr %%p, null\n  br i1 %%z, label %%rn, label %%rc\nrn:\n  ret ptr null\nrc:\n", m);
+        sb_printf(b, "  %%sz = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64\n  %%np = call ptr @malloc(i64 %%sz)\n", cls->llvm_name);
+        sb_append(b, "  call void @llvm.memcpy.p0.p0.i64(ptr %np, ptr %p, i64 %sz, i1 false)\n");
+        for (int f = 0; f < cls->field_count; f++) {
+            Type* ft = cls->fields[f].type;
+            if (type_is_owned(ft)) {
+                const char* fmty = llvm_mem_ty(ft);
+                sb_printf(b, "  %%sp%d = getelementptr %s, ptr %%p, i32 0, i32 %d\n  %%sv%d = load %s, ptr %%sp%d\n",
+                          f, cls->llvm_name, cls->fields[f].slot_index, f, fmty, f);
+                sb_printf(b, "  %%cv%d = call %s @_clone_%s(%s %%sv%d)\n", f, fmty, ft->mangled, fmty, f);
+                sb_printf(b, "  %%dp%d = getelementptr %s, ptr %%np, i32 0, i32 %d\n  store %s %%cv%d, ptr %%dp%d\n",
+                          f, cls->llvm_name, cls->fields[f].slot_index, fmty, f, f);
+            }
+        }
+        sb_append(b, "  ret ptr %np\n}\n\n");
+    }
+}
+
 static void emit_mono_list(Type* lt) {
     Type* el = lt->elem;
     emit_hash_eq_for_type(el);
+    if (type_is_owned(el)) {
+        emit_drop_for_type(el);
+        emit_clone_for_type(el);
+    }
     const char* m = lt->mangled;
     const char* sty = arena_sprintf("%%%s", m);
     const char* mty = llvm_mem_ty(el);
@@ -6347,11 +7901,16 @@ static void emit_mono_list(Type* lt) {
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%l, i32 0, i32 0\n  %%len32 = load i32, ptr %%lp\n", sty);
     sb_append(b, "  %len = sext i32 %len32 to i64\n  %neg = icmp slt i64 %idx, 0\n  %adj = add i64 %idx, %len\n");
     sb_append(b, "  %i = select i1 %neg, i64 %adj, i64 %idx\n");
+    sb_append(b, "  %ok = icmp ult i64 %i, %len\n  br i1 %ok, label %inb, label %oob\noob:\n");
+    sb_append(b, "  call void @stricta_bounds_fail(i64 %idx, i64 %len, ptr null, i32 0)\n  unreachable\ninb:\n");
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
     sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%i\n  %%v = load %s, ptr %%slot\n  ret %s %%v\n}\n\n", mty, mty, mty);
 
-    /* get_nn (statically proven non-negative index) */
+    /* get_nn (statically proven non-negative index; still bounds-checked for upper limit) */
     sb_printf(b, "define internal %s @_%s_get_nn(ptr %%l, i64 %%idx) alwaysinline {\nentry:\n", mty, m);
+    sb_printf(b, "  %%lp = getelementptr %s, ptr %%l, i32 0, i32 0\n  %%len32 = load i32, ptr %%lp\n  %%len = sext i32 %%len32 to i64\n", sty);
+    sb_append(b, "  %ok = icmp ult i64 %idx, %len\n  br i1 %ok, label %inb, label %oob\noob:\n");
+    sb_append(b, "  call void @stricta_bounds_fail(i64 %idx, i64 %len, ptr null, i32 0)\n  unreachable\ninb:\n");
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
     sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%idx\n  %%v = load %s, ptr %%slot\n  ret %s %%v\n}\n\n", mty, mty, mty);
 
@@ -6360,30 +7919,64 @@ static void emit_mono_list(Type* lt) {
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%l, i32 0, i32 0\n  %%len32 = load i32, ptr %%lp\n", sty);
     sb_append(b, "  %len = sext i32 %len32 to i64\n  %neg = icmp slt i64 %idx, 0\n  %adj = add i64 %idx, %len\n");
     sb_append(b, "  %i = select i1 %neg, i64 %adj, i64 %idx\n");
+    sb_append(b, "  %ok = icmp ult i64 %i, %len\n  br i1 %ok, label %inb, label %oob\noob:\n");
+    sb_append(b, "  call void @stricta_bounds_fail(i64 %idx, i64 %len, ptr null, i32 0)\n  unreachable\ninb:\n");
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
-    sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%i\n  store %s %%val, ptr %%slot\n  ret void\n}\n\n", mty, mty);
+    sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%i\n", mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%old = load %s, ptr %%slot\n  call void @_drop_%s(%s %%old)\n", mty, el->mangled, mty);
+    }
+    sb_printf(b, "  store %s %%val, ptr %%slot\n  ret void\n}\n\n", mty);
 
-    /* set_nn (statically proven non-negative index) */
+    /* set_nn (statically proven non-negative index; still bounds-checked for upper limit) */
     sb_printf(b, "define internal void @_%s_set_nn(ptr %%l, i64 %%idx, %s %%val) alwaysinline {\nentry:\n", m, mty);
+    sb_printf(b, "  %%lp = getelementptr %s, ptr %%l, i32 0, i32 0\n  %%len32 = load i32, ptr %%lp\n  %%len = sext i32 %%len32 to i64\n", sty);
+    sb_append(b, "  %ok = icmp ult i64 %idx, %len\n  br i1 %ok, label %inb, label %oob\noob:\n");
+    sb_append(b, "  call void @stricta_bounds_fail(i64 %idx, i64 %len, ptr null, i32 0)\n  unreachable\ninb:\n");
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
-    sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%idx\n  store %s %%val, ptr %%slot\n  ret void\n}\n\n", mty, mty);
+    sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%idx\n", mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%old = load %s, ptr %%slot\n  call void @_drop_%s(%s %%old)\n", mty, el->mangled, mty);
+    }
+    sb_printf(b, "  store %s %%val, ptr %%slot\n  ret void\n}\n\n", mty);
 
-    /* del */
-    sb_printf(b, "define internal void @_%s_del(ptr %%l, i64 %%idx) {\nentry:\n", m);
+    /* del_raw (drops element iff %drop_it is true) */
+    sb_printf(b, "define internal void @_%s_del_raw(ptr %%l, i64 %%idx, i1 %%drop_it) {\nentry:\n", m);
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%l, i32 0, i32 0\n  %%len32 = load i32, ptr %%lp\n", sty);
     sb_append(b, "  %len = sext i32 %len32 to i64\n  %neg = icmp slt i64 %idx, 0\n  %adj = add i64 %idx, %len\n");
-    sb_append(b, "  %i0 = select i1 %neg, i64 %adj, i64 %idx\n  %i = trunc i64 %i0 to i32\n");
+    sb_append(b, "  %i0 = select i1 %neg, i64 %adj, i64 %idx\n");
+    sb_append(b, "  %ok = icmp ult i64 %i0, %len\n  br i1 %ok, label %inb, label %oob\noob:\n");
+    sb_append(b, "  call void @stricta_bounds_fail(i64 %idx, i64 %len, ptr null, i32 0)\n  unreachable\ninb:\n  %i = trunc i64 %i0 to i32\n");
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
-    sb_append(b, "  %nlen = sub i32 %len32, 1\n  br label %loop\nloop:\n  %k = phi i32 [ %i, %entry ], [ %kn, %step ]\n");
+    if (type_is_owned(el)) {
+        sb_append(b, "  br i1 %drop_it, label %do_drop, label %after_drop\ndo_drop:\n");
+        sb_printf(b, "  %%dp0 = getelementptr %s, ptr %%arr, i32 %%i\n  %%dv0 = load %s, ptr %%dp0\n  call void @_drop_%s(%s %%dv0)\n  br label %%after_drop\nafter_drop:\n",
+                  mty, mty, el->mangled, mty);
+    }
+    sb_printf(b, "  %%nlen = sub i32 %%len32, 1\n  br label %%loop\nloop:\n  %%k = phi i32 [ %%i, %%%s ], [ %%kn, %%step ]\n",
+              type_is_owned(el) ? "after_drop" : "inb");
     sb_append(b, "  %c = icmp slt i32 %k, %nlen\n  br i1 %c, label %step, label %done\nstep:\n  %kn = add i32 %k, 1\n");
     sb_printf(b, "  %%sp = getelementptr %s, ptr %%arr, i32 %%kn\n  %%v = load %s, ptr %%sp\n", mty, mty);
     sb_printf(b, "  %%dp = getelementptr %s, ptr %%arr, i32 %%k\n  store %s %%v, ptr %%dp\n  br label %%loop\n", mty, mty);
     sb_append(b, "done:\n  store i32 %nlen, ptr %lp\n  ret void\n}\n\n");
 
+    sb_printf(b, "define internal void @_%s_del(ptr %%l, i64 %%idx) {\nentry:\n  call void @_%s_del_raw(ptr %%l, i64 %%idx, i1 true)\n  ret void\n}\n\n", m, m);
+
     /* pop */
     sb_printf(b, "define internal %s @_%s_pop(ptr %%l, i64 %%idx) {\nentry:\n", mty, m);
     sb_printf(b, "  %%v = call %s @_%s_get(ptr %%l, i64 %%idx)\n", mty, m);
-    sb_printf(b, "  call void @_%s_del(ptr %%l, i64 %%idx)\n  ret %s %%v\n}\n\n", m, mty);
+    sb_printf(b, "  call void @_%s_del_raw(ptr %%l, i64 %%idx, i1 false)\n  ret %s %%v\n}\n\n", m, mty);
+
+    /* clear */
+    sb_printf(b, "define internal void @_%s_clear(ptr %%l) {\nentry:\n", m);
+    sb_printf(b, "  %%lp = getelementptr %s, ptr %%l, i32 0, i32 0\n", sty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%len = load i32, ptr %%lp\n  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n  br label %%loop\n", sty);
+        sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
+        sb_printf(b, "  %%ep = getelementptr %s, ptr %%arr, i32 %%i\n  %%ev = load %s, ptr %%ep\n  call void @_drop_%s(%s %%ev)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n",
+                  mty, mty, el->mangled, mty);
+    }
+    sb_append(b, "  store i32 0, ptr %lp\n  ret void\n}\n\n");
 
     /* slice */
     sb_printf(b, "define internal ptr @_%s_slice(ptr %%l, i64 %%s0, i64 %%e0) {\nentry:\n", m);
@@ -6396,8 +7989,13 @@ static void emit_mono_list(Type* lt) {
     sb_printf(b, "  %%res = call ptr @_%s_new(i32 %%cnt32)\n", m);
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
     sb_append(b, "  br label %loop\nloop:\n  %k = phi i64 [ %s, %entry ], [ %kn, %body ]\n  %c = icmp slt i64 %k, %e\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%arr, i64 %%k\n  %%v = load %s, ptr %%vp\n", mty, mty);
-    sb_printf(b, "  call void @_%s_append(ptr %%res, %s %%v)\n  %%kn = add i64 %%k, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", m, mty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%arr, i64 %%k\n  %%v0 = load %s, ptr %%vp\n", mty, mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", mty, el->mangled, mty);
+        sb_printf(b, "  call void @_%s_append(ptr %%res, %s %%v)\n  %%kn = add i64 %%k, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", m, mty);
+    } else {
+        sb_printf(b, "  call void @_%s_append(ptr %%res, %s %%v0)\n  %%kn = add i64 %%k, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", m, mty);
+    }
 
     /* copy */
     sb_printf(b, "define internal ptr @_%s_copy(ptr %%l) {\nentry:\n", m);
@@ -6406,17 +8004,29 @@ static void emit_mono_list(Type* lt) {
     sb_printf(b, "  %%res_lp = getelementptr %s, ptr %%res, i32 0, i32 0\n  store i32 %%len, ptr %%res_lp\n", sty);
     sb_printf(b, "  %%ip1 = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%src = load ptr, ptr %%ip1\n", sty);
     sb_printf(b, "  %%ip2 = getelementptr %s, ptr %%res, i32 0, i32 2\n  %%dst = load ptr, ptr %%ip2\n", sty);
-    sb_append(b, "  %len64 = sext i32 %len to i64\n");
-    sb_printf(b, "  %%nb = mul i64 %%len64, %s\n", esz);
-    sb_append(b, "  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 %nb, i1 false)\n  ret ptr %res\n}\n\n");
+    if (type_is_owned(el)) {
+        sb_append(b, "  br label %loop\nloop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
+        sb_printf(b, "  %%sp = getelementptr %s, ptr %%src, i32 %%i\n  %%sv = load %s, ptr %%sp\n", mty, mty);
+        sb_printf(b, "  %%cv = call %s @_clone_%s(%s %%sv)\n", mty, el->mangled, mty);
+        sb_printf(b, "  %%dp = getelementptr %s, ptr %%dst, i32 %%i\n  store %s %%cv, ptr %%dp\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", mty, mty);
+    } else {
+        sb_append(b, "  %len64 = sext i32 %len to i64\n");
+        sb_printf(b, "  %%nb = mul i64 %%len64, %s\n", esz);
+        sb_append(b, "  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 %nb, i1 false)\n  ret ptr %res\n}\n\n");
+    }
 
     /* extend */
     sb_printf(b, "define internal void @_%s_extend(ptr %%l, ptr %%o) {\nentry:\n", m);
     sb_printf(b, "  %%olp = getelementptr %s, ptr %%o, i32 0, i32 0\n  %%olen = load i32, ptr %%olp\n", sty);
     sb_printf(b, "  %%oip = getelementptr %s, ptr %%o, i32 0, i32 2\n  %%oarr = load ptr, ptr %%oip\n", sty);
     sb_append(b, "  br label %loop\nloop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %olen\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%oarr, i32 %%i\n  %%v = load %s, ptr %%vp\n", mty, mty);
-    sb_printf(b, "  call void @_%s_append(ptr %%l, %s %%v)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret void\n}\n\n", m, mty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%oarr, i32 %%i\n  %%v0 = load %s, ptr %%vp\n", mty, mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", mty, el->mangled, mty);
+        sb_printf(b, "  call void @_%s_append(ptr %%l, %s %%v)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret void\n}\n\n", m, mty);
+    } else {
+        sb_printf(b, "  call void @_%s_append(ptr %%l, %s %%v0)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret void\n}\n\n", m, mty);
+    }
 
     /* concat */
     sb_printf(b, "define internal ptr @_%s_concat(ptr %%a, ptr %%b) {\nentry:\n", m);
@@ -6507,6 +8117,10 @@ static void emit_mono_list(Type* lt) {
 static void emit_mono_set(Type* st) {
     Type* el = st->elem;
     emit_hash_eq_for_type(el);
+    if (type_is_owned(el)) {
+        emit_drop_for_type(el);
+        emit_clone_for_type(el);
+    }
     const char* m = st->mangled;
     const char* sty = arena_sprintf("%%%s", m);
     const char* mty = llvm_mem_ty(el);
@@ -6566,7 +8180,11 @@ static void emit_mono_set(Type* st) {
     sb_printf(b, "  %%p4 = getelementptr %s, ptr %%s, i32 0, i32 4\n  %%hc = load i32, ptr %%p4\n", sty);
     sb_append(b, "  %l1 = add i32 %len, 1\n  %l2 = mul i32 %l1, 2\n  %need_r = icmp sge i32 %l2, %hc\n  br i1 %need_r, label %reb, label %find\nreb:\n");
     sb_printf(b, "  %%hc2 = mul i32 %%hc, 2\n  call void @_%s_rebuild(ptr %%s, i32 %%hc2)\n  br label %%find\nfind:\n", m);
-    sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%s, %s %%val, ptr %%slot_p)\n  %%found = icmp sge i32 %%idx, 0\n  br i1 %%found, label %%done, label %%ins\nins:\n", m, mty);
+    sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%s, %s %%val, ptr %%slot_p)\n  %%found = icmp sge i32 %%idx, 0\n  br i1 %%found, label %%dup, label %%ins\ndup:\n", m, mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  call void @_drop_%s(%s %%val)\n", el->mangled, mty);
+    }
+    sb_append(b, "  br label %done\nins:\n");
     sb_printf(b, "  %%p3 = getelementptr %s, ptr %%s, i32 0, i32 3\n  %%cap = load i32, ptr %%p3\n", sty);
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%s, i32 0, i32 0\n  %%full = icmp sge i32 %%len, %%cap\n  br i1 %%full, label %%grow, label %%put\ngrow:\n", sty);
     sb_append(b, "  %ncap = mul i32 %cap, 2\n  store i32 %ncap, ptr %p3\n  %nc64 = sext i32 %ncap to i64\n");
@@ -6579,34 +8197,50 @@ static void emit_mono_set(Type* st) {
     sb_printf(b, "define internal i1 @_%s_contains(ptr %%s, %s %%val) alwaysinline {\nentry:\n", m, mty);
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%s, %s %%val, ptr null)\n  %%r = icmp sge i32 %%idx, 0\n  ret i1 %%r\n}\n\n", m, mty);
 
-    /* discard */
-    sb_printf(b, "define internal void @_%s_discard(ptr %%s, %s %%val) alwaysinline {\nentry:\n", m, mty);
+    /* discard_raw (drops removed element iff %drop_it is true) */
+    sb_printf(b, "define internal void @_%s_discard_raw(ptr %%s, %s %%val, i1 %%drop_it) alwaysinline {\nentry:\n", m, mty);
     sb_append(b, "  %slot_p = alloca i32\n");
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%s, %s %%val, ptr %%slot_p)\n  %%miss = icmp slt i32 %%idx, 0\n  br i1 %%miss, label %%done, label %%rem\nrem:\n", m, mty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%s, i32 0, i32 1\n  %%buckets = load ptr, ptr %%p1\n  %%slot = load i32, ptr %%slot_p\n", sty);
     sb_append(b, "  %bp = getelementptr i32, ptr %buckets, i32 %slot\n  store i32 -2, ptr %bp\n");
+    sb_printf(b, "  %%p0 = getelementptr %s, ptr %%s, i32 0, i32 0\n  %%items = load ptr, ptr %%p0\n", sty);
+    if (type_is_owned(el)) {
+        sb_append(b, "  br i1 %drop_it, label %do_drop, label %after_drop\ndo_drop:\n");
+        sb_printf(b, "  %%dp0 = getelementptr %s, ptr %%items, i32 %%idx\n  %%dv0 = load %s, ptr %%dp0\n  call void @_drop_%s(%s %%dv0)\n  br label %%after_drop\nafter_drop:\n",
+                  mty, mty, el->mangled, mty);
+    }
     sb_printf(b, "  %%p2 = getelementptr %s, ptr %%s, i32 0, i32 2\n  %%len = load i32, ptr %%p2\n  %%last = sub i32 %%len, 1\n", sty);
     sb_append(b, "  %not_last = icmp ne i32 %idx, %last\n  br i1 %not_last, label %swap, label %dec\nswap:\n");
-    sb_printf(b, "  %%p0 = getelementptr %s, ptr %%s, i32 0, i32 0\n  %%items = load ptr, ptr %%p0\n", sty);
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%items, i32 %%last\n  %%mv = load %s, ptr %%lp\n", mty, mty);
     sb_printf(b, "  %%dp = getelementptr %s, ptr %%items, i32 %%idx\n  store %s %%mv, ptr %%dp\n", mty, mty);
     sb_append(b, "  %ms_p = alloca i32\n");
     sb_printf(b, "  %%midx = call i32 @_%s_find(ptr %%s, %s %%mv, ptr %%ms_p)\n  %%ms = load i32, ptr %%ms_p\n", m, mty);
     sb_append(b, "  %mbp = getelementptr i32, ptr %buckets, i32 %ms\n  store i32 %idx, ptr %mbp\n  br label %dec\ndec:\n  store i32 %last, ptr %p2\n  br label %done\ndone:\n  ret void\n}\n\n");
 
+    sb_printf(b, "define internal void @_%s_discard(ptr %%s, %s %%val) alwaysinline {\nentry:\n  call void @_%s_discard_raw(ptr %%s, %s %%val, i1 true)\n  ret void\n}\n\n", m, mty, m, mty);
+
     /* pop */
     sb_printf(b, "define internal %s @_%s_pop(ptr %%s) {\nentry:\n", mty, m);
     sb_printf(b, "  %%p2 = getelementptr %s, ptr %%s, i32 0, i32 2\n  %%len = load i32, ptr %%p2\n  %%last = sub i32 %%len, 1\n", sty);
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%s, i32 0, i32 0\n  %%items = load ptr, ptr %%p0\n", sty);
     sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%last\n  %%v = load %s, ptr %%vp\n", mty, mty);
-    sb_printf(b, "  call void @_%s_discard(ptr %%s, %s %%v)\n  ret %s %%v\n}\n\n", m, mty, mty);
+    sb_printf(b, "  call void @_%s_discard_raw(ptr %%s, %s %%v, i1 false)\n  ret %s %%v\n}\n\n", m, mty, mty);
 
     /* clear */
     sb_printf(b, "define internal void @_%s_clear(ptr %%s) {\nentry:\n", m);
-    sb_printf(b, "  %%p2 = getelementptr %s, ptr %%s, i32 0, i32 2\n  store i32 0, ptr %%p2\n", sty);
+    sb_printf(b, "  %%p2 = getelementptr %s, ptr %%s, i32 0, i32 2\n", sty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%len = load i32, ptr %%p2\n  %%p0 = getelementptr %s, ptr %%s, i32 0, i32 0\n  %%items = load ptr, ptr %%p0\n  br label %%dloop\n", sty);
+        sb_append(b, "dloop:\n  %di = phi i32 [ 0, %entry ], [ %din, %dbody ]\n  %dc = icmp slt i32 %di, %len\n  br i1 %dc, label %dbody, label %ddone\ndbody:\n");
+        sb_printf(b, "  %%dip = getelementptr %s, ptr %%items, i32 %%di\n  %%dv = load %s, ptr %%dip\n  call void @_drop_%s(%s %%dv)\n  %%din = add i32 %%di, 1\n  br label %%dloop\nddone:\n",
+                  mty, mty, el->mangled, mty);
+    }
+    sb_append(b, "  store i32 0, ptr %p2\n");
     sb_printf(b, "  %%p4 = getelementptr %s, ptr %%s, i32 0, i32 4\n  %%hc = load i32, ptr %%p4\n", sty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%s, i32 0, i32 1\n  %%buckets = load ptr, ptr %%p1\n", sty);
-    sb_append(b, "  br label %loop\nloop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %hc\n  br i1 %c, label %body, label %done\nbody:\n");
+    sb_append(b, "  br label %loop\nloop:\n  %i = phi i32 [ 0, %");
+    sb_append(b, type_is_owned(el) ? "ddone" : "entry");
+    sb_append(b, " ], [ %in, %body ]\n  %c = icmp slt i32 %i, %hc\n  br i1 %c, label %body, label %done\nbody:\n");
     sb_append(b, "  %bp = getelementptr i32, ptr %buckets, i32 %i\n  store i32 -1, ptr %bp\n  %in = add i32 %i, 1\n  br label %loop\ndone:\n  ret void\n}\n\n");
 
     /* copy */
@@ -6619,8 +8253,16 @@ static void emit_mono_set(Type* st) {
     sb_printf(b, "  %%p4 = getelementptr %s, ptr %%s, i32 0, i32 4\n  %%hc = load i32, ptr %%p4\n", sty);
     sb_append(b, "  %cap64 = sext i32 %cap to i64\n");
     sb_printf(b, "  %%ib = mul i64 %%cap64, %s\n  %%ni = call ptr @stricta_alloc(i64 %%ib)\n", esz);
-    sb_append(b, "  %len64 = sext i32 %len to i64\n");
-    sb_printf(b, "  %%lb = mul i64 %%len64, %s\n  call void @llvm.memcpy.p0.p0.i64(ptr %%ni, ptr %%items, i64 %%lb, i1 false)\n", esz);
+    if (type_is_owned(el)) {
+        sb_append(b, "  br label %cloop\ncloop:\n  %ci = phi i32 [ 0, %entry ], [ %cin, %cbody ]\n  %cc = icmp slt i32 %ci, %len\n  br i1 %cc, label %cbody, label %cdone\ncbody:\n");
+        sb_printf(b, "  %%csp = getelementptr %s, ptr %%items, i32 %%ci\n  %%csv = load %s, ptr %%csp\n  %%ccv = call %s @_clone_%s(%s %%csv)\n",
+                  mty, mty, mty, el->mangled, mty);
+        sb_printf(b, "  %%cdp = getelementptr %s, ptr %%ni, i32 %%ci\n  store %s %%ccv, ptr %%cdp\n  %%cin = add i32 %%ci, 1\n  br label %%cloop\ncdone:\n",
+                  mty, mty);
+    } else {
+        sb_append(b, "  %len64 = sext i32 %len to i64\n");
+        sb_printf(b, "  %%lb = mul i64 %%len64, %s\n  call void @llvm.memcpy.p0.p0.i64(ptr %%ni, ptr %%items, i64 %%lb, i1 false)\n", esz);
+    }
     sb_append(b, "  %hc64 = sext i32 %hc to i64\n  %bb = mul i64 %hc64, 4\n  %nb = call ptr @stricta_alloc(i64 %bb)\n");
     sb_append(b, "  call void @llvm.memcpy.p0.p0.i64(ptr %nb, ptr %buckets, i64 %bb, i1 false)\n");
     sb_printf(b, "  %%c0 = getelementptr %s, ptr %%c, i32 0, i32 0\n  store ptr %%ni, ptr %%c0\n", sty);
@@ -6634,8 +8276,11 @@ static void emit_mono_set(Type* st) {
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%b, i32 0, i32 2\n  %%len = load i32, ptr %%lp\n", sty);
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%b, i32 0, i32 0\n  %%items = load ptr, ptr %%ip\n  br label %%loop\n", sty);
     sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v = load %s, ptr %%vp\n", mty, mty);
-    sb_printf(b, "  call void @_%s_add(ptr %%a, %s %%v)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret void\n}\n\n", m, mty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v0 = load %s, ptr %%vp\n", mty, mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", mty, el->mangled, mty);
+    }
+    sb_printf(b, "  call void @_%s_add(ptr %%a, %s %s)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret void\n}\n\n", m, mty, type_is_owned(el) ? "%v" : "%v0");
 
     /* union (|) */
     sb_printf(b, "define internal ptr @_%s_union(ptr %%a, ptr %%b) {\nentry:\n", m);
@@ -6647,9 +8292,12 @@ static void emit_mono_set(Type* st) {
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%a, i32 0, i32 0\n  %%items = load ptr, ptr %%ip\n", sty);
     sb_printf(b, "  %%res = call ptr @_%s_new(i32 %%len)\n  br label %%loop\n", m);
     sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %next ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v = load %s, ptr %%vp\n", mty, mty);
-    sb_printf(b, "  %%has = call i1 @_%s_contains(ptr %%b, %s %%v)\n  br i1 %%has, label %%add, label %%next\nadd:\n", m, mty);
-    sb_printf(b, "  call void @_%s_add(ptr %%res, %s %%v)\n  br label %%next\nnext:\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", m, mty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v0 = load %s, ptr %%vp\n", mty, mty);
+    sb_printf(b, "  %%has = call i1 @_%s_contains(ptr %%b, %s %%v0)\n  br i1 %%has, label %%add, label %%next\nadd:\n", m, mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", mty, el->mangled, mty);
+    }
+    sb_printf(b, "  call void @_%s_add(ptr %%res, %s %s)\n  br label %%next\nnext:\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", m, mty, type_is_owned(el) ? "%v" : "%v0");
 
     /* difference (-) */
     sb_printf(b, "define internal ptr @_%s_difference(ptr %%a, ptr %%b) {\nentry:\n", m);
@@ -6657,9 +8305,12 @@ static void emit_mono_set(Type* st) {
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%a, i32 0, i32 0\n  %%items = load ptr, ptr %%ip\n", sty);
     sb_printf(b, "  %%res = call ptr @_%s_new(i32 %%len)\n  br label %%loop\n", m);
     sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %next ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v = load %s, ptr %%vp\n", mty, mty);
-    sb_printf(b, "  %%has = call i1 @_%s_contains(ptr %%b, %s %%v)\n  br i1 %%has, label %%next, label %%add\nadd:\n", m, mty);
-    sb_printf(b, "  call void @_%s_add(ptr %%res, %s %%v)\n  br label %%next\nnext:\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", m, mty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v0 = load %s, ptr %%vp\n", mty, mty);
+    sb_printf(b, "  %%has = call i1 @_%s_contains(ptr %%b, %s %%v0)\n  br i1 %%has, label %%next, label %%add\nadd:\n", m, mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", mty, el->mangled, mty);
+    }
+    sb_printf(b, "  call void @_%s_add(ptr %%res, %s %s)\n  br label %%next\nnext:\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", m, mty, type_is_owned(el) ? "%v" : "%v0");
 
     /* symmetric_difference (^) */
     sb_printf(b, "define internal ptr @_%s_symmetric_difference(ptr %%a, ptr %%b) {\nentry:\n", m);
@@ -6667,9 +8318,12 @@ static void emit_mono_set(Type* st) {
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%b, i32 0, i32 2\n  %%len = load i32, ptr %%lp\n", sty);
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%b, i32 0, i32 0\n  %%items = load ptr, ptr %%ip\n  br label %%loop\n", sty);
     sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %next ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v = load %s, ptr %%vp\n", mty, mty);
-    sb_printf(b, "  %%has = call i1 @_%s_contains(ptr %%a, %s %%v)\n  br i1 %%has, label %%next, label %%add\nadd:\n", m, mty);
-    sb_printf(b, "  call void @_%s_add(ptr %%res, %s %%v)\n  br label %%next\nnext:\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", m, mty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v0 = load %s, ptr %%vp\n", mty, mty);
+    sb_printf(b, "  %%has = call i1 @_%s_contains(ptr %%a, %s %%v0)\n  br i1 %%has, label %%next, label %%add\nadd:\n", m, mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", mty, el->mangled, mty);
+    }
+    sb_printf(b, "  call void @_%s_add(ptr %%res, %s %s)\n  br label %%next\nnext:\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", m, mty, type_is_owned(el) ? "%v" : "%v0");
 
     /* difference_update (-=), symmetric_difference_update (^=), intersection_update (&=) */
     sb_printf(b, "define internal void @_%s_difference_update(ptr %%a, ptr %%b) {\nentry:\n", m);
@@ -6683,13 +8337,23 @@ static void emit_mono_set(Type* st) {
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%b, i32 0, i32 2\n  %%len = load i32, ptr %%lp\n", sty);
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%b, i32 0, i32 0\n  %%items = load ptr, ptr %%ip\n  br label %%loop\n", sty);
     sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %next ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v = load %s, ptr %%vp\n", mty, mty);
-    sb_printf(b, "  %%has = call i1 @_%s_contains(ptr %%a, %s %%v)\n  br i1 %%has, label %%rem, label %%add\nrem:\n", m, mty);
-    sb_printf(b, "  call void @_%s_discard(ptr %%a, %s %%v)\n  br label %%next\nadd:\n  call void @_%s_add(ptr %%a, %s %%v)\n  br label %%next\nnext:\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret void\n}\n\n", m, mty, m, mty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%items, i32 %%i\n  %%v0 = load %s, ptr %%vp\n", mty, mty);
+    sb_printf(b, "  %%has = call i1 @_%s_contains(ptr %%a, %s %%v0)\n  br i1 %%has, label %%rem, label %%add\nrem:\n", m, mty);
+    sb_printf(b, "  call void @_%s_discard(ptr %%a, %s %%v0)\n  br label %%next\nadd:\n", m, mty);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", mty, el->mangled, mty);
+    }
+    sb_printf(b, "  call void @_%s_add(ptr %%a, %s %s)\n  br label %%next\nnext:\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret void\n}\n\n", m, mty, type_is_owned(el) ? "%v" : "%v0");
 
     sb_printf(b, "define internal void @_%s_intersection_update(ptr %%a, ptr %%b) {\nentry:\n", m);
     sb_printf(b, "  %%tmp = call ptr @_%s_intersection(ptr %%a, ptr %%b)\n", m);
-    sb_printf(b, "  call void @_%s_clear(ptr %%a)\n  call void @_%s_update(ptr %%a, ptr %%tmp)\n  ret void\n}\n\n", m, m);
+    sb_printf(b, "  call void @_%s_clear(ptr %%a)\n  call void @_%s_update(ptr %%a, ptr %%tmp)\n", m, m);
+    if (type_is_owned(el)) {
+        sb_printf(b, "  call void @_drop_%s(ptr %%tmp)\n", m);
+    } else {
+        sb_printf(b, "  call void @_%s_clear(ptr %%tmp)\n", m);
+    }
+    sb_append(b, "  ret void\n}\n\n");
 
     /* issubset, issuperset, isdisjoint, eq */
     sb_printf(b, "define internal i1 @_%s_issubset(ptr %%a, ptr %%b) {\nentry:\n", m);
@@ -6720,6 +8384,8 @@ static void emit_mono_dict(Type* dt) {
     Type* vt = dt->val;
     emit_hash_eq_for_type(kt);
     emit_hash_eq_for_type(vt);
+    if (type_is_owned(kt)) { emit_drop_for_type(kt); emit_clone_for_type(kt); }
+    if (type_is_owned(vt)) { emit_drop_for_type(vt); emit_clone_for_type(vt); }
     const char* m = dt->mangled;
     const char* sty = arena_sprintf("%%%s", m);
     const char* kmty = llvm_mem_ty(kt);
@@ -6791,7 +8457,14 @@ static void emit_mono_dict(Type* dt) {
     sb_printf(b, "  call void @_%s_rebuild(ptr %%d, i32 %%nhc)\n  br label %%find\nfind:\n", m);
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%d, %s %%key, ptr %%slot_p)\n  %%found = icmp sge i32 %%idx, 0\n  br i1 %%found, label %%upd, label %%ins\nupd:\n", m, kmty);
     sb_printf(b, "  %%p1u = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%valsu = load ptr, ptr %%p1u\n", sty);
-    sb_printf(b, "  %%vpu = getelementptr %s, ptr %%valsu, i32 %%idx\n  store %s %%val, ptr %%vpu\n  ret void\nins:\n", vmty, vmty);
+    sb_printf(b, "  %%vpu = getelementptr %s, ptr %%valsu, i32 %%idx\n", vmty);
+    if (type_is_owned(vt)) {
+        sb_printf(b, "  %%oldu = load %s, ptr %%vpu\n  call void @_drop_%s(%s %%oldu)\n", vmty, vt->mangled, vmty);
+    }
+    if (type_is_owned(kt)) {
+        sb_printf(b, "  call void @_drop_%s(%s %%key)\n", kt->mangled, kmty);
+    }
+    sb_printf(b, "  store %s %%val, ptr %%vpu\n  ret void\nins:\n", vmty);
     sb_printf(b, "  %%p4 = getelementptr %s, ptr %%d, i32 0, i32 4\n  %%cap = load i32, ptr %%p4\n", sty);
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%d, i32 0, i32 0\n  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n", sty, sty);
     sb_append(b, "  %full = icmp sge i32 %len, %cap\n  br i1 %full, label %grow, label %put\ngrow:\n");
@@ -6809,31 +8482,57 @@ static void emit_mono_dict(Type* dt) {
     sb_printf(b, "define internal %s @_%s_get(ptr %%d, %s %%key, %s %%def) alwaysinline {\nentry:\n", vmty, m, kmty, vmty);
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%d, %s %%key, ptr null)\n  %%ok = icmp sge i32 %%idx, 0\n  br i1 %%ok, label %%hit, label %%miss\nhit:\n", m, kmty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n", sty);
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%idx\n  %%v = load %s, ptr %%vp\n  ret %s %%v\nmiss:\n  ret %s %%def\n}\n\n", vmty, vmty, vmty, vmty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%idx\n  %%v = load %s, ptr %%vp\n", vmty, vmty);
+    if (type_is_owned(vt)) {
+        sb_printf(b, "  %%vc = call %s @_clone_%s(%s %%v)\n  ret %s %%vc\nmiss:\n  %%dc = call %s @_clone_%s(%s %%def)\n  ret %s %%dc\n}\n\n",
+                  vmty, vt->mangled, vmty, vmty, vmty, vt->mangled, vmty, vmty);
+    } else {
+        sb_printf(b, "  ret %s %%v\nmiss:\n  ret %s %%def\n}\n\n", vmty, vmty);
+    }
 
     sb_printf(b, "define internal %s @_%s_getitem(ptr %%d, %s %%key) alwaysinline {\nentry:\n", vmty, m, kmty);
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%d, %s %%key, ptr null)\n  %%ok = icmp sge i32 %%idx, 0\n  br i1 %%ok, label %%hit, label %%miss\nhit:\n", m, kmty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n", sty);
     sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%idx\n  %%v = load %s, ptr %%vp\n  ret %s %%v\nmiss:\n", vmty, vmty, vmty);
-    sb_printf(b, "  call void @stricta_raise(i32 6, ptr null, ptr null)\n  unreachable\n}\n\n");
+    sb_printf(b, "  call void @stricta_set_exc(i32 6, ptr null, ptr null)\n  call void @stricta_unhandled_exc()\n  unreachable\n}\n\n");
 
     sb_printf(b, "define internal %s @_%s_setdefault(ptr %%d, %s %%key, %s %%def) alwaysinline {\nentry:\n", vmty, m, kmty, vmty);
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%d, %s %%key, ptr null)\n  %%ok = icmp sge i32 %%idx, 0\n  br i1 %%ok, label %%hit, label %%ins\nhit:\n", m, kmty);
+    if (type_is_owned(kt)) sb_printf(b, "  call void @_drop_%s(%s %%key)\n", kt->mangled, kmty);
+    if (type_is_owned(vt)) sb_printf(b, "  call void @_drop_%s(%s %%def)\n", vt->mangled, vmty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n", sty);
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%idx\n  %%v = load %s, ptr %%vp\n  ret %s %%v\nins:\n", vmty, vmty, vmty);
-    sb_printf(b, "  call void @_%s_set(ptr %%d, %s %%key, %s %%def)\n  ret %s %%def\n}\n\n", m, kmty, vmty, vmty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%idx\n  %%v = load %s, ptr %%vp\n", vmty, vmty);
+    if (type_is_owned(vt)) {
+        sb_printf(b, "  %%vc = call %s @_clone_%s(%s %%v)\n  ret %s %%vc\n", vmty, vt->mangled, vmty, vmty);
+    } else {
+        sb_printf(b, "  ret %s %%v\n", vmty);
+    }
+    sb_printf(b, "ins:\n  call void @_%s_set(ptr %%d, %s %%key, %s %%def)\n", m, kmty, vmty);
+    sb_printf(b, "  %%idx2 = call i32 @_%s_find(ptr %%d, %s %%key, ptr null)\n", m, kmty);
+    sb_printf(b, "  %%p1b = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%valsb = load ptr, ptr %%p1b\n", sty);
+    sb_printf(b, "  %%vpb = getelementptr %s, ptr %%valsb, i32 %%idx2\n  %%vb = load %s, ptr %%vpb\n", vmty, vmty);
+    if (type_is_owned(vt)) {
+        sb_printf(b, "  %%vbc = call %s @_clone_%s(%s %%vb)\n  ret %s %%vbc\n}\n\n", vmty, vt->mangled, vmty, vmty);
+    } else {
+        sb_printf(b, "  ret %s %%vb\n}\n\n", vmty);
+    }
 
     sb_printf(b, "define internal i1 @_%s_contains(ptr %%d, %s %%key) alwaysinline {\nentry:\n", m, kmty);
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%d, %s %%key, ptr null)\n  %%r = icmp sge i32 %%idx, 0\n  ret i1 %%r\n}\n\n", m, kmty);
 
-    /* pop & del */
-    sb_printf(b, "define internal %s @_%s_pop(ptr %%d, %s %%key) {\nentry:\n", vmty, m, kmty);
+    /* pop_raw, pop, del, popitem */
+    sb_printf(b, "define internal %s @_%s_pop_raw(ptr %%d, %s %%key, i1 %%drop_key) {\nentry:\n", vmty, m, kmty);
     sb_append(b, "  %slot_p = alloca i32\n");
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%d, %s %%key, ptr %%slot_p)\n  %%miss = icmp slt i32 %%idx, 0\n  br i1 %%miss, label %%err, label %%rem\nerr:\n", m, kmty);
-    sb_append(b, "  call void @stricta_raise(i32 6, ptr null, ptr null)\n  unreachable\nrem:\n");
+    sb_append(b, "  call void @stricta_set_exc(i32 6, ptr null, ptr null)\n  call void @stricta_unhandled_exc()\n  unreachable\nrem:\n");
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%d, i32 0, i32 0\n  %%keys = load ptr, ptr %%p0\n", sty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n", sty);
     sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%idx\n  %%retv = load %s, ptr %%vp\n", vmty, vmty);
+    if (type_is_owned(kt)) {
+        sb_append(b, "  br i1 %drop_key, label %dk, label %after_dk\ndk:\n");
+        sb_printf(b, "  %%dkp0 = getelementptr %s, ptr %%keys, i32 %%idx\n  %%dkv0 = load %s, ptr %%dkp0\n  call void @_drop_%s(%s %%dkv0)\n  br label %%after_dk\nafter_dk:\n",
+                  kmty, kmty, kt->mangled, kmty);
+    }
     sb_printf(b, "  %%p2 = getelementptr %s, ptr %%d, i32 0, i32 2\n  %%buckets = load ptr, ptr %%p2\n  %%slot = load i32, ptr %%slot_p\n", sty);
     sb_append(b, "  %bp = getelementptr i32, ptr %buckets, i32 %slot\n  store i32 -2, ptr %bp\n");
     sb_printf(b, "  %%p6 = getelementptr %s, ptr %%d, i32 0, i32 6\n  %%t = load i32, ptr %%p6\n  %%nt = add i32 %%t, 1\n  store i32 %%nt, ptr %%p6\n", sty);
@@ -6848,8 +8547,15 @@ static void emit_mono_dict(Type* dt) {
     sb_append(b, "  %mbp = getelementptr i32, ptr %buckets, i32 %ms\n  store i32 %idx, ptr %mbp\n  br label %dec\ndec:\n  store i32 %last, ptr %p3\n  ret ");
     sb_printf(b, "%s %%retv\n}\n\n", vmty);
 
+    sb_printf(b, "define internal %s @_%s_pop(ptr %%d, %s %%key) {\nentry:\n  %%v = call %s @_%s_pop_raw(ptr %%d, %s %%key, i1 true)\n  ret %s %%v\n}\n\n",
+              vmty, m, kmty, vmty, m, kmty, vmty);
+
     sb_printf(b, "define internal void @_%s_del(ptr %%d, %s %%key) {\nentry:\n", m, kmty);
-    sb_printf(b, "  %%_ = call %s @_%s_pop(ptr %%d, %s %%key)\n  ret void\n}\n\n", vmty, m, kmty);
+    sb_printf(b, "  %%v = call %s @_%s_pop(ptr %%d, %s %%key)\n", vmty, m, kmty);
+    if (type_is_owned(vt)) {
+        sb_printf(b, "  call void @_drop_%s(%s %%v)\n", vt->mangled, vmty);
+    }
+    sb_append(b, "  ret void\n}\n\n");
 
     /* popitem */
     Type* pair[2] = {kt, vt};
@@ -6859,17 +8565,33 @@ static void emit_mono_dict(Type* dt) {
     sb_printf(b, "  %%p3 = getelementptr %s, ptr %%d, i32 0, i32 3\n  %%len = load i32, ptr %%p3\n  %%last = sub i32 %%len, 1\n", sty);
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%d, i32 0, i32 0\n  %%keys = load ptr, ptr %%p0\n", sty);
     sb_printf(b, "  %%kp = getelementptr %s, ptr %%keys, i32 %%last\n  %%k = load %s, ptr %%kp\n", kmty, kmty);
-    sb_printf(b, "  %%v = call %s @_%s_pop(ptr %%d, %s %%k)\n", vmty, m, kmty);
+    sb_printf(b, "  %%v = call %s @_%s_pop_raw(ptr %%d, %s %%k, i1 false)\n", vmty, m, kmty);
     sb_printf(b, "  %%t1 = insertvalue %s zeroinitializer, %s %%k, 0\n  %%t2 = insertvalue %s %%t1, %s %%v, 1\n  ret %s %%t2\n}\n\n",
               psty, kmty, psty, vmty, psty);
 
     /* clear, copy, update, merge, keys, values, items, eq */
     sb_printf(b, "define internal void @_%s_clear(ptr %%d) {\nentry:\n", m);
-    sb_printf(b, "  %%p3 = getelementptr %s, ptr %%d, i32 0, i32 3\n  store i32 0, ptr %%p3\n", sty);
+    sb_printf(b, "  %%p3 = getelementptr %s, ptr %%d, i32 0, i32 3\n", sty);
+    if (type_is_owned(kt) || type_is_owned(vt)) {
+        sb_printf(b, "  %%len = load i32, ptr %%p3\n  %%p0 = getelementptr %s, ptr %%d, i32 0, i32 0\n  %%keys = load ptr, ptr %%p0\n  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n  br label %%dloop\n", sty, sty);
+        sb_append(b, "dloop:\n  %di = phi i32 [ 0, %entry ], [ %din, %dbody ]\n  %dc = icmp slt i32 %di, %len\n  br i1 %dc, label %dbody, label %ddone\ndbody:\n");
+        if (type_is_owned(kt)) {
+            sb_printf(b, "  %%dkp = getelementptr %s, ptr %%keys, i32 %%di\n  %%dk = load %s, ptr %%dkp\n  call void @_drop_%s(%s %%dk)\n",
+                      kmty, kmty, kt->mangled, kmty);
+        }
+        if (type_is_owned(vt)) {
+            sb_printf(b, "  %%dvp = getelementptr %s, ptr %%vals, i32 %%di\n  %%dv = load %s, ptr %%dvp\n  call void @_drop_%s(%s %%dv)\n",
+                      vmty, vmty, vt->mangled, vmty);
+        }
+        sb_append(b, "  %din = add i32 %di, 1\n  br label %dloop\nddone:\n");
+    }
+    sb_append(b, "  store i32 0, ptr %p3\n");
     sb_printf(b, "  %%p6 = getelementptr %s, ptr %%d, i32 0, i32 6\n  store i32 0, ptr %%p6\n", sty);
     sb_printf(b, "  %%p5 = getelementptr %s, ptr %%d, i32 0, i32 5\n  %%hc = load i32, ptr %%p5\n", sty);
     sb_printf(b, "  %%p2 = getelementptr %s, ptr %%d, i32 0, i32 2\n  %%buckets = load ptr, ptr %%p2\n  br label %%loop\n", sty);
-    sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %hc\n  br i1 %c, label %body, label %done\nbody:\n");
+    sb_append(b, "loop:\n  %i = phi i32 [ 0, %");
+    sb_append(b, (type_is_owned(kt) || type_is_owned(vt)) ? "ddone" : "entry");
+    sb_append(b, " ], [ %in, %body ]\n  %c = icmp slt i32 %i, %hc\n  br i1 %c, label %body, label %done\nbody:\n");
     sb_append(b, "  %bp = getelementptr i32, ptr %buckets, i32 %i\n  store i32 -1, ptr %bp\n  %in = add i32 %i, 1\n  br label %loop\ndone:\n  ret void\n}\n\n");
 
     sb_printf(b, "define internal ptr @_%s_copy(ptr %%d) {\nentry:\n", m);
@@ -6881,9 +8603,12 @@ static void emit_mono_dict(Type* dt) {
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%b, i32 0, i32 0\n  %%keys = load ptr, ptr %%p0\n", sty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%b, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n  br label %%loop\n", sty);
     sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%kp = getelementptr %s, ptr %%keys, i32 %%i\n  %%k = load %s, ptr %%kp\n", kmty, kmty);
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%i\n  %%v = load %s, ptr %%vp\n", vmty, vmty);
-    sb_printf(b, "  call void @_%s_set(ptr %%a, %s %%k, %s %%v)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret void\n}\n\n", m, kmty, vmty);
+    sb_printf(b, "  %%kp = getelementptr %s, ptr %%keys, i32 %%i\n  %%k0 = load %s, ptr %%kp\n", kmty, kmty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%i\n  %%v0 = load %s, ptr %%vp\n", vmty, vmty);
+    if (type_is_owned(kt)) sb_printf(b, "  %%k = call %s @_clone_%s(%s %%k0)\n", kmty, kt->mangled, kmty);
+    if (type_is_owned(vt)) sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", vmty, vt->mangled, vmty);
+    sb_printf(b, "  call void @_%s_set(ptr %%a, %s %s, %s %s)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret void\n}\n\n",
+              m, kmty, type_is_owned(kt) ? "%k" : "%k0", vmty, type_is_owned(vt) ? "%v" : "%v0");
 
     sb_printf(b, "define internal ptr @_%s_merge(ptr %%a, ptr %%b) {\nentry:\n", m);
     sb_printf(b, "  %%res = call ptr @_%s_copy(ptr %%a)\n  call void @_%s_update(ptr %%res, ptr %%b)\n  ret ptr %%res\n}\n\n", m, m);
@@ -6896,16 +8621,20 @@ static void emit_mono_dict(Type* dt) {
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%d, i32 0, i32 0\n  %%keys = load ptr, ptr %%p0\n", sty);
     sb_printf(b, "  %%res = call ptr @_%s_new(i32 %%len)\n  br label %%loop\n", lk->mangled);
     sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%kp = getelementptr %s, ptr %%keys, i32 %%i\n  %%k = load %s, ptr %%kp\n", kmty, kmty);
-    sb_printf(b, "  call void @_%s_append(ptr %%res, %s %%k)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", lk->mangled, kmty);
+    sb_printf(b, "  %%kp = getelementptr %s, ptr %%keys, i32 %%i\n  %%k0 = load %s, ptr %%kp\n", kmty, kmty);
+    if (type_is_owned(kt)) sb_printf(b, "  %%k = call %s @_clone_%s(%s %%k0)\n", kmty, kt->mangled, kmty);
+    sb_printf(b, "  call void @_%s_append(ptr %%res, %s %s)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n",
+              lk->mangled, kmty, type_is_owned(kt) ? "%k" : "%k0");
 
     sb_printf(b, "define internal ptr @_%s_values(ptr %%d) {\nentry:\n", m);
     sb_printf(b, "  %%p3 = getelementptr %s, ptr %%d, i32 0, i32 3\n  %%len = load i32, ptr %%p3\n", sty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n", sty);
     sb_printf(b, "  %%res = call ptr @_%s_new(i32 %%len)\n  br label %%loop\n", lv->mangled);
     sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%i\n  %%v = load %s, ptr %%vp\n", vmty, vmty);
-    sb_printf(b, "  call void @_%s_append(ptr %%res, %s %%v)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", lv->mangled, vmty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%i\n  %%v0 = load %s, ptr %%vp\n", vmty, vmty);
+    if (type_is_owned(vt)) sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", vmty, vt->mangled, vmty);
+    sb_printf(b, "  call void @_%s_append(ptr %%res, %s %s)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n",
+              lv->mangled, vmty, type_is_owned(vt) ? "%v" : "%v0");
 
     sb_printf(b, "define internal ptr @_%s_items(ptr %%d) {\nentry:\n", m);
     sb_printf(b, "  %%p3 = getelementptr %s, ptr %%d, i32 0, i32 3\n  %%len = load i32, ptr %%p3\n", sty);
@@ -6913,9 +8642,12 @@ static void emit_mono_dict(Type* dt) {
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n", sty);
     sb_printf(b, "  %%res = call ptr @_%s_new(i32 %%len)\n  br label %%loop\n", li->mangled);
     sb_append(b, "loop:\n  %i = phi i32 [ 0, %entry ], [ %in, %body ]\n  %c = icmp slt i32 %i, %len\n  br i1 %c, label %body, label %done\nbody:\n");
-    sb_printf(b, "  %%kp = getelementptr %s, ptr %%keys, i32 %%i\n  %%k = load %s, ptr %%kp\n", kmty, kmty);
-    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%i\n  %%v = load %s, ptr %%vp\n", vmty, vmty);
-    sb_printf(b, "  %%t1 = insertvalue %s zeroinitializer, %s %%k, 0\n  %%t2 = insertvalue %s %%t1, %s %%v, 1\n", psty, kmty, psty, vmty);
+    sb_printf(b, "  %%kp = getelementptr %s, ptr %%keys, i32 %%i\n  %%k0 = load %s, ptr %%kp\n", kmty, kmty);
+    sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%i\n  %%v0 = load %s, ptr %%vp\n", vmty, vmty);
+    if (type_is_owned(kt)) sb_printf(b, "  %%k = call %s @_clone_%s(%s %%k0)\n", kmty, kt->mangled, kmty);
+    if (type_is_owned(vt)) sb_printf(b, "  %%v = call %s @_clone_%s(%s %%v0)\n", vmty, vt->mangled, vmty);
+    sb_printf(b, "  %%t1 = insertvalue %s zeroinitializer, %s %s, 0\n  %%t2 = insertvalue %s %%t1, %s %s, 1\n",
+              psty, kmty, type_is_owned(kt) ? "%k" : "%k0", psty, vmty, type_is_owned(vt) ? "%v" : "%v0");
     sb_printf(b, "  call void @_%s_append(ptr %%res, %s %%t2)\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", li->mangled, psty);
 
     sb_printf(b, "define internal i1 @_%s_eq(ptr %%a, ptr %%b) {\nentry:\n", m);
@@ -6979,8 +8711,135 @@ static const char* cg_var_ptr(const char* name, Type** out_ty) {
     return NULL;
 }
 
+static VarSym* cg_find_var_sym(const char* name) {
+    if (g_cg.cur_fn) {
+        bool is_glob = false;
+        for (int i = 0; i < g_cg.cur_fn->global_decl_count; i++) {
+            if (strcmp(g_cg.cur_fn->global_decls[i], name) == 0) { is_glob = true; break; }
+        }
+        if (!is_glob) {
+            VarSym* lv = find_local_in_fn(g_cg.cur_fn, name);
+            if (lv) return lv;
+        }
+    }
+    return find_global_in_mod(g_cg.cur_mod, name);
+}
+
 static const char* cg_expr(Expr* e, Type* hint);
 static void cg_stmts(Stmt** stmts, int count);
+
+static void cg_reg_temp(const char* reg, Type* ty) {
+    if (!reg || !ty || !type_is_owned(ty) || g_cg.temp_count >= 128) return;
+    emit_drop_for_type(ty);
+    g_cg.temps[g_cg.temp_count].reg = reg;
+    g_cg.temps[g_cg.temp_count].ty = ty;
+    g_cg.temps[g_cg.temp_count].active = true;
+    g_cg.temp_count++;
+}
+
+static void cg_consume_temp(const char* reg) {
+    if (!reg) return;
+    for (int i = g_cg.temp_count - 1; i >= 0; i--) {
+        if (g_cg.temps[i].active && strcmp(g_cg.temps[i].reg, reg) == 0) {
+            g_cg.temps[i].active = false;
+            return;
+        }
+    }
+}
+
+static void cg_consume_expr(Expr* e, const char* reg) {
+    cg_consume_temp(reg);
+    if (e && e->kind == EXPR_VAR && e->is_move && g_cg.cur_fn) {
+        VarSym* lv = find_local_in_fn(g_cg.cur_fn, e->var.name);
+        if (lv && lv->drop_flag_llvm && !g_cg.block_terminated) {
+            cg_emit("store i1 false, ptr %s", lv->drop_flag_llvm);
+        }
+    }
+}
+
+static bool cg_has_active_temps(int mark) {
+    for (int i = g_cg.temp_count - 1; i >= mark; i--) {
+        if (g_cg.temps[i].active) return true;
+    }
+    return false;
+}
+
+static void cg_flush_temps_preserve(int mark) {
+    for (int i = g_cg.temp_count - 1; i >= mark; i--) {
+        if (g_cg.temps[i].active && !g_cg.block_terminated) {
+            Type* ty = g_cg.temps[i].ty;
+            emit_drop_for_type(ty);
+            cg_emit("call void @_drop_%s(%s %s)", ty->mangled, llvm_mem_ty(ty), cg_reg_to_mem(g_cg.temps[i].reg, ty));
+        }
+    }
+}
+
+static void cg_flush_temps(int mark) {
+    for (int i = g_cg.temp_count - 1; i >= mark; i--) {
+        if (g_cg.temps[i].active && !g_cg.block_terminated) {
+            Type* ty = g_cg.temps[i].ty;
+            emit_drop_for_type(ty);
+            cg_emit("call void @_drop_%s(%s %s)", ty->mangled, llvm_mem_ty(ty), cg_reg_to_mem(g_cg.temps[i].reg, ty));
+            g_cg.temps[i].active = false;
+        }
+    }
+    if (g_cg.temp_count > mark) g_cg.temp_count = mark;
+}
+
+static void cg_drop_var_if_alive(VarSym* lv) {
+    if (!lv || !type_is_owned(lv->type) || !lv->drop_flag_llvm || g_cg.block_terminated) return;
+    emit_drop_for_type(lv->type);
+    const char* fl = cg_reg();
+    cg_emit("%s = load i1, ptr %s", fl, lv->drop_flag_llvm);
+    const char* l_do = cg_lbl("dv_do");
+    const char* l_ok = cg_lbl("dv_ok");
+    cg_cond_br(fl, l_do, l_ok);
+    cg_label(l_do);
+    const char* vp = (lv->llvm_name[0] == '@') ? lv->llvm_name : cg_ensure_local_alloca(lv->llvm_name, lv->type);
+    const char* mv = cg_reg();
+    cg_emit("%s = load %s, ptr %s", mv, llvm_mem_ty(lv->type), vp);
+    if (lv->is_stack_owned) {
+        cg_emit("call void @_drop_fields_%s(ptr %s)", lv->type->mangled, mv);
+    } else {
+        cg_emit("call void @_drop_%s(%s %s)", lv->type->mangled, llvm_mem_ty(lv->type), mv);
+    }
+    cg_emit("store i1 false, ptr %s", lv->drop_flag_llvm);
+    cg_br(l_ok);
+    cg_label(l_ok);
+}
+
+static void cg_drop_all_fn_locals(FuncInfo* fn) {
+    if (!fn || g_cg.block_terminated) return;
+    for (int i = 0; i < fn->local_count; i++) {
+        cg_drop_var_if_alive(&fn->locals[i]);
+    }
+}
+
+static bool expr_produces_fresh_temp(Expr* e) {
+    if (!e || !e->ty || !type_is_owned(e->ty)) return false;
+    switch (e->kind) {
+        case EXPR_INT:
+            return e->ty->kind == TY_BIGINT;
+        case EXPR_BYTES: case EXPR_FSTRING: case EXPR_LIST: case EXPR_SET: case EXPR_DICT:
+        case EXPR_LISTCOMP: case EXPR_SETCOMP: case EXPR_DICTCOMP: case EXPR_GENEXPR:
+        case EXPR_TUPLE: case EXPR_SLICE: case EXPR_TERNARY:
+        case EXPR_BINOP: case EXPR_UNOP:
+            return true;
+        case EXPR_INDEX:
+            return e->index.obj->ty && e->index.obj->ty->kind == TY_STR;
+        case EXPR_ATTR:
+            if (e->attr.obj->ty && e->attr.obj->ty->kind == TY_CLASS) {
+                FuncInfo* prop = find_method_in_class(e->attr.obj->ty->cls, e->attr.attr);
+                return prop && prop->is_property;
+            }
+            return false;
+        case EXPR_CALL:
+            if (e->call.callee->kind == EXPR_VAR && strcmp(e->call.callee->var.name, "super") == 0) return false;
+            return true;
+        default:
+            return false;
+    }
+}
 
 static const char* cg_to_str(const char* val, Type* t) {
     if (!t) return cg_strictastr_lit("None", 4);
@@ -7090,6 +8949,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         const char* a1 = cg_reg(); const char* a2 = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a1, acc_p);
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a2, a1, cg_strictastr_lit(", ", 2));
+        cg_emit("call void @stricta_str_free(ptr %s)", a1);
         cg_emit("store ptr %s, ptr %s", a2, acc_p);
         cg_br(l_item);
         cg_label(l_item);
@@ -7097,14 +8957,21 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_emit("%s = getelementptr %s, ptr %s, i32 %s", ep, mty, arr, iv);
         cg_emit("%s = load %s, ptr %s", evm, mty, ep);
         const char* ev = cg_mem_to_reg(evm, t->elem);
-        const char* es = (t->elem->kind == TY_STR)
-            ? ({ const char* q = cg_strictastr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
-                 cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q1, q, ev);
-                 cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q2, q1, q); q2; })
-            : cg_to_str(ev, t->elem);
+        const char* es = NULL;
+        if (t->elem->kind == TY_STR) {
+            const char* q = cg_strictastr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
+            cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q1, q, ev);
+            cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q2, q1, q);
+            cg_emit("call void @stricta_str_free(ptr %s)", q1);
+            es = q2;
+        } else {
+            es = cg_to_str(ev, t->elem);
+        }
         const char* a3 = cg_reg(); const char* a4 = cg_reg(); const char* in = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a3, acc_p);
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a4, a3, es);
+        cg_emit("call void @stricta_str_free(ptr %s)", a3);
+        cg_emit("call void @stricta_str_free(ptr %s)", es);
         cg_emit("store ptr %s, ptr %s", a4, acc_p);
         cg_emit("%s = add i32 %s, 1", in, iv);
         cg_emit("store i32 %s, ptr %s", in, i_p);
@@ -7113,6 +8980,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         const char* af = cg_reg(); const char* res = cg_reg();
         cg_emit("%s = load ptr, ptr %s", af, acc_p);
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", res, af, cg_strictastr_lit("]", 1));
+        cg_emit("call void @stricta_str_free(ptr %s)", af);
         return res;
     }
     if (t->kind == TY_TUPLE) {
@@ -7122,22 +8990,31 @@ static const char* cg_to_str(const char* val, Type* t) {
             if (i > 0) {
                 const char* n = cg_reg();
                 cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, cg_strictastr_lit(", ", 2));
+                cg_emit("call void @stricta_str_free(ptr %s)", acc);
                 acc = n;
             }
             const char* fm = cg_reg();
             cg_emit("%s = extractvalue %s %s, %d", fm, llvm_reg_ty(t), val, i);
             const char* fv = cg_mem_to_reg(fm, t->tuple_elems[i]);
-            const char* fs = (t->tuple_elems[i]->kind == TY_STR)
-                ? ({ const char* q = cg_strictastr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
-                     cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q1, q, fv);
-                     cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q2, q1, q); q2; })
-                : cg_to_str(fv, t->tuple_elems[i]);
+            const char* fs = NULL;
+            if (t->tuple_elems[i]->kind == TY_STR) {
+                const char* q = cg_strictastr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
+                cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q1, q, fv);
+                cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q2, q1, q);
+                cg_emit("call void @stricta_str_free(ptr %s)", q1);
+                fs = q2;
+            } else {
+                fs = cg_to_str(fv, t->tuple_elems[i]);
+            }
             const char* n = cg_reg();
             cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, fs);
+            cg_emit("call void @stricta_str_free(ptr %s)", acc);
+            cg_emit("call void @stricta_str_free(ptr %s)", fs);
             acc = n;
         }
         const char* res = cg_reg();
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", res, acc, cg_strictastr_lit(t->tuple_count == 1 ? ",)" : ")", t->tuple_count == 1 ? 2 : 1));
+        cg_emit("call void @stricta_str_free(ptr %s)", acc);
         return res;
     }
     if (t->kind == TY_SET) {
@@ -7177,6 +9054,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         const char* a1 = cg_reg(); const char* a2 = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a1, acc_p);
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a2, a1, cg_strictastr_lit(", ", 2));
+        cg_emit("call void @stricta_str_free(ptr %s)", a1);
         cg_emit("store ptr %s, ptr %s", a2, acc_p);
         cg_br(l_item);
         cg_label(l_item);
@@ -7187,6 +9065,8 @@ static const char* cg_to_str(const char* val, Type* t) {
         const char* a3 = cg_reg(); const char* a4 = cg_reg(); const char* in = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a3, acc_p);
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a4, a3, evs);
+        cg_emit("call void @stricta_str_free(ptr %s)", a3);
+        if (t->elem->kind != TY_STR) cg_emit("call void @stricta_str_free(ptr %s)", evs);
         cg_emit("store ptr %s, ptr %s", a4, acc_p);
         cg_emit("%s = add i32 %s, 1", in, iv);
         cg_emit("store i32 %s, ptr %s", in, i_p);
@@ -7195,6 +9075,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         const char* af = cg_reg(); const char* ns = cg_reg();
         cg_emit("%s = load ptr, ptr %s", af, acc_p);
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", ns, af, cg_strictastr_lit("}", 1));
+        cg_emit("call void @stricta_str_free(ptr %s)", af);
         cg_br(l_end);
         cg_label(l_end);
         const char* res = cg_reg();
@@ -7234,6 +9115,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         const char* a1 = cg_reg(); const char* a2 = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a1, acc_p);
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a2, a1, cg_strictastr_lit(", ", 2));
+        cg_emit("call void @stricta_str_free(ptr %s)", a1);
         cg_emit("store ptr %s, ptr %s", a2, acc_p);
         cg_br(l_item);
         cg_label(l_item);
@@ -7249,13 +9131,19 @@ static const char* cg_to_str(const char* val, Type* t) {
             const char* q = cg_strictastr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
             cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q1, q, ks);
             cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q2, q1, q);
+            cg_emit("call void @stricta_str_free(ptr %s)", q1);
             ks = q2;
         }
         const char* p1 = cg_reg(); const char* p2 = cg_reg(); const char* a3 = cg_reg(); const char* a4 = cg_reg();
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", p1, ks, cg_strictastr_lit(": ", 2));
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", p2, p1, vs);
+        cg_emit("call void @stricta_str_free(ptr %s)", p1);
+        cg_emit("call void @stricta_str_free(ptr %s)", ks);
+        if (t->val->kind != TY_STR) cg_emit("call void @stricta_str_free(ptr %s)", vs);
         cg_emit("%s = load ptr, ptr %s", a3, acc_p);
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a4, a3, p2);
+        cg_emit("call void @stricta_str_free(ptr %s)", a3);
+        cg_emit("call void @stricta_str_free(ptr %s)", p2);
         cg_emit("store ptr %s, ptr %s", a4, acc_p);
         const char* in = cg_reg();
         cg_emit("%s = add i32 %s, 1", in, iv);
@@ -7265,6 +9153,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         const char* af = cg_reg(); const char* res = cg_reg();
         cg_emit("%s = load ptr, ptr %s", af, acc_p);
         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", res, af, cg_strictastr_lit("}", 1));
+        cg_emit("call void @stricta_str_free(ptr %s)", af);
         return res;
     }
     return cg_strictastr_lit("<object>", 8);
@@ -7288,6 +9177,7 @@ static void cg_print_val(const char* val, Type* t) {
     } else {
         const char* s = cg_to_str(val, t);
         cg_emit("call void @stricta_print_str(ptr %s)", s);
+        cg_emit("call void @stricta_str_free(ptr %s)", s);
     }
 }
 
@@ -7360,6 +9250,12 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
                                strcmp(op, "<") == 0 ? "slt" : strcmp(op, "<=") == 0 ? "sle" :
                                strcmp(op, ">") == 0 ? "sgt" : "sge";
             cg_emit("%s = icmp %s i32 %s, 0", r, pred, c);
+            return r;
+        }
+        if (lt->kind == TY_BYTES && rt->kind == TY_BYTES) {
+            const char* eq32 = cg_reg(); const char* r = cg_reg();
+            cg_emit("%s = call i32 @stricta_bytes_eq(ptr %s, ptr %s)", eq32, lv, rv);
+            cg_emit("%s = icmp %s i32 %s, 0", r, is_ne ? "eq" : "ne", eq32);
             return r;
         }
         if (lt->kind == TY_BIGINT && rt->kind == TY_BIGINT) {
@@ -7595,7 +9491,9 @@ static const char* cg_construct_class_at(ClassInfo* cls, Expr** args, int argc, 
         }
         if (cls->is_dataclass && !find_method_in_class_exact(cls, "__init__")) {
             for (int i = 0; i < argc && i < cls->field_count; i++) {
-                const char* av = cg_coerce(cg_expr(args[i], cls->fields[i].type), args[i]->ty, cls->fields[i].type);
+                const char* raw_av = cg_expr(args[i], cls->fields[i].type);
+                cg_consume_expr(args[i], raw_av);
+                const char* av = cg_coerce(raw_av, args[i]->ty, cls->fields[i].type);
                 const char* fp = cg_reg();
                 cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, cls->llvm_name, ptr, cls->fields[i].slot_index);
                 cg_emit("store %s %s, ptr %s", llvm_mem_ty(cls->fields[i].type), cg_reg_to_mem(av, cls->fields[i].type), fp);
@@ -7607,20 +9505,25 @@ static const char* cg_construct_class_at(ClassInfo* cls, Expr** args, int argc, 
     }
 
     if (cls->has_unimpl_abstract) {
-        cg_emit("call void @stricta_raise(i32 5, ptr null, ptr %s)", cg_cstr_lit("TypeError: cannot instantiate abstract class", 44));
+        cg_emit("call void @stricta_set_exc(i32 5, ptr null, ptr %s)", cg_cstr_lit("TypeError: cannot instantiate abstract class", 44));
+        cg_raise_branch();
         return "null";
     }
     const char* obj = prealloc_obj;
+    bool has_owned_fld = false;
+    for (int f = 0; f < cls->field_count; f++) {
+        if (type_is_owned(cls->fields[f].type)) { has_owned_fld = true; break; }
+    }
     if (!obj) {
         const char* sz = cg_reg();
         obj = cg_reg();
         cg_emit("%s = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64", sz, cls->llvm_name);
-        if (find_method_in_class(cls, "__init__") || cls->is_dataclass) {
+        if ((find_method_in_class(cls, "__init__") || cls->is_dataclass) && !has_owned_fld) {
             cg_emit("%s = call ptr @malloc(i64 %s)", obj, sz);
         } else {
             cg_emit("%s = call ptr @calloc(i64 1, i64 %s)", obj, sz);
         }
-    } else if (!find_method_in_class(cls, "__init__") && !cls->is_dataclass) {
+    } else if ((!find_method_in_class(cls, "__init__") && !cls->is_dataclass) || has_owned_fld) {
         cg_emit("store %s zeroinitializer, ptr %s", cls->llvm_name, obj);
     }
     if (cls->needs_vtable) {
@@ -7630,7 +9533,9 @@ static const char* cg_construct_class_at(ClassInfo* cls, Expr** args, int argc, 
     }
     for (int f = 0; f < cls->field_count; f++) {
         if (cls->fields[f].default_expr) {
-            const char* dv = cg_expr(cls->fields[f].default_expr, cls->fields[f].type);
+            const char* raw_dv = cg_expr(cls->fields[f].default_expr, cls->fields[f].type);
+            cg_consume_expr(cls->fields[f].default_expr, raw_dv);
+            const char* dv = cg_coerce(raw_dv, cls->fields[f].default_expr->ty, cls->fields[f].type);
             const char* fp = cg_reg();
             cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, cls->llvm_name, obj, cls->fields[f].slot_index);
             cg_emit("store %s %s, ptr %s", llvm_mem_ty(cls->fields[f].type), cg_reg_to_mem(dv, cls->fields[f].type), fp);
@@ -7643,14 +9548,18 @@ static const char* cg_construct_class_at(ClassInfo* cls, Expr** args, int argc, 
         for (int i = 1; i < init_fn->param_count; i++) {
             Expr* ae = (i - 1 < argc) ? args[i - 1] : init_fn->param_defaults[i];
             Type* pt = init_fn->param_types[i];
-            const char* av = cg_coerce(cg_expr(ae, pt), ae->ty, pt);
+            const char* raw_av = cg_expr(ae, pt);
+            if (init_fn->param_modes && init_fn->param_modes[i] == PM_MOVE) cg_consume_expr(ae, raw_av);
+            const char* av = cg_coerce(raw_av, ae->ty, pt);
             sb_printf(&call_args, ", %s %s", llvm_reg_ty(pt), av);
         }
-        cg_emit("call void %s(%s)", init_fn->llvm_name, call_args.data);
+        cg_emit_call_check(init_fn, init_fn->llvm_name, call_args.data);
         free(call_args.data);
     } else if (cls->is_dataclass) {
         for (int i = 0; i < argc && i < cls->field_count; i++) {
-            const char* av = cg_coerce(cg_expr(args[i], cls->fields[i].type), args[i]->ty, cls->fields[i].type);
+            const char* raw_av = cg_expr(args[i], cls->fields[i].type);
+            cg_consume_expr(args[i], raw_av);
+            const char* av = cg_coerce(raw_av, args[i]->ty, cls->fields[i].type);
             const char* fp = cg_reg();
             cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, cls->llvm_name, obj, cls->fields[i].slot_index);
             cg_emit("store %s %s, ptr %s", llvm_mem_ty(cls->fields[i].type), cg_reg_to_mem(av, cls->fields[i].type), fp);
@@ -7700,7 +9609,7 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
         cg_cond_br(c, l_body, else_lbl ? else_lbl : after_lbl);
         cg_label(l_body);
         cg_emit("store i64 %s, ptr %s", cg_coerce(cur, g_ty_i64, vt), vp);
-        g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){after_lbl, l_step, NULL, NULL};
+        g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){after_lbl, l_step, NULL, NULL, g_cg.temp_count};
         cg_stmts(body, body_count);
         g_cg.loop_depth--;
         cg_br(l_step);
@@ -7735,6 +9644,8 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
         Type* kvt = NULL; Type* vvt = NULL;
         const char* kvp = cg_var_ptr(targets[0], &kvt);
         const char* vvp = cg_var_ptr(targets[1], &vvt);
+        VarSym* kvs = cg_find_var_sym(targets[0]);
+        VarSym* vvs = cg_find_var_sym(targets[1]);
         const char* l_cond = cg_lbl("dit_cond"); const char* l_body = cg_lbl("dit_body"); const char* l_step = cg_lbl("dit_step");
         cg_br(l_cond);
         cg_label(l_cond);
@@ -7749,9 +9660,11 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
         cg_emit("%s = load %s, ptr %s", km, llvm_mem_ty(dt->key), kp);
         cg_emit("%s = getelementptr %s, ptr %s, i32 %s", vp, llvm_mem_ty(dt->val), vals, iv);
         cg_emit("%s = load %s, ptr %s", vm, llvm_mem_ty(dt->val), vp);
+        if (kvs && kvs->drop_flag_llvm) { cg_drop_var_if_alive(kvs); cg_emit("store i1 false, ptr %s", kvs->drop_flag_llvm); }
+        if (vvs && vvs->drop_flag_llvm) { cg_drop_var_if_alive(vvs); cg_emit("store i1 false, ptr %s", vvs->drop_flag_llvm); }
         cg_emit("store %s %s, ptr %s", llvm_mem_ty(kvt), km, kvp);
         cg_emit("store %s %s, ptr %s", llvm_mem_ty(vvt), vm, vvp);
-        g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){after_lbl, l_step, NULL, NULL};
+        g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){after_lbl, l_step, NULL, NULL, g_cg.temp_count};
         cg_stmts(body, body_count);
         g_cg.loop_depth--;
         cg_br(l_step);
@@ -7782,6 +9695,7 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
         cg_emit("store i32 0, ptr %s", i_p);
         Type* vvt = NULL;
         const char* vvp = cg_var_ptr(targets[0], &vvt);
+        VarSym* vvs = cg_find_var_sym(targets[0]);
         const char* l_cond = cg_lbl("dv_cond"); const char* l_body = cg_lbl("dv_body"); const char* l_step = cg_lbl("dv_step");
         cg_br(l_cond);
         cg_label(l_cond);
@@ -7793,8 +9707,9 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
         const char* vp = cg_reg(); const char* vm = cg_reg();
         cg_emit("%s = getelementptr %s, ptr %s, i32 %s", vp, llvm_mem_ty(dt->val), vals, iv);
         cg_emit("%s = load %s, ptr %s", vm, llvm_mem_ty(dt->val), vp);
+        if (vvs && vvs->drop_flag_llvm) { cg_drop_var_if_alive(vvs); cg_emit("store i1 false, ptr %s", vvs->drop_flag_llvm); }
         cg_emit("store %s %s, ptr %s", llvm_mem_ty(vvt), vm, vvp);
-        g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){after_lbl, l_step, NULL, NULL};
+        g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){after_lbl, l_step, NULL, NULL, g_cg.temp_count};
         cg_stmts(body, body_count);
         g_cg.loop_depth--;
         cg_br(l_step);
@@ -7868,17 +9783,24 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
     if (target_count == 1) {
         Type* vt = NULL;
         const char* vp = cg_var_ptr(targets[0], &vt);
+        VarSym* vs = cg_find_var_sym(targets[0]);
+        if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
         cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(cg_coerce(elem_v, el_ty, vt), vt), vp);
+        if (vs && vs->drop_flag_llvm) {
+            cg_emit("store i1 %s, ptr %s", (it_ty->kind == TY_STR) ? "true" : "false", vs->drop_flag_llvm);
+        }
     } else {
         for (int k = 0; k < target_count; k++) {
             Type* vt = NULL;
             const char* vp = cg_var_ptr(targets[k], &vt);
+            VarSym* vs = cg_find_var_sym(targets[k]);
+            if (vs && vs->drop_flag_llvm) { cg_drop_var_if_alive(vs); cg_emit("store i1 false, ptr %s", vs->drop_flag_llvm); }
             const char* fm = cg_reg();
             cg_emit("%s = extractvalue %s %s, %d", fm, llvm_reg_ty(el_ty), elem_v, k);
             cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), fm, vp);
         }
     }
-    g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){after_lbl, l_step, NULL, NULL};
+    g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){after_lbl, l_step, NULL, NULL, g_cg.temp_count};
     cg_stmts(body, body_count);
     g_cg.loop_depth--;
     cg_br(l_step);
@@ -7897,6 +9819,7 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
     }
     CompGen* cg = &gens[gidx];
     const char* l_after = cg_lbl("cg_after");
+    int outer_m = g_cg.temp_count;
     if (cg->iter->kind == EXPR_CALL && cg->iter->call.callee->kind == EXPR_VAR &&
         strcmp(cg->iter->call.callee->var.name, "range") == 0) {
         const char* start_v = "0"; const char* stop_v = NULL; const char* step_v = "1";
@@ -7920,7 +9843,9 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
         cg_label(l_body);
         cg_emit("store i64 %s, ptr %s", iv, vp);
         for (int f = 0; f < cg->if_count; f++) {
+            int fm = g_cg.temp_count;
             const char* fv = cg_truthy(cg_expr(cg->ifs[f], g_ty_bool), cg->ifs[f]->ty);
+            cg_flush_temps(fm);
             const char* l_ok = cg_lbl("cg_ok");
             cg_cond_br(fv, l_ok, l_step);
             cg_label(l_ok);
@@ -7934,6 +9859,7 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
         cg_emit("store i64 %s, ptr %s", in, i_p);
         cg_br(l_cond);
         cg_label(l_after);
+        cg_flush_temps(outer_m);
         return;
     }
 
@@ -7976,7 +9902,9 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
         cg_emit("store %s %s, ptr %s", llvm_mem_ty(kvt), km, kvp);
         cg_emit("store %s %s, ptr %s", llvm_mem_ty(vvt), vm, vvp);
         for (int f = 0; f < cg->if_count; f++) {
+            int fm = g_cg.temp_count;
             const char* fv = cg_truthy(cg_expr(cg->ifs[f], g_ty_bool), cg->ifs[f]->ty);
+            cg_flush_temps(fm);
             const char* l_ok = cg_lbl("cg_ok");
             cg_cond_br(fv, l_ok, l_step);
             cg_label(l_ok);
@@ -7990,6 +9918,7 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
         cg_emit("store i32 %s, ptr %s", in, i_p);
         cg_br(l_cond);
         cg_label(l_after);
+        cg_flush_temps(outer_m);
         return;
     }
 
@@ -8048,6 +9977,7 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
     cg_emit("%s = icmp slt i32 %s, %s", c, iv, len);
     cg_cond_br(c, l_body, l_after);
     cg_label(l_body);
+    int bm = g_cg.temp_count;
     const char* ev = NULL;
     if (it_ty->kind == TY_STR) {
         const char* iv64 = cg_reg(); ev = cg_reg();
@@ -8061,17 +9991,26 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
     }
     if (cg->target_count == 1) {
         Type* vt = NULL; const char* vp = cg_var_ptr(cg->targets[0], &vt);
+        VarSym* vs = cg_find_var_sym(cg->targets[0]);
+        if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
         cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(ev, el_ty), vp);
+        if (vs && vs->drop_flag_llvm) {
+            cg_emit("store i1 %s, ptr %s", (it_ty->kind == TY_STR) ? "true" : "false", vs->drop_flag_llvm);
+        }
     } else {
         for (int k = 0; k < cg->target_count; k++) {
             Type* vt = NULL; const char* vp = cg_var_ptr(cg->targets[k], &vt);
+            VarSym* vs = cg_find_var_sym(cg->targets[k]);
+            if (vs && vs->drop_flag_llvm) { cg_drop_var_if_alive(vs); cg_emit("store i1 false, ptr %s", vs->drop_flag_llvm); }
             const char* fm = cg_reg();
             cg_emit("%s = extractvalue %s %s, %d", fm, llvm_reg_ty(el_ty), ev, k);
             cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), fm, vp);
         }
     }
     for (int f = 0; f < cg->if_count; f++) {
+        int fm = g_cg.temp_count;
         const char* fv = cg_truthy(cg_expr(cg->ifs[f], g_ty_bool), cg->ifs[f]->ty);
+        cg_flush_temps(fm);
         const char* l_ok = cg_lbl("cg_ok");
         cg_cond_br(fv, l_ok, l_step);
         cg_label(l_ok);
@@ -8079,41 +10018,62 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
     cg_comp_loop_emit(gens, gidx + 1, gcount, emit_leaf, ctx);
     cg_br(l_step);
     cg_label(l_step);
+    cg_flush_temps(bm);
+    if (it_ty->kind == TY_STR && cg->target_count == 1) {
+        VarSym* vs = cg_find_var_sym(cg->targets[0]);
+        if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
+    }
     const char* iv2 = cg_reg(); const char* in = cg_reg();
     cg_emit("%s = load i32, ptr %s", iv2, i_p);
     cg_emit("%s = add i32 %s, 1", in, iv2);
     cg_emit("store i32 %s, ptr %s", in, i_p);
     cg_br(l_cond);
     cg_label(l_after);
+    cg_flush_temps(outer_m);
 }
 
-typedef struct { Expr* comp; const char* container; Type* cty; const char* exit_lbl; bool is_all; } CompLeafCtx;
+typedef struct { Expr* comp; const char* container; Type* cty; const char* exit_lbl; bool is_all; int exit_tmark; } CompLeafCtx;
 
 static void comp_leaf_list(void* vctx) {
     CompLeafCtx* c = (CompLeafCtx*)vctx;
+    int lm = g_cg.temp_count;
     Type* el = c->cty->elem;
-    const char* ev = cg_coerce(cg_expr(c->comp->comp.elt, el), c->comp->comp.elt->ty, el);
+    const char* raw = cg_expr(c->comp->comp.elt, el);
+    cg_consume_expr(c->comp->comp.elt, raw);
+    const char* ev = cg_coerce(raw, c->comp->comp.elt->ty, el);
     cg_emit("call void @_%s_append(ptr %s, %s %s)", c->cty->mangled, c->container, llvm_mem_ty(el), cg_reg_to_mem(ev, el));
+    cg_flush_temps(lm);
 }
 
 static void comp_leaf_set(void* vctx) {
     CompLeafCtx* c = (CompLeafCtx*)vctx;
+    int lm = g_cg.temp_count;
     Type* el = c->cty->elem;
-    const char* ev = cg_coerce(cg_expr(c->comp->comp.elt, el), c->comp->comp.elt->ty, el);
+    const char* raw = cg_expr(c->comp->comp.elt, el);
+    cg_consume_expr(c->comp->comp.elt, raw);
+    const char* ev = cg_coerce(raw, c->comp->comp.elt->ty, el);
     cg_emit("call void @_%s_add(ptr %s, %s %s)", c->cty->mangled, c->container, llvm_mem_ty(el), cg_reg_to_mem(ev, el));
+    cg_flush_temps(lm);
 }
 
 static void comp_leaf_dict(void* vctx) {
     CompLeafCtx* c = (CompLeafCtx*)vctx;
+    int lm = g_cg.temp_count;
     Type* kt = c->cty->key; Type* vt = c->cty->val;
-    const char* kv = cg_coerce(cg_expr(c->comp->comp.elt, kt), c->comp->comp.elt->ty, kt);
-    const char* vv = cg_coerce(cg_expr(c->comp->comp.val, vt), c->comp->comp.val->ty, vt);
+    const char* raw_k = cg_expr(c->comp->comp.elt, kt);
+    cg_consume_expr(c->comp->comp.elt, raw_k);
+    const char* raw_v = cg_expr(c->comp->comp.val, vt);
+    cg_consume_expr(c->comp->comp.val, raw_v);
+    const char* kv = cg_coerce(raw_k, c->comp->comp.elt->ty, kt);
+    const char* vv = cg_coerce(raw_v, c->comp->comp.val->ty, vt);
     cg_emit("call void @_%s_set(ptr %s, %s %s, %s %s)", c->cty->mangled, c->container,
             llvm_mem_ty(kt), cg_reg_to_mem(kv, kt), llvm_mem_ty(vt), cg_reg_to_mem(vv, vt));
+    cg_flush_temps(lm);
 }
 
 static void comp_leaf_sum(void* vctx) {
     CompLeafCtx* c = (CompLeafCtx*)vctx;
+    int lm = g_cg.temp_count;
     Type* el = c->cty;
     const char* ev = cg_coerce(cg_expr(c->comp->comp.elt, el), c->comp->comp.elt->ty, el);
     const char* cur = cg_reg(); const char* sum = cg_reg();
@@ -8121,14 +10081,18 @@ static void comp_leaf_sum(void* vctx) {
     if (type_is_float(el)) cg_emit("%s = fadd %s %s, %s", sum, llvm_reg_ty(el), cur, ev);
     else cg_emit("%s = add %s %s, %s", sum, llvm_reg_ty(el), cur, ev);
     cg_emit("store %s %s, ptr %s", llvm_reg_ty(el), sum, c->container);
+    cg_flush_temps(lm);
 }
 
 static void comp_leaf_any_all(void* vctx) {
     CompLeafCtx* c = (CompLeafCtx*)vctx;
+    int lm = g_cg.temp_count;
     const char* b = cg_truthy(cg_expr(c->comp->comp.elt, NULL), c->comp->comp.elt->ty);
+    cg_flush_temps(lm);
     const char* l_hit = cg_lbl("aa_h"); const char* l_cont = cg_lbl("aa_c");
     if (c->is_all) cg_cond_br(b, l_cont, l_hit); else cg_cond_br(b, l_hit, l_cont);
     cg_label(l_hit);
+    cg_flush_temps_preserve(c->exit_tmark);
     cg_emit("store i1 %s, ptr %s", c->is_all ? "false" : "true", c->container);
     cg_br(c->exit_lbl);
     cg_label(l_cont);
@@ -8186,6 +10150,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
                     if (lit.len > 0) {
                         const char* n = cg_reg();
                         cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, cg_strictastr_lit(lit.data, lit.len));
+                        cg_emit("call void @stricta_str_free(ptr %s)", acc);
                         acc = n; lit.len = 0; lit.data[0] = '\0';
                     }
                     p++;
@@ -8202,6 +10167,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
                     if (spec[0] != '\0') aidx = atoi(spec);
                     else auto_idx++;
                     const char* part = NULL;
+                    bool free_part = false;
                     if (aidx >= 0 && aidx < argc) {
                         if (colon && strchr(colon + 1, 'f')) {
                             const char* dot = strchr(colon + 1, '.');
@@ -8209,14 +10175,18 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
                             const char* fv = cg_coerce(arg_strs[aidx], args[aidx]->ty, g_ty_f64);
                             part = cg_reg();
                             cg_emit("%s = call ptr @stricta_float_fmt(double %s, i32 %d)", part, fv, prec);
+                            free_part = true;
                         } else {
                             part = cg_to_str(arg_strs[aidx], args[aidx]->ty);
+                            free_part = (args[aidx]->ty->kind != TY_STR);
                         }
                     } else {
                         part = cg_strictastr_lit("", 0);
                     }
                     const char* n = cg_reg();
                     cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, part);
+                    cg_emit("call void @stricta_str_free(ptr %s)", acc);
+                    if (free_part) cg_emit("call void @stricta_str_free(ptr %s)", part);
                     acc = n;
                 } else {
                     sb_append_n(&lit, &fmt[p], 1);
@@ -8226,12 +10196,28 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
             if (lit.len > 0) {
                 const char* n = cg_reg();
                 cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, cg_strictastr_lit(lit.data, lit.len));
+                cg_emit("call void @stricta_str_free(ptr %s)", acc);
                 acc = n;
             }
             free(lit.data);
             return acc;
         }
+        if (strcmp(mname, "copy") == 0) {
+            const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_clone(ptr %s)", r, self_v); return r;
+        }
         return cg_strictastr_lit("", 0);
+    }
+
+    if (obj_ty->kind == TY_BYTES || obj_ty->kind == TY_BIGINT || obj_ty->kind == TY_TUPLE) {
+        const char* ov = cg_expr(obj_e, NULL);
+        if (strcmp(mname, "copy") == 0) {
+            if (!type_is_owned(obj_ty)) return ov;
+            emit_clone_for_type(obj_ty);
+            const char* r = cg_reg();
+            cg_emit("%s = call %s @_clone_%s(%s %s)", r, llvm_reg_ty(obj_ty), obj_ty->mangled, llvm_reg_ty(obj_ty), ov);
+            return r;
+        }
+        return ov;
     }
 
     if (obj_ty->kind == TY_FILE) {
@@ -8254,7 +10240,9 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
         Type* el = obj_ty->elem;
         const char* mty = llvm_mem_ty(el);
         if (strcmp(mname, "append") == 0) {
-            const char* av = cg_reg_to_mem(cg_coerce(cg_expr(args[0], el), args[0]->ty, el), el);
+            const char* raw_av = cg_expr(args[0], el);
+            cg_consume_expr(args[0], raw_av);
+            const char* av = cg_reg_to_mem(cg_coerce(raw_av, args[0]->ty, el), el);
             cg_emit("call void @_%s_append(ptr %s, %s %s)", m, lv, mty, av); return "0";
         }
         if (strcmp(mname, "extend") == 0) {
@@ -8263,7 +10251,9 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
         }
         if (strcmp(mname, "insert") == 0) {
             const char* iv = cg_coerce(cg_expr(args[0], g_ty_i64), args[0]->ty, g_ty_i64);
-            const char* vv = cg_reg_to_mem(cg_coerce(cg_expr(args[1], el), args[1]->ty, el), el);
+            const char* raw_vv = cg_expr(args[1], el);
+            cg_consume_expr(args[1], raw_vv);
+            const char* vv = cg_reg_to_mem(cg_coerce(raw_vv, args[1]->ty, el), el);
             cg_emit("call void @_%s_insert(ptr %s, i64 %s, %s %s)", m, lv, iv, mty, vv); return "0";
         }
         if (strcmp(mname, "pop") == 0) {
@@ -8283,9 +10273,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
             cg_emit("call void @_%s_%s(ptr %s)", m, mname, lv); return "0";
         }
         if (strcmp(mname, "clear") == 0) {
-            const char* lp = cg_reg();
-            cg_emit("%s = getelementptr %%%s, ptr %s, i32 0, i32 0", lp, m, lv);
-            cg_emit("store i32 0, ptr %s", lp); return "0";
+            cg_emit("call void @_%s_clear(ptr %s)", m, lv); return "0";
         }
         if (strcmp(mname, "copy") == 0) {
             const char* r = cg_reg(); cg_emit("%s = call ptr @_%s_copy(ptr %s)", r, m, lv); return r;
@@ -8298,7 +10286,9 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
         Type* el = obj_ty->elem;
         const char* mty = llvm_mem_ty(el);
         if (strcmp(mname, "add") == 0) {
-            const char* av = cg_reg_to_mem(cg_coerce(cg_expr(args[0], el), args[0]->ty, el), el);
+            const char* raw_av = cg_expr(args[0], el);
+            cg_consume_expr(args[0], raw_av);
+            const char* av = cg_reg_to_mem(cg_coerce(raw_av, args[0]->ty, el), el);
             cg_emit("call void @_%s_add(ptr %s, %s %s)", m, sv, mty, av); return "0";
         }
         if (strcmp(mname, "discard") == 0 || strcmp(mname, "remove") == 0) {
@@ -8336,8 +10326,14 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
             const char* r = cg_reg(); cg_emit("%s = call ptr @_%s_%s(ptr %s)", r, m, mname, dv); return r;
         }
         if (strcmp(mname, "get") == 0 || strcmp(mname, "setdefault") == 0) {
-            const char* kv = cg_reg_to_mem(cg_coerce(cg_expr(args[0], kt), args[0]->ty, kt), kt);
-            const char* vv = cg_reg_to_mem(cg_coerce(cg_expr(args[1], vt), args[1]->ty, vt), vt);
+            const char* raw_kv = cg_expr(args[0], kt);
+            const char* raw_vv = cg_expr(args[1], vt);
+            if (strcmp(mname, "setdefault") == 0) {
+                cg_consume_expr(args[0], raw_kv);
+                cg_consume_expr(args[1], raw_vv);
+            }
+            const char* kv = cg_reg_to_mem(cg_coerce(raw_kv, args[0]->ty, kt), kt);
+            const char* vv = cg_reg_to_mem(cg_coerce(raw_vv, args[1]->ty, vt), vt);
             const char* r = cg_reg();
             cg_emit("%s = call %s @_%s_%s(ptr %s, %s %s, %s %s)", r, vmty, m, mname, dv, kmty, kv, vmty, vv);
             return cg_mem_to_reg(r, vt);
@@ -8388,7 +10384,9 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
             sb_printf(&ca, "%s %s", llvm_reg_ty(def_m->param_types[0]), self_reg);
             for (int i = 0; i < argc; i++) {
                 Type* pt = def_m->param_types[i + 1];
-                const char* av = cg_coerce(cg_expr(args[i], pt), args[i]->ty, pt);
+                const char* raw_av = cg_expr(args[i], pt);
+                if (def_m->param_modes && def_m->param_modes[i + 1] == PM_MOVE) cg_consume_expr(args[i], raw_av);
+                const char* av = cg_coerce(raw_av, args[i]->ty, pt);
                 sb_printf(&ca, ", %s %s", llvm_reg_ty(pt), av);
             }
 
@@ -8415,15 +10413,11 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
                 }
             }
 
-            const char* rty = llvm_reg_ty(def_m->ret_type);
+            const char* rty = llvm_fn_ret_ty(def_m);
             if (alt_cnt == 0) {
-                if (def_m->ret_type->kind == TY_VOID) {
-                    cg_emit("call void %s(%s)", def_m->llvm_name, ca.data);
-                    free(ca.data); return "0";
-                }
-                const char* r = cg_reg();
-                cg_emit("%s = call %s %s(%s)", r, rty, def_m->llvm_name, ca.data);
-                free(ca.data); return r;
+                const char* r = cg_emit_call_check(def_m, def_m->llvm_name, ca.data);
+                free(ca.data);
+                return r;
             }
 
             const char* vpp = cg_reg(); const char* vt = cg_reg(); const char* tid = cg_reg();
@@ -8432,8 +10426,9 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
             cg_emit("%s = load i32, ptr %s", tid, vt);
             const char* l_def = cg_lbl("sup_def");
             const char* l_end = cg_lbl("sup_end");
-            const char* res_p = (def_m->ret_type->kind != TY_VOID) ? cg_reg() : NULL;
-            if (res_p) cg_entry("%s = alloca %s", res_p, llvm_mem_ty(def_m->ret_type));
+            bool has_ret_slot = (def_m->can_raise || def_m->ret_type->kind != TY_VOID);
+            const char* res_p = has_ret_slot ? cg_reg() : NULL;
+            if (res_p) cg_entry("%s = alloca %s", res_p, rty);
 
             StrBuf sw; sb_init(&sw);
             sb_printf(&sw, "switch i32 %s, label %%%s [", tid, l_def);
@@ -8449,33 +10444,70 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
 
             for (int k = 0; k < alt_cnt; k++) {
                 cg_label(lbls[k]);
-                if (def_m->ret_type->kind == TY_VOID) {
+                if (!has_ret_slot) {
                     cg_emit("call void %s(%s)", alt_fns[k]->llvm_name, ca.data);
                 } else {
                     const char* cr = cg_reg();
                     cg_emit("%s = call %s %s(%s)", cr, rty, alt_fns[k]->llvm_name, ca.data);
-                    cg_emit("store %s %s, ptr %s", llvm_mem_ty(def_m->ret_type), cg_reg_to_mem(cr, def_m->ret_type), res_p);
+                    cg_emit("store %s %s, ptr %s", rty, cr, res_p);
                 }
                 cg_br(l_end);
             }
             cg_label(l_def);
-            if (def_m->ret_type->kind == TY_VOID) {
+            if (!has_ret_slot) {
                 cg_emit("call void %s(%s)", def_m->llvm_name, ca.data);
             } else {
                 const char* cr = cg_reg();
                 cg_emit("%s = call %s %s(%s)", cr, rty, def_m->llvm_name, ca.data);
-                cg_emit("store %s %s, ptr %s", llvm_mem_ty(def_m->ret_type), cg_reg_to_mem(cr, def_m->ret_type), res_p);
+                cg_emit("store %s %s, ptr %s", rty, cr, res_p);
             }
             cg_br(l_end);
             cg_label(l_end);
             free(ca.data);
             if (!res_p) return "0";
-            const char* rm = cg_reg();
-            cg_emit("%s = load %s, ptr %s", rm, llvm_mem_ty(def_m->ret_type), res_p);
-            return cg_mem_to_reg(rm, def_m->ret_type);
+            const char* raw = cg_reg();
+            cg_emit("%s = load %s, ptr %s", raw, rty, res_p);
+            if (!def_m->can_raise) return raw;
+            const char* is_exc = raw;
+            if (def_m->ret_type->kind != TY_VOID) {
+                is_exc = cg_reg();
+                cg_emit("%s = extractvalue %s %s, 0", is_exc, rty, raw);
+            }
+            const char* l_ok = cg_lbl("sup_ok");
+            if (g_cg.cur_unwind_lbl) {
+                if (cg_has_active_temps(0)) {
+                    const char* l_ed = cg_lbl("sup_ed");
+                    cg_cond_br(is_exc, l_ed, l_ok);
+                    cg_label(l_ed);
+                    cg_flush_temps_preserve(0);
+                    cg_br(g_cg.cur_unwind_lbl);
+                } else {
+                    cg_cond_br(is_exc, g_cg.cur_unwind_lbl, l_ok);
+                }
+            } else {
+                const char* l_unh = cg_lbl("sup_unh");
+                cg_cond_br(is_exc, l_unh, l_ok);
+                cg_label(l_unh);
+                cg_emit("call void @stricta_unhandled_exc()");
+                cg_emit("unreachable");
+                g_cg.block_terminated = true;
+            }
+            cg_label(l_ok);
+            if (def_m->ret_type->kind == TY_VOID) return "0";
+            const char* val = cg_reg();
+            cg_emit("%s = extractvalue %s %s, 1", val, rty, raw);
+            return val;
         }
 
         FuncInfo* m = call->call.resolved_fn ? call->call.resolved_fn : find_method_in_class(cls, mname);
+        if (!m && strcmp(mname, "copy") == 0) {
+            const char* ov = cg_expr(obj_e, NULL);
+            if (!type_is_owned(obj_ty)) return ov;
+            emit_clone_for_type(obj_ty);
+            const char* r = cg_reg();
+            cg_emit("%s = call %s @_clone_%s(%s %s)", r, llvm_reg_ty(obj_ty), obj_ty->mangled, llvm_reg_ty(obj_ty), ov);
+            return r;
+        }
         bool call_on_class_type = (obj_e->kind == EXPR_VAR && find_class_in_mod(g_cg.cur_mod, obj_e->var.name) != NULL);
         const char* self_val = call_on_class_type ? NULL : cg_expr(obj_e, NULL);
         StrBuf ca; sb_init(&ca);
@@ -8492,12 +10524,14 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
         for (int i = start_p; i < m->param_count; i++) {
             Expr* ae = (i - start_p < argc) ? args[i - start_p] : m->param_defaults[i];
             Type* pt = m->param_types[i];
-            const char* av = cg_coerce(cg_expr(ae, pt), ae->ty, pt);
+            const char* raw_av = cg_expr(ae, pt);
+            if (m->param_modes && m->param_modes[i] == PM_MOVE) cg_consume_expr(ae, raw_av);
+            const char* av = cg_coerce(raw_av, ae->ty, pt);
             if (ca.len > 0) sb_append(&ca, ", ");
             sb_printf(&ca, "%s %s", llvm_reg_ty(pt), av);
         }
 
-        const char* rty = llvm_reg_ty(m->ret_type);
+        const char* rty = llvm_fn_ret_ty(m);
         if (cls->needs_vtable && !m->is_static && !m->is_classmethod && !call_on_class_type && cls->has_subclasses) {
             /* Collect distinct subclass overrides for type_id switch */
             FuncInfo* ov_fns[64];
@@ -8520,8 +10554,9 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
                 cg_emit("%s = load i32, ptr %s", tid, vt);
                 const char* l_def = cg_lbl("v_def");
                 const char* l_end = cg_lbl("v_end");
-                const char* res_p = (m->ret_type->kind != TY_VOID) ? cg_reg() : NULL;
-                if (res_p) cg_entry("%s = alloca %s", res_p, llvm_mem_ty(m->ret_type));
+                bool has_ret_slot = (m->can_raise || m->ret_type->kind != TY_VOID);
+                const char* res_p = has_ret_slot ? cg_reg() : NULL;
+                if (res_p) cg_entry("%s = alloca %s", res_p, rty);
 
                 StrBuf sw; sb_init(&sw);
                 sb_printf(&sw, "switch i32 %s, label %%%s [", tid, l_def);
@@ -8537,38 +10572,62 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
 
                 for (int k = 0; k < ov_cnt; k++) {
                     cg_label(lbls[k]);
-                    if (m->ret_type->kind == TY_VOID) {
+                    if (!has_ret_slot) {
                         cg_emit("call void %s(%s)", ov_fns[k]->llvm_name, ca.data);
                     } else {
                         const char* cr = cg_reg();
                         cg_emit("%s = call %s %s(%s)", cr, rty, ov_fns[k]->llvm_name, ca.data);
-                        cg_emit("store %s %s, ptr %s", llvm_mem_ty(m->ret_type), cg_reg_to_mem(cr, m->ret_type), res_p);
+                        cg_emit("store %s %s, ptr %s", rty, cr, res_p);
                     }
                     cg_br(l_end);
                 }
                 cg_label(l_def);
-                if (m->ret_type->kind == TY_VOID) {
+                if (!has_ret_slot) {
                     cg_emit("call void %s(%s)", m->llvm_name, ca.data);
                 } else {
                     const char* cr = cg_reg();
                     cg_emit("%s = call %s %s(%s)", cr, rty, m->llvm_name, ca.data);
-                    cg_emit("store %s %s, ptr %s", llvm_mem_ty(m->ret_type), cg_reg_to_mem(cr, m->ret_type), res_p);
+                    cg_emit("store %s %s, ptr %s", rty, cr, res_p);
                 }
                 cg_br(l_end);
                 cg_label(l_end);
                 free(ca.data);
                 if (!res_p) return "0";
-                const char* rm = cg_reg();
-                cg_emit("%s = load %s, ptr %s", rm, llvm_mem_ty(m->ret_type), res_p);
-                return cg_mem_to_reg(rm, m->ret_type);
+                const char* raw = cg_reg();
+                cg_emit("%s = load %s, ptr %s", raw, rty, res_p);
+                if (!m->can_raise) return raw;
+                const char* is_exc = raw;
+                if (m->ret_type->kind != TY_VOID) {
+                    is_exc = cg_reg();
+                    cg_emit("%s = extractvalue %s %s, 0", is_exc, rty, raw);
+                }
+                const char* l_ok = cg_lbl("v_ok");
+                if (g_cg.cur_unwind_lbl) {
+                    if (cg_has_active_temps(0)) {
+                        const char* l_ed = cg_lbl("v_ed");
+                        cg_cond_br(is_exc, l_ed, l_ok);
+                        cg_label(l_ed);
+                        cg_flush_temps_preserve(0);
+                        cg_br(g_cg.cur_unwind_lbl);
+                    } else {
+                        cg_cond_br(is_exc, g_cg.cur_unwind_lbl, l_ok);
+                    }
+                } else {
+                    const char* l_unh = cg_lbl("v_unh");
+                    cg_cond_br(is_exc, l_unh, l_ok);
+                    cg_label(l_unh);
+                    cg_emit("call void @stricta_unhandled_exc()");
+                    cg_emit("unreachable");
+                    g_cg.block_terminated = true;
+                }
+                cg_label(l_ok);
+                if (m->ret_type->kind == TY_VOID) return "0";
+                const char* val = cg_reg();
+                cg_emit("%s = extractvalue %s %s, 1", val, rty, raw);
+                return val;
             }
         }
-        if (m->ret_type->kind == TY_VOID) {
-            cg_emit("call void %s(%s)", m->llvm_name, ca.data);
-            free(ca.data); return "0";
-        }
-        const char* r = cg_reg();
-        cg_emit("%s = call %s %s(%s)", r, rty, m->llvm_name, ca.data);
+        const char* r = cg_emit_call_check(m, m->llvm_name, ca.data);
         free(ca.data); return r;
     }
 
@@ -8580,16 +10639,13 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
             for (int i = 0; i < mf->param_count; i++) {
                 Expr* ae = (i < argc) ? args[i] : mf->param_defaults[i];
                 Type* pt = mf->param_types[i];
-                const char* av = cg_coerce(cg_expr(ae, pt), ae->ty, pt);
+                const char* raw_av = cg_expr(ae, pt);
+                if (mf->param_modes && mf->param_modes[i] == PM_MOVE) cg_consume_expr(ae, raw_av);
+                const char* av = cg_coerce(raw_av, ae->ty, pt);
                 if (i > 0) sb_append(&ca, ", ");
                 sb_printf(&ca, "%s %s", llvm_reg_ty(pt), av);
             }
-            if (mf->ret_type->kind == TY_VOID) {
-                cg_emit("call void %s(%s)", mf->llvm_name, ca.data);
-                free(ca.data); return "0";
-            }
-            const char* r = cg_reg();
-            cg_emit("%s = call %s %s(%s)", r, llvm_reg_ty(mf->ret_type), mf->llvm_name, ca.data);
+            const char* r = cg_emit_call_check(mf, mf->llvm_name, ca.data);
             free(ca.data); return r;
         }
         ClassInfo* mci = find_class_in_mod(mmod, mname);
@@ -8599,7 +10655,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
     return "0";
 }
 
-static const char* cg_expr(Expr* e, Type* hint) {
+static const char* cg_expr_inner(Expr* e, Type* hint) {
     (void)hint;
     if (!e) return "0";
     Type* ty = e->ty ? e->ty : g_ty_i64;
@@ -8644,6 +10700,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
             for (int i = 0; i < e->fstr.count; i++) {
                 FStrPart* fp = &e->fstr.parts[i];
                 const char* ps = NULL;
+                bool free_ps = false;
                 if (!fp->is_expr) {
                     ps = cg_strictastr_lit(fp->text, strlen(fp->text));
                 } else {
@@ -8653,12 +10710,16 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         int prec = dot ? atoi(dot + 1) : 6;
                         ps = cg_reg();
                         cg_emit("%s = call ptr @stricta_float_fmt(double %s, i32 %d)", ps, cg_coerce(ev, fp->expr->ty, g_ty_f64), prec);
+                        free_ps = true;
                     } else {
                         ps = cg_to_str(ev, fp->expr->ty);
+                        free_ps = (fp->expr->ty->kind != TY_STR);
                     }
                 }
                 const char* n = cg_reg();
                 cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, ps);
+                cg_emit("call void @stricta_str_free(ptr %s)", acc);
+                if (free_ps) cg_emit("call void @stricta_str_free(ptr %s)", ps);
                 acc = n;
             }
             return acc;
@@ -8690,11 +10751,16 @@ static const char* cg_expr(Expr* e, Type* hint) {
             return "null";
         }
         case EXPR_WALRUS: {
-            const char* v = cg_expr(e->walrus.val, ty);
+            const char* raw_v = cg_expr(e->walrus.val, ty);
+            cg_consume_expr(e->walrus.val, raw_v);
             Type* vt = NULL;
             const char* vp = cg_var_ptr(e->walrus.name, &vt);
-            cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(cg_coerce(v, e->walrus.val->ty, vt), vt), vp);
-            return v;
+            VarSym* vs = cg_find_var_sym(e->walrus.name);
+            if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
+            const char* cv = cg_coerce(raw_v, e->walrus.val->ty, vt);
+            cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(cv, vt), vp);
+            if (vs && vs->drop_flag_llvm) cg_emit("store i1 true, ptr %s", vs->drop_flag_llvm);
+            return cv;
         }
         case EXPR_UNOP: {
             const char* op = e->unop.op;
@@ -8738,11 +10804,25 @@ static const char* cg_expr(Expr* e, Type* hint) {
 
                 cg_label(l_short);
                 const char* sv = (ty->kind == TY_BOOL) ? (is_and ? "false" : "true") : cg_coerce(lv, e->binop.left->ty, ty);
+                if (type_is_owned(ty)) {
+                    emit_clone_for_type(ty);
+                    const char* svc = cg_reg();
+                    cg_emit("%s = call %s @_clone_%s(%s %s)", svc, llvm_mem_ty(ty), ty->mangled, llvm_mem_ty(ty), cg_reg_to_mem(sv, ty));
+                    sv = cg_mem_to_reg(svc, ty);
+                }
                 cg_br(l_end);
 
                 cg_label(l_rhs);
+                int rm = g_cg.temp_count;
                 const char* rv = cg_expr(e->binop.right, ty);
                 const char* rb = (ty->kind == TY_BOOL) ? cg_truthy(rv, e->binop.right->ty) : cg_coerce(rv, e->binop.right->ty, ty);
+                if (type_is_owned(ty)) {
+                    emit_clone_for_type(ty);
+                    const char* rbc = cg_reg();
+                    cg_emit("%s = call %s @_clone_%s(%s %s)", rbc, llvm_mem_ty(ty), ty->mangled, llvm_mem_ty(ty), cg_reg_to_mem(rb, ty));
+                    rb = cg_mem_to_reg(rbc, ty);
+                }
+                cg_flush_temps(rm);
                 const char* rhs_end = cg_lbl("sc_rend");
                 cg_br(rhs_end);
                 cg_label(rhs_end);
@@ -8764,10 +10844,38 @@ static const char* cg_expr(Expr* e, Type* hint) {
             const char* l_end = cg_lbl("tern_e");
             cg_cond_br(cond, l_t, l_f);
             cg_label(l_t);
-            const char* tv = cg_coerce(cg_expr(e->ternary.then_e, ty), e->ternary.then_e->ty, ty);
+            int tm = g_cg.temp_count;
+            const char* raw_t = cg_expr(e->ternary.then_e, ty);
+            if (type_is_owned(ty)) {
+                if (e->ternary.then_e->is_move || expr_produces_fresh_temp(e->ternary.then_e)) {
+                    cg_consume_expr(e->ternary.then_e, raw_t);
+                } else {
+                    emit_clone_for_type(ty);
+                    const char* tc = cg_reg();
+                    cg_emit("%s = call %s @_clone_%s(%s %s)", tc, llvm_mem_ty(ty), ty->mangled, llvm_mem_ty(ty),
+                            cg_reg_to_mem(cg_coerce(raw_t, e->ternary.then_e->ty, ty), ty));
+                    raw_t = cg_mem_to_reg(tc, ty);
+                }
+            }
+            const char* tv = cg_coerce(raw_t, e->ternary.then_e->ty, ty);
+            cg_flush_temps(tm);
             const char* l_te = cg_lbl("tern_te"); cg_br(l_te); cg_label(l_te); cg_br(l_end);
             cg_label(l_f);
-            const char* fv = cg_coerce(cg_expr(e->ternary.else_e, ty), e->ternary.else_e->ty, ty);
+            int fm = g_cg.temp_count;
+            const char* raw_f = cg_expr(e->ternary.else_e, ty);
+            if (type_is_owned(ty)) {
+                if (e->ternary.else_e->is_move || expr_produces_fresh_temp(e->ternary.else_e)) {
+                    cg_consume_expr(e->ternary.else_e, raw_f);
+                } else {
+                    emit_clone_for_type(ty);
+                    const char* fc = cg_reg();
+                    cg_emit("%s = call %s @_clone_%s(%s %s)", fc, llvm_mem_ty(ty), ty->mangled, llvm_mem_ty(ty),
+                            cg_reg_to_mem(cg_coerce(raw_f, e->ternary.else_e->ty, ty), ty));
+                    raw_f = cg_mem_to_reg(fc, ty);
+                }
+            }
+            const char* fv = cg_coerce(raw_f, e->ternary.else_e->ty, ty);
+            cg_flush_temps(fm);
             const char* l_fe = cg_lbl("tern_fe"); cg_br(l_fe); cg_label(l_fe); cg_br(l_end);
             cg_label(l_end);
             const char* r = cg_reg();
@@ -8779,7 +10887,9 @@ static const char* cg_expr(Expr* e, Type* hint) {
             int cap = e->seq.count > 4 ? e->seq.count : 4;
             cg_emit("%s = call ptr @_%s_new(i32 %d)", l, ty->mangled, cap);
             for (int i = 0; i < e->seq.count; i++) {
-                const char* iv = cg_coerce(cg_expr(e->seq.items[i], ty->elem), e->seq.items[i]->ty, ty->elem);
+                const char* raw_iv = cg_expr(e->seq.items[i], ty->elem);
+                cg_consume_expr(e->seq.items[i], raw_iv);
+                const char* iv = cg_coerce(raw_iv, e->seq.items[i]->ty, ty->elem);
                 cg_emit("call void @_%s_append(ptr %s, %s %s)", ty->mangled, l, llvm_mem_ty(ty->elem), cg_reg_to_mem(iv, ty->elem));
             }
             return l;
@@ -8787,7 +10897,9 @@ static const char* cg_expr(Expr* e, Type* hint) {
         case EXPR_TUPLE: {
             const char* t = "zeroinitializer";
             for (int i = 0; i < e->seq.count; i++) {
-                const char* iv = cg_coerce(cg_expr(e->seq.items[i], ty->tuple_elems[i]), e->seq.items[i]->ty, ty->tuple_elems[i]);
+                const char* raw_iv = cg_expr(e->seq.items[i], ty->tuple_elems[i]);
+                cg_consume_expr(e->seq.items[i], raw_iv);
+                const char* iv = cg_coerce(raw_iv, e->seq.items[i]->ty, ty->tuple_elems[i]);
                 const char* nt = cg_reg();
                 cg_emit("%s = insertvalue %s %s, %s %s, %d", nt, llvm_reg_ty(ty), t,
                         llvm_mem_ty(ty->tuple_elems[i]), cg_reg_to_mem(iv, ty->tuple_elems[i]), i);
@@ -8800,7 +10912,9 @@ static const char* cg_expr(Expr* e, Type* hint) {
             int cap = e->seq.count > 8 ? e->seq.count : 8;
             cg_emit("%s = call ptr @_%s_new(i32 %d)", s, ty->mangled, cap);
             for (int i = 0; i < e->seq.count; i++) {
-                const char* iv = cg_coerce(cg_expr(e->seq.items[i], ty->elem), e->seq.items[i]->ty, ty->elem);
+                const char* raw_iv = cg_expr(e->seq.items[i], ty->elem);
+                cg_consume_expr(e->seq.items[i], raw_iv);
+                const char* iv = cg_coerce(raw_iv, e->seq.items[i]->ty, ty->elem);
                 cg_emit("call void @_%s_add(ptr %s, %s %s)", ty->mangled, s, llvm_mem_ty(ty->elem), cg_reg_to_mem(iv, ty->elem));
             }
             return s;
@@ -8810,8 +10924,12 @@ static const char* cg_expr(Expr* e, Type* hint) {
             int cap = e->dict.count > 8 ? e->dict.count : 8;
             cg_emit("%s = call ptr @_%s_new(i32 %d)", d, ty->mangled, cap);
             for (int i = 0; i < e->dict.count; i++) {
-                const char* kv = cg_coerce(cg_expr(e->dict.keys[i], ty->key), e->dict.keys[i]->ty, ty->key);
-                const char* vv = cg_coerce(cg_expr(e->dict.vals[i], ty->val), e->dict.vals[i]->ty, ty->val);
+                const char* raw_kv = cg_expr(e->dict.keys[i], ty->key);
+                cg_consume_expr(e->dict.keys[i], raw_kv);
+                const char* raw_vv = cg_expr(e->dict.vals[i], ty->val);
+                cg_consume_expr(e->dict.vals[i], raw_vv);
+                const char* kv = cg_coerce(raw_kv, e->dict.keys[i]->ty, ty->key);
+                const char* vv = cg_coerce(raw_vv, e->dict.vals[i]->ty, ty->val);
                 cg_emit("call void @_%s_set(ptr %s, %s %s, %s %s)", ty->mangled, d,
                         llvm_mem_ty(ty->key), cg_reg_to_mem(kv, ty->key),
                         llvm_mem_ty(ty->val), cg_reg_to_mem(vv, ty->val));
@@ -8822,21 +10940,21 @@ static const char* cg_expr(Expr* e, Type* hint) {
         case EXPR_GENEXPR: {
             const char* l = cg_reg();
             cg_emit("%s = call ptr @_%s_new(i32 16)", l, ty->mangled);
-            CompLeafCtx ctx = {e, l, ty, NULL, false};
+            CompLeafCtx ctx = {e, l, ty, NULL, false, 0};
             cg_comp_loop_emit(e->comp.gens, 0, e->comp.gen_count, comp_leaf_list, &ctx);
             return l;
         }
         case EXPR_SETCOMP: {
             const char* s = cg_reg();
             cg_emit("%s = call ptr @_%s_new(i32 16)", s, ty->mangled);
-            CompLeafCtx ctx = {e, s, ty, NULL, false};
+            CompLeafCtx ctx = {e, s, ty, NULL, false, 0};
             cg_comp_loop_emit(e->comp.gens, 0, e->comp.gen_count, comp_leaf_set, &ctx);
             return s;
         }
         case EXPR_DICTCOMP: {
             const char* d = cg_reg();
             cg_emit("%s = call ptr @_%s_new(i32 16)", d, ty->mangled);
-            CompLeafCtx ctx = {e, d, ty, NULL, false};
+            CompLeafCtx ctx = {e, d, ty, NULL, false, 0};
             cg_comp_loop_emit(e->comp.gens, 0, e->comp.gen_count, comp_leaf_dict, &ctx);
             return d;
         }
@@ -8879,11 +10997,28 @@ static const char* cg_expr(Expr* e, Type* hint) {
                 return r;
             }
             if (ot->kind == TY_BYTES) {
+                const char* i64 = cg_coerce(iv, e->index.index->ty, g_ty_i64);
+                const char* lp = cg_reg(); const char* len32 = cg_reg(); const char* len64 = cg_reg();
+                const char* is_neg = cg_reg(); const char* adj = cg_reg(); const char* idx_ok = cg_reg();
+                const char* ok = cg_reg();
+                cg_emit("%s = getelementptr %%StrictaBytes, ptr %s, i32 0, i32 0", lp, ov);
+                cg_emit("%s = load i32, ptr %s", len32, lp);
+                cg_emit("%s = sext i32 %s to i64", len64, len32);
+                cg_emit("%s = icmp slt i64 %s, 0", is_neg, i64);
+                cg_emit("%s = add i64 %s, %s", adj, i64, len64);
+                cg_emit("%s = select i1 %s, i64 %s, i64 %s", idx_ok, is_neg, adj, i64);
+                cg_emit("%s = icmp ult i64 %s, %s", ok, idx_ok, len64);
+                const char* l_inb = cg_lbl("b_inb"); const char* l_oob = cg_lbl("b_oob");
+                cg_cond_br(ok, l_inb, l_oob);
+                cg_label(l_oob);
+                cg_emit("call void @stricta_bounds_fail(i64 %s, i64 %s, ptr null, i32 0)", i64, len64);
+                cg_emit("unreachable");
+                cg_label(l_inb);
                 const char* dp = cg_reg(); const char* data = cg_reg(); const char* bp = cg_reg();
                 const char* b = cg_reg(); const char* r = cg_reg();
                 cg_emit("%s = getelementptr %%StrictaBytes, ptr %s, i32 0, i32 2", dp, ov);
                 cg_emit("%s = load ptr, ptr %s", data, dp);
-                cg_emit("%s = getelementptr i8, ptr %s, i64 %s", bp, data, cg_coerce(iv, e->index.index->ty, g_ty_i64));
+                cg_emit("%s = getelementptr i8, ptr %s, i64 %s", bp, data, idx_ok);
                 cg_emit("%s = load i8, ptr %s", b, bp);
                 cg_emit("%s = zext i8 %s to i64", r, b);
                 return r;
@@ -9002,7 +11137,11 @@ static const char* cg_expr(Expr* e, Type* hint) {
                             return r;
                         }
                     }
-                    return cg_to_str(cg_expr(args[0], NULL), args[0]->ty);
+                    const char* av = cg_expr(args[0], NULL);
+                    if (args[0]->ty->kind == TY_STR) {
+                        const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_clone(ptr %s)", r, av); return r;
+                    }
+                    return cg_to_str(av, args[0]->ty);
                 }
                 if (strcmp(cname, "int") == 0 || strcmp(cname, "i64") == 0 || strcmp(cname, "i32") == 0 ||
                     strcmp(cname, "i16") == 0 || strcmp(cname, "i8") == 0 || strcmp(cname, "u64") == 0 ||
@@ -9076,7 +11215,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         const char* acc_p = cg_reg();
                         cg_entry("%s = alloca %s", acc_p, llvm_reg_ty(ty));
                         cg_emit("store %s %s, ptr %s", llvm_reg_ty(ty), llvm_zero(ty), acc_p);
-                        CompLeafCtx ctx = {args[0], acc_p, ty, NULL, false};
+                        CompLeafCtx ctx = {args[0], acc_p, ty, NULL, false, 0};
                         cg_comp_loop_emit(args[0]->comp.gens, 0, args[0]->comp.gen_count, comp_leaf_sum, &ctx);
                         const char* r = cg_reg();
                         cg_emit("%s = load %s, ptr %s", r, llvm_reg_ty(ty), acc_p);
@@ -9172,7 +11311,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         cg_entry("%s = alloca i1", res_p);
                         cg_emit("store i1 %s, ptr %s", is_all ? "true" : "false", res_p);
                         const char* l_exit = cg_lbl("aa_exit");
-                        CompLeafCtx ctx = {args[0], res_p, g_ty_bool, l_exit, is_all};
+                        CompLeafCtx ctx = {args[0], res_p, g_ty_bool, l_exit, is_all, g_cg.temp_count};
                         cg_comp_loop_emit(args[0]->comp.gens, 0, args[0]->comp.gen_count, comp_leaf_any_all, &ctx);
                         cg_br(l_exit);
                         cg_label(l_exit);
@@ -9239,9 +11378,15 @@ static const char* cg_expr(Expr* e, Type* hint) {
                             const char* iv = cg_reg(); const char* c = cg_reg();
                             cg_emit("%s = load i32, ptr %s", iv, i_p); cg_emit("%s = icmp slt i32 %s, %s", c, iv, len);
                             cg_cond_br(c, lb, ld); cg_label(lb);
-                            const char* ep = cg_reg(); const char* ev = cg_reg();
+                            const char* ep = cg_reg(); const char* ev0 = cg_reg();
                             cg_emit("%s = getelementptr %s, ptr %s, i32 %s", ep, llvm_mem_ty(at->elem), arr, iv);
-                            cg_emit("%s = load %s, ptr %s", ev, llvm_mem_ty(at->elem), ep);
+                            cg_emit("%s = load %s, ptr %s", ev0, llvm_mem_ty(at->elem), ep);
+                            const char* ev = ev0;
+                            if (type_is_owned(ty->elem)) {
+                                emit_clone_for_type(ty->elem);
+                                ev = cg_reg();
+                                cg_emit("%s = call %s @_clone_%s(%s %s)", ev, llvm_mem_ty(ty->elem), ty->elem->mangled, llvm_mem_ty(ty->elem), ev0);
+                            }
                             cg_emit("call void @_%s_append(ptr %s, %s %s)", ty->mangled, res, llvm_mem_ty(ty->elem), ev);
                             const char* in = cg_reg(); cg_emit("%s = add i32 %s, 1", in, iv); cg_emit("store i32 %s, ptr %s", in, i_p);
                             cg_br(ll); cg_label(ld);
@@ -9371,7 +11516,13 @@ static const char* cg_expr(Expr* e, Type* hint) {
                             const char* keep = cg_truthy(cv, fr);
                             const char* lk = cg_lbl("fl_k"); const char* ln = cg_lbl("fl_n");
                             cg_cond_br(keep, lk, ln); cg_label(lk);
-                            cg_emit("call void @_%s_append(ptr %s, %s %s)", ty->mangled, res, evm, ev);
+                            const char* ev_add = ev;
+                            if (type_is_owned(el)) {
+                                emit_clone_for_type(el);
+                                ev_add = cg_reg();
+                                cg_emit("%s = call %s @_clone_%s(%s %s)", ev_add, evm, el->mangled, evm, ev);
+                            }
+                            cg_emit("call void @_%s_append(ptr %s, %s %s)", ty->mangled, res, evm, ev_add);
                             cg_br(ln); cg_label(ln);
                         }
                         const char* in = cg_reg(); cg_emit("%s = add i32 %s, 1", in, idx); cg_emit("store i32 %s, ptr %s", in, i_p);
@@ -9408,9 +11559,15 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         const char* iv = cg_reg(); const char* c = cg_reg();
                         cg_emit("%s = load i32, ptr %s", iv, i_p); cg_emit("%s = icmp slt i32 %s, %s", c, iv, len);
                         cg_cond_br(c, lb, ld); cg_label(lb);
-                        const char* ep = cg_reg(); const char* ev = cg_reg();
+                        const char* ep = cg_reg(); const char* ev0 = cg_reg();
                         cg_emit("%s = getelementptr %s, ptr %s, i32 %s", ep, llvm_mem_ty(ty->elem), arr, iv);
-                        cg_emit("%s = load %s, ptr %s", ev, llvm_mem_ty(ty->elem), ep);
+                        cg_emit("%s = load %s, ptr %s", ev0, llvm_mem_ty(ty->elem), ep);
+                        const char* ev = ev0;
+                        if (type_is_owned(ty->elem)) {
+                            emit_clone_for_type(ty->elem);
+                            ev = cg_reg();
+                            cg_emit("%s = call %s @_clone_%s(%s %s)", ev, llvm_mem_ty(ty->elem), ty->elem->mangled, llvm_mem_ty(ty->elem), ev0);
+                        }
                         cg_emit("call void @_%s_append(ptr %s, %s %s)", ty->mangled, res, llvm_mem_ty(ty->elem), ev);
                         const char* in = cg_reg(); cg_emit("%s = add i32 %s, 1", in, iv); cg_emit("store i32 %s, ptr %s", in, i_p);
                         cg_br(ll); cg_label(ld);
@@ -9461,9 +11618,15 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         const char* iv = cg_reg(); const char* c = cg_reg();
                         cg_emit("%s = load i32, ptr %s", iv, i_p); cg_emit("%s = icmp slt i32 %s, %s", c, iv, len);
                         cg_cond_br(c, lb, ld); cg_label(lb);
-                        const char* ep = cg_reg(); const char* ev = cg_reg();
+                        const char* ep = cg_reg(); const char* ev0 = cg_reg();
                         cg_emit("%s = getelementptr %s, ptr %s, i32 %s", ep, llvm_mem_ty(at->elem), arr, iv);
-                        cg_emit("%s = load %s, ptr %s", ev, llvm_mem_ty(at->elem), ep);
+                        cg_emit("%s = load %s, ptr %s", ev0, llvm_mem_ty(at->elem), ep);
+                        const char* ev = ev0;
+                        if (type_is_owned(ty->elem)) {
+                            emit_clone_for_type(ty->elem);
+                            ev = cg_reg();
+                            cg_emit("%s = call %s @_clone_%s(%s %s)", ev, llvm_mem_ty(ty->elem), ty->elem->mangled, llvm_mem_ty(ty->elem), ev0);
+                        }
                         cg_emit("call void @_%s_add(ptr %s, %s %s)", ty->mangled, res, llvm_mem_ty(ty->elem), ev);
                         const char* in = cg_reg(); cg_emit("%s = add i32 %s, 1", in, iv); cg_emit("store i32 %s, ptr %s", in, i_p);
                         cg_br(ll); cg_label(ld);
@@ -9485,8 +11648,14 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         cg_br(ll); cg_label(ld);
                     } else if (at->kind == TY_TUPLE) {
                         for (int k = 0; k < at->tuple_count; k++) {
-                            const char* fv = cg_reg();
-                            cg_emit("%s = extractvalue %s %s, %d", fv, llvm_reg_ty(at), av, k);
+                            const char* fv0 = cg_reg();
+                            cg_emit("%s = extractvalue %s %s, %d", fv0, llvm_reg_ty(at), av, k);
+                            const char* fv = fv0;
+                            if (type_is_owned(ty->elem)) {
+                                emit_clone_for_type(ty->elem);
+                                fv = cg_reg();
+                                cg_emit("%s = call %s @_clone_%s(%s %s)", fv, llvm_mem_ty(ty->elem), ty->elem->mangled, llvm_mem_ty(ty->elem), fv0);
+                            }
                             cg_emit("call void @_%s_add(ptr %s, %s %s)", ty->mangled, res, llvm_mem_ty(ty->elem), fv);
                         }
                     }
@@ -9507,11 +11676,30 @@ static const char* cg_expr(Expr* e, Type* hint) {
                     const char* le = cg_lbl("nx_e"); const char* lo = cg_lbl("nx_o"); const char* ld = cg_lbl("nx_d");
                     cg_cond_br(emp, le, lo);
                     cg_label(le);
-                    const char* defv = (argc == 2) ? cg_coerce(cg_expr(args[1], lt->elem), args[1]->ty, lt->elem) : llvm_zero(lt->elem);
-                    if (argc < 2) {
-                        cg_emit("call void @stricta_raise(i32 7, ptr null, ptr %s)", cg_cstr_lit("StopIteration", 13));
+                    const char* defv = llvm_zero(lt->elem);
+                    if (argc == 2) {
+                        const char* raw_def = cg_expr(args[1], lt->elem);
+                        if (type_is_owned(lt->elem)) {
+                            if (args[1]->is_move || expr_produces_fresh_temp(args[1])) {
+                                cg_consume_expr(args[1], raw_def);
+                            } else {
+                                emit_clone_for_type(lt->elem);
+                                const char* dc = cg_reg();
+                                cg_emit("%s = call %s @_clone_%s(%s %s)", dc, llvm_mem_ty(lt->elem), lt->elem->mangled,
+                                        llvm_mem_ty(lt->elem), cg_reg_to_mem(cg_coerce(raw_def, args[1]->ty, lt->elem), lt->elem));
+                                raw_def = cg_mem_to_reg(dc, lt->elem);
+                            }
+                        }
+                        defv = cg_coerce(raw_def, args[1]->ty, lt->elem);
                     }
-                    const char* lee = cg_lbl("nx_ee"); cg_br(lee); cg_label(lee); cg_br(ld);
+                    const char* lee = cg_lbl("nx_ee");
+                    if (argc < 2) {
+                        cg_emit("call void @stricta_set_exc(i32 7, ptr null, ptr %s)", cg_cstr_lit("StopIteration", 13));
+                        cg_raise_branch();
+                    } else {
+                        cg_br(lee);
+                    }
+                    cg_label(lee); cg_br(ld);
                     cg_label(lo);
                     const char* pv = cg_reg();
                     cg_emit("%s = call %s @_%s_pop(ptr %s, i64 0)", pv, llvm_mem_ty(lt->elem), lt->mangled, lv);
@@ -9607,7 +11795,9 @@ static const char* cg_expr(Expr* e, Type* hint) {
                     for (int i = 0; i < target_fn->param_count; i++) {
                         Expr* ae = (i < argc) ? args[i] : target_fn->param_defaults[i];
                         Type* pt = target_fn->param_types[i];
-                        const char* av = cg_coerce(cg_expr(ae, pt), ae->ty, pt);
+                        const char* raw_av = cg_expr(ae, pt);
+                        if (target_fn->param_modes && target_fn->param_modes[i] == PM_MOVE) cg_consume_expr(ae, raw_av);
+                        const char* av = cg_coerce(raw_av, ae->ty, pt);
                         if (arg_pos > 0 || i > 0) sb_append(&ca, ", ");
                         sb_printf(&ca, "%s %s", llvm_reg_ty(pt), av);
                     }
@@ -9617,12 +11807,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         cg_emit("%s = load ptr, ptr @_decfn_%s%s", fp, target_fn->mod->prefix, target_fn->name);
                         call_sym = fp;
                     }
-                    if (target_fn->ret_type->kind == TY_VOID) {
-                        cg_emit("call void %s(%s)", call_sym, ca.data);
-                        free(ca.data); return "0";
-                    }
-                    const char* r = cg_reg();
-                    cg_emit("%s = call %s %s(%s)", r, llvm_reg_ty(target_fn->ret_type), call_sym, ca.data);
+                    const char* r = cg_emit_call_check(target_fn, call_sym, ca.data);
                     free(ca.data); return r;
                 }
             }
@@ -9647,6 +11832,14 @@ static const char* cg_expr(Expr* e, Type* hint) {
         }
     }
     return "0";
+}
+
+static const char* cg_expr(Expr* e, Type* hint) {
+    const char* r = cg_expr_inner(e, hint);
+    if (e && e->ty && type_is_owned(e->ty) && expr_produces_fresh_temp(e)) {
+        cg_reg_temp(r, e->ty);
+    }
+    return r;
 }
 
 static bool stmts_escape_var_d(Stmt** stmts, int count, const char* vname, int depth);
@@ -9832,6 +12025,7 @@ static void cg_stmts(Stmt** stmts, int count) {
     for (int i = 0; i < count; i++) {
         if (g_cg.block_terminated) break;
         Stmt* s = stmts[i];
+        int stm_mark = g_cg.temp_count;
         switch (s->kind) {
             case STMT_PASS:
             case STMT_GLOBAL:
@@ -9844,29 +12038,50 @@ static void cg_stmts(Stmt** stmts, int count) {
             case STMT_BREAK:
                 if (g_cg.loop_depth > 0) {
                     LoopCtx* lc = &g_cg.loop_stack[g_cg.loop_depth - 1];
+                    cg_flush_temps_preserve(lc->body_temp_mark);
                     if (lc->broke_alloca) cg_emit("store i1 true, ptr %s", lc->broke_alloca);
                     cg_br(lc->break_lbl);
                 }
                 break;
             case STMT_CONTINUE:
                 if (g_cg.loop_depth > 0) {
-                    cg_br(g_cg.loop_stack[g_cg.loop_depth - 1].cont_lbl);
+                    LoopCtx* lc = &g_cg.loop_stack[g_cg.loop_depth - 1];
+                    cg_flush_temps_preserve(lc->body_temp_mark);
+                    cg_br(lc->cont_lbl);
                 }
                 break;
-            case STMT_RETURN:
-                if (g_cg.cur_fn->ret_type->kind == TY_VOID) {
-                    cg_emit("ret void");
-                } else if (!s->ret.expr) {
-                    cg_emit("ret %s %s", llvm_reg_ty(g_cg.cur_fn->ret_type), llvm_zero(g_cg.cur_fn->ret_type));
+            case STMT_RETURN: {
+                Type* rt = g_cg.cur_fn->ret_type;
+                const char* rv = NULL;
+                if (rt->kind != TY_VOID) {
+                    const char* raw_rv = s->ret.expr ? cg_expr(s->ret.expr, rt) : llvm_zero(rt);
+                    if (s->ret.expr) cg_consume_expr(s->ret.expr, raw_rv);
+                    rv = s->ret.expr ? cg_coerce(raw_rv, s->ret.expr->ty, rt) : raw_rv;
+                }
+                cg_flush_temps_preserve(0);
+                cg_drop_all_fn_locals(g_cg.cur_fn);
+                if (g_cg.cur_fn->can_raise) {
+                    if (rt->kind == TY_VOID) {
+                        cg_emit("ret i1 false");
+                    } else {
+                        const char* rty = llvm_fn_ret_ty(g_cg.cur_fn);
+                        const char* pkt = cg_reg();
+                        cg_emit("%s = insertvalue %s { i1 false, %s undef }, %s %s, 1",
+                                pkt, rty, llvm_reg_ty(rt), llvm_reg_ty(rt), rv);
+                        cg_emit("ret %s %s", rty, pkt);
+                    }
                 } else {
-                    const char* rv = cg_coerce(cg_expr(s->ret.expr, g_cg.cur_fn->ret_type), s->ret.expr->ty, g_cg.cur_fn->ret_type);
-                    cg_emit("ret %s %s", llvm_reg_ty(g_cg.cur_fn->ret_type), rv);
+                    if (rt->kind == TY_VOID) cg_emit("ret void");
+                    else cg_emit("ret %s %s", llvm_reg_ty(rt), rv);
                 }
                 g_cg.block_terminated = true;
                 break;
+            }
             case STMT_YIELD: {
                 Type* el = g_cg.cur_fn->ret_type->elem;
-                const char* yv = cg_coerce(cg_expr(s->expr_s.expr, el), s->expr_s.expr->ty, el);
+                const char* raw_yv = cg_expr(s->expr_s.expr, el);
+                cg_consume_expr(s->expr_s.expr, raw_yv);
+                const char* yv = cg_coerce(raw_yv, s->expr_s.expr->ty, el);
                 cg_emit("call void @_%s_append(ptr %s, %s %s)", g_cg.cur_fn->ret_type->mangled,
                         g_cg.yield_list_reg, llvm_mem_ty(el), cg_reg_to_mem(yv, el));
                 break;
@@ -9890,6 +12105,7 @@ static void cg_stmts(Stmt** stmts, int count) {
                 if (tgt->kind == EXPR_VAR) {
                     Type* vt = NULL;
                     const char* vp = cg_var_ptr(tgt->var.name, &vt);
+                    VarSym* vs = cg_find_var_sym(tgt->var.name);
                     if (g_cg.cur_fn && g_cg.cur_fn->ast && s->assign.value->kind == EXPR_LIST &&
                         s->assign.value->seq.count <= 64 && vt->kind == TY_LIST &&
                         !stmts_escape_var(g_cg.cur_fn->ast->def_s.body, g_cg.cur_fn->ast->def_s.body_count, tgt->var.name) &&
@@ -9901,7 +12117,9 @@ static void cg_stmts(Stmt** stmts, int count) {
                         cg_entry("%s = alloca [64 x %s]", sb, mty);
                         int n = s->assign.value->seq.count;
                         for (int k = 0; k < n; k++) {
-                            const char* iv = cg_coerce(cg_expr(s->assign.value->seq.items[k], vt->elem), s->assign.value->seq.items[k]->ty, vt->elem);
+                            const char* raw_iv = cg_expr(s->assign.value->seq.items[k], vt->elem);
+                            cg_consume_expr(s->assign.value->seq.items[k], raw_iv);
+                            const char* iv = cg_coerce(raw_iv, s->assign.value->seq.items[k]->ty, vt->elem);
                             const char* sp = cg_reg();
                             cg_emit("%s = getelementptr [64 x %s], ptr %s, i32 0, i32 %d", sp, mty, sb, k);
                             cg_emit("store %s %s, ptr %s", mty, cg_reg_to_mem(iv, vt->elem), sp);
@@ -9914,6 +12132,10 @@ static void cg_stmts(Stmt** stmts, int count) {
                         cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 2", p2, sty, sl);
                         cg_emit("store ptr %s, ptr %s", sb, p2);
                         cg_emit("store ptr %s, ptr %s", sl, vp);
+                        if (vs) {
+                            vs->is_stack_owned = true;
+                            if (vs->drop_flag_llvm) cg_emit("store i1 true, ptr %s", vs->drop_flag_llvm);
+                        }
                         break;
                     }
                     if (g_cg.cur_fn && g_cg.cur_fn->ast &&
@@ -9933,9 +12155,13 @@ static void cg_stmts(Stmt** stmts, int count) {
                         cg_emit("store i32 -64, ptr %s", p1);
                         cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 2", p2, sty, sl);
                         cg_emit("store ptr %s, ptr %s", sb, p2);
-                        CompLeafCtx ctx = {s->assign.value, sl, vt, NULL, false};
+                        CompLeafCtx ctx = {s->assign.value, sl, vt, NULL, false, 0};
                         cg_comp_loop_emit(s->assign.value->comp.gens, 0, s->assign.value->comp.gen_count, comp_leaf_list, &ctx);
                         cg_emit("store ptr %s, ptr %s", sl, vp);
+                        if (vs) {
+                            vs->is_stack_owned = true;
+                            if (vs->drop_flag_llvm) cg_emit("store i1 true, ptr %s", vs->drop_flag_llvm);
+                        }
                         break;
                     }
                     if (g_cg.cur_fn && g_cg.cur_fn->ast && s->assign.value->kind == EXPR_CALL &&
@@ -9952,17 +12178,30 @@ static void cg_stmts(Stmt** stmts, int count) {
                             cg_entry("%s = alloca %s", stk_obj, vt->cls->llvm_name);
                             const char* obj_v = cg_construct_class_at(vt->cls, s->assign.value->call.args, s->assign.value->call.arg_count, stk_obj);
                             cg_emit("store ptr %s, ptr %s", obj_v, vp);
+                            if (vs) {
+                                vs->is_stack_owned = true;
+                                if (vs->drop_flag_llvm) cg_emit("store i1 true, ptr %s", vs->drop_flag_llvm);
+                            }
                             break;
                         }
                     }
-                    const char* v = cg_coerce(cg_expr(s->assign.value, vt), s->assign.value->ty, vt);
+                    const char* raw_v = cg_expr(s->assign.value, vt);
+                    bool is_borrow = g_cg.cur_fn && expr_is_borrow_source(s->assign.value) && type_is_owned(vt);
+                    if (!is_borrow) cg_consume_expr(s->assign.value, raw_v);
+                    if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
+                    const char* v = cg_coerce(raw_v, s->assign.value->ty, vt);
                     cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(v, vt), vp);
+                    if (vs && vs->drop_flag_llvm) {
+                        cg_emit("store i1 %s, ptr %s", is_borrow ? "false" : "true", vs->drop_flag_llvm);
+                    }
                 } else if (tgt->kind == EXPR_ATTR) {
                     Type* ot = tgt->attr.obj->ty;
                     FieldInfo* fi = find_field_in_class(ot->cls, tgt->attr.attr);
                     if (fi) {
                         const char* ov = cg_expr(tgt->attr.obj, NULL);
-                        const char* v = cg_coerce(cg_expr(s->assign.value, fi->type), s->assign.value->ty, fi->type);
+                        const char* raw_v = cg_expr(s->assign.value, fi->type);
+                        cg_consume_expr(s->assign.value, raw_v);
+                        const char* v = cg_coerce(raw_v, s->assign.value->ty, fi->type);
                         if (ot->cls->is_value_type) {
                             /* Value type mutation inside __init__ or local */
                             if (tgt->attr.obj->kind == EXPR_VAR) {
@@ -9975,6 +12214,12 @@ static void cg_stmts(Stmt** stmts, int count) {
                         } else {
                             const char* fp = cg_reg();
                             cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, ot->cls->llvm_name, ov, fi->slot_index);
+                            if (type_is_owned(fi->type)) {
+                                emit_drop_for_type(fi->type);
+                                const char* old_v = cg_reg();
+                                cg_emit("%s = load %s, ptr %s", old_v, llvm_mem_ty(fi->type), fp);
+                                cg_emit("call void @_drop_%s(%s %s)", fi->type->mangled, llvm_mem_ty(fi->type), old_v);
+                            }
                             cg_emit("store %s %s, ptr %s", llvm_mem_ty(fi->type), cg_reg_to_mem(v, fi->type), fp);
                         }
                     } else {
@@ -9986,7 +12231,9 @@ static void cg_stmts(Stmt** stmts, int count) {
                             }
                         }
                         fca_s:;
-                        const char* v = cg_coerce(cg_expr(s->assign.value, ca->type), s->assign.value->ty, ca->type);
+                        const char* raw_v = cg_expr(s->assign.value, ca->type);
+                        cg_consume_expr(s->assign.value, raw_v);
+                        const char* v = cg_coerce(raw_v, s->assign.value->ty, ca->type);
                         cg_emit("store %s %s, ptr @_cattr_%s%s__%s", llvm_mem_ty(ca->type), cg_reg_to_mem(v, ca->type),
                                 owner->mod->prefix, owner->name, tgt->attr.attr);
                     }
@@ -9995,20 +12242,32 @@ static void cg_stmts(Stmt** stmts, int count) {
                     Type* ot = tgt->index.obj->ty;
                     if (ot->kind == TY_LIST) {
                         const char* iv = cg_coerce(cg_expr(tgt->index.index, g_ty_i64), tgt->index.index->ty, g_ty_i64);
-                        const char* vv = cg_coerce(cg_expr(s->assign.value, ot->elem), s->assign.value->ty, ot->elem);
+                        const char* raw_vv = cg_expr(s->assign.value, ot->elem);
+                        cg_consume_expr(s->assign.value, raw_vv);
+                        const char* vv = cg_coerce(raw_vv, s->assign.value->ty, ot->elem);
                         if (tgt->is_inbounds) {
                             const char* ip = cg_reg(); const char* arr = cg_reg(); const char* slot = cg_reg();
                             cg_emit("%s = getelementptr %%%s, ptr %s, i32 0, i32 2", ip, ot->mangled, ov);
                             cg_emit("%s = load ptr, ptr %s", arr, ip);
                             cg_emit("%s = getelementptr %s, ptr %s, i64 %s", slot, llvm_mem_ty(ot->elem), arr, iv);
+                            if (type_is_owned(ot->elem)) {
+                                emit_drop_for_type(ot->elem);
+                                const char* old_e = cg_reg();
+                                cg_emit("%s = load %s, ptr %s", old_e, llvm_mem_ty(ot->elem), slot);
+                                cg_emit("call void @_drop_%s(%s %s)", ot->elem->mangled, llvm_mem_ty(ot->elem), old_e);
+                            }
                             cg_emit("store %s %s, ptr %s", llvm_mem_ty(ot->elem), cg_reg_to_mem(vv, ot->elem), slot);
                         } else {
                             cg_emit("call void @_%s_%s(ptr %s, i64 %s, %s %s)", ot->mangled,
                                     tgt->index.index->is_nonneg ? "set_nn" : "set", ov, iv, llvm_mem_ty(ot->elem), cg_reg_to_mem(vv, ot->elem));
                         }
                     } else if (ot->kind == TY_DICT) {
-                        const char* kv = cg_coerce(cg_expr(tgt->index.index, ot->key), tgt->index.index->ty, ot->key);
-                        const char* vv = cg_coerce(cg_expr(s->assign.value, ot->val), s->assign.value->ty, ot->val);
+                        const char* raw_kv = cg_expr(tgt->index.index, ot->key);
+                        cg_consume_expr(tgt->index.index, raw_kv);
+                        const char* raw_vv = cg_expr(s->assign.value, ot->val);
+                        cg_consume_expr(s->assign.value, raw_vv);
+                        const char* kv = cg_coerce(raw_kv, tgt->index.index->ty, ot->key);
+                        const char* vv = cg_coerce(raw_vv, s->assign.value->ty, ot->val);
                         cg_emit("call void @_%s_set(ptr %s, %s %s, %s %s)", ot->mangled, ov,
                                 llvm_mem_ty(ot->key), cg_reg_to_mem(kv, ot->key),
                                 llvm_mem_ty(ot->val), cg_reg_to_mem(vv, ot->val));
@@ -10018,13 +12277,27 @@ static void cg_stmts(Stmt** stmts, int count) {
             }
             case STMT_MULTI_ASSIGN: {
                 const char* tv = cg_expr(s->multi_assign.value, NULL);
+                bool owned_src = s->multi_assign.value->is_move || expr_produces_fresh_temp(s->multi_assign.value);
+                if (owned_src) cg_consume_expr(s->multi_assign.value, tv);
                 Type* tt = s->multi_assign.value->ty;
                 for (int k = 0; k < s->multi_assign.target_count; k++) {
                     Type* vt = NULL;
                     const char* vp = cg_var_ptr(s->multi_assign.targets[k]->var.name, &vt);
+                    VarSym* vs = cg_find_var_sym(s->multi_assign.targets[k]->var.name);
+                    if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
                     const char* fm = cg_reg();
                     cg_emit("%s = extractvalue %s %s, %d", fm, llvm_reg_ty(tt), tv, k);
+                    if (!owned_src && type_is_owned(vt) && !g_cg.cur_fn) {
+                        emit_clone_for_type(vt);
+                        const char* fc = cg_reg();
+                        cg_emit("%s = call %s @_clone_%s(%s %s)", fc, llvm_mem_ty(vt), vt->mangled, llvm_mem_ty(vt), fm);
+                        fm = fc;
+                    }
                     cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), fm, vp);
+                    if (vs && vs->drop_flag_llvm) {
+                        bool take = owned_src || !g_cg.cur_fn;
+                        cg_emit("store i1 %s, ptr %s", take ? "true" : "false", vs->drop_flag_llvm);
+                    }
                 }
                 break;
             }
@@ -10037,6 +12310,7 @@ static void cg_stmts(Stmt** stmts, int count) {
                 if (tgt->kind == EXPR_VAR) {
                     Type* vt = NULL;
                     const char* vp = cg_var_ptr(tgt->var.name, &vt);
+                    VarSym* vs = cg_find_var_sym(tgt->var.name);
                     const char* cur = cg_mem_to_reg(({ const char* r = cg_reg(); cg_emit("%s = load %s, ptr %s", r, llvm_mem_ty(vt), vp); r; }), vt);
                     const char* rv = cg_expr(s->aug_assign.value, vt);
                     if (vt->kind == TY_SET) {
@@ -10045,7 +12319,9 @@ static void cg_stmts(Stmt** stmts, int count) {
                         cg_emit("call void @_%s_%s(ptr %s, ptr %s)", vt->mangled, fnm, cur, rv);
                     } else {
                         const char* res = cg_binop_values(bop, cur, vt, rv, s->aug_assign.value->ty, vt);
+                        if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
                         cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(cg_coerce(res, vt, vt), vt), vp);
+                        if (vs && vs->drop_flag_llvm) cg_emit("store i1 true, ptr %s", vs->drop_flag_llvm);
                     }
                 } else if (tgt->kind == EXPR_INDEX) {
                     const char* ov = cg_expr(tgt->index.obj, NULL);
@@ -10061,7 +12337,9 @@ static void cg_stmts(Stmt** stmts, int count) {
             case STMT_IF: {
                 const char* l_end = cg_lbl("if_end");
                 for (int b = 0; b < s->if_s.branch_count; b++) {
+                    int cm = g_cg.temp_count;
                     const char* cv = cg_truthy(cg_expr(s->if_s.conds[b], g_ty_bool), s->if_s.conds[b]->ty);
+                    cg_flush_temps(cm);
                     const char* l_t = cg_lbl("if_then");
                     const char* l_f = (b + 1 < s->if_s.branch_count || s->if_s.else_count > 0) ? cg_lbl("if_next") : l_end;
                     cg_cond_br(cv, l_t, l_f);
@@ -10084,10 +12362,12 @@ static void cg_stmts(Stmt** stmts, int count) {
                 const char* l_end = cg_lbl("wh_end");
                 cg_br(l_cond);
                 cg_label(l_cond);
+                int cm = g_cg.temp_count;
                 const char* cv = cg_truthy(cg_expr(s->while_s.cond, g_ty_bool), s->while_s.cond->ty);
+                cg_flush_temps(cm);
                 cg_cond_br(cv, l_body, l_else ? l_else : l_end);
                 cg_label(l_body);
-                g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){l_end, l_cond, NULL, NULL};
+                g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){l_end, l_cond, NULL, NULL, g_cg.temp_count};
                 cg_stmts(s->while_s.body, s->while_s.body_count);
                 g_cg.loop_depth--;
                 cg_br(l_cond);
@@ -10252,59 +12532,43 @@ static void cg_stmts(Stmt** stmts, int count) {
                 break;
             }
             case STMT_RAISE: {
-                if (!s->raise_s.exc) {
-                    cg_emit("call void @stricta_reraise()");
-                    cg_emit("unreachable");
-                    g_cg.block_terminated = true;
-                    break;
+                if (s->raise_s.exc) {
+                    const char* raw_ev = cg_expr(s->raise_s.exc, NULL);
+                    cg_consume_expr(s->raise_s.exc, raw_ev);
+                    Type* et = s->raise_s.exc->ty;
+                    if (et->kind == TY_CLASS) {
+                        cg_emit("call void @stricta_set_exc(i32 %d, ptr %s, ptr null)", et->cls->type_id, raw_ev);
+                    } else {
+                        const char* es = cg_to_str(raw_ev, et);
+                        const char* sp = cg_reg(); const char* cp = cg_reg();
+                        cg_emit("%s = getelementptr %%StrictaStr, ptr %s, i32 0, i32 2", sp, es);
+                        cg_emit("%s = load ptr, ptr %s", cp, sp);
+                        cg_emit("call void @stricta_set_exc(i32 1, ptr null, ptr %s)", cp);
+                    }
                 }
-                const char* ev = cg_expr(s->raise_s.exc, NULL);
-                Type* et = s->raise_s.exc->ty;
-                if (et->kind == TY_CLASS) {
-                    cg_emit("call void @stricta_raise(i32 %d, ptr %s, ptr null)", et->cls->type_id, ev);
-                } else {
-                    const char* es = cg_to_str(ev, et);
-                    const char* sp = cg_reg(); const char* cp = cg_reg();
-                    cg_emit("%s = getelementptr %%StrictaStr, ptr %s, i32 0, i32 2", sp, es);
-                    cg_emit("%s = load ptr, ptr %s", cp, sp);
-                    cg_emit("call void @stricta_raise(i32 1, ptr null, ptr %s)", cp);
-                }
-                cg_emit("unreachable");
-                g_cg.block_terminated = true;
+                cg_raise_branch();
                 break;
             }
             case STMT_TRY: {
-                const char* jbuf = cg_reg(); const char* sj = cg_reg(); const char* is_ok = cg_reg();
-                const char* l_try = cg_lbl("try_b"); const char* l_catch = cg_lbl("try_c");
-                const char* l_else = s->try_s.else_count > 0 ? cg_lbl("try_e") : NULL;
-                const char* l_fin = s->try_s.finally_count > 0 ? cg_lbl("try_f") : NULL;
+                const char* l_catch = (s->try_s.handler_count > 0) ? cg_lbl("try_c") : NULL;
+                const char* l_fin_ok = (s->try_s.finally_count > 0) ? cg_lbl("try_fok") : NULL;
+                const char* l_fin_exc = (s->try_s.finally_count > 0) ? cg_lbl("try_fex") : NULL;
                 const char* l_end = cg_lbl("try_end");
-                cg_emit("%s = call ptr @stricta_try_push()", jbuf);
-                cg_emit("%s = call i32 @setjmp(ptr %s) returns_twice", sj, jbuf);
-                cg_emit("%s = icmp eq i32 %s, 0", is_ok, sj);
-                cg_cond_br(is_ok, l_try, l_catch);
+                const char* prev_unwind = g_cg.cur_unwind_lbl;
+                const char* post_try_target = l_fin_ok ? l_fin_ok : l_end;
+                const char* post_exc_unwind = l_fin_exc ? l_fin_exc : prev_unwind;
 
-                cg_label(l_try);
+                g_cg.cur_unwind_lbl = l_catch ? l_catch : post_exc_unwind;
                 cg_stmts(s->try_s.try_body, s->try_s.try_count);
-                cg_emit("call void @stricta_try_pop()");
-                cg_br(l_else ? l_else : (l_fin ? l_fin : l_end));
-
-                if (l_else) {
-                    cg_label(l_else);
+                if (!g_cg.block_terminated && s->try_s.else_count > 0) {
+                    g_cg.cur_unwind_lbl = post_exc_unwind;
                     cg_stmts(s->try_s.else_body, s->try_s.else_count);
-                    cg_br(l_fin ? l_fin : l_end);
                 }
+                cg_br(post_try_target);
 
-                cg_label(l_catch);
-                cg_emit("call void @stricta_try_pop()");
-                if (s->try_s.handler_count == 0) {
-                    if (l_fin) {
-                        cg_stmts(s->try_s.finally_body, s->try_s.finally_count);
-                    }
-                    cg_emit("call void @stricta_reraise()");
-                    cg_emit("unreachable");
-                    g_cg.block_terminated = true;
-                } else {
+                if (l_catch) {
+                    cg_label(l_catch);
+                    g_cg.cur_unwind_lbl = post_exc_unwind;
                     const char* tid = cg_reg();
                     cg_emit("%s = call i32 @stricta_exc_type_id()", tid);
                     for (int h = 0; h < s->try_s.handler_count; h++) {
@@ -10326,26 +12590,49 @@ static void cg_stmts(Stmt** stmts, int count) {
                         cg_label(l_h);
                         if (eh->as_name) {
                             Type* vt = NULL; const char* vp = cg_var_ptr(eh->as_name, &vt);
+                            VarSym* vs = cg_find_var_sym(eh->as_name);
+                            if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
                             const char* ev = cg_reg();
                             if (vt->kind == TY_CLASS) cg_emit("%s = call ptr @stricta_exc_obj()", ev);
                             else cg_emit("%s = call ptr @stricta_exc_msg()", ev);
                             cg_emit("store ptr %s, ptr %s", ev, vp);
+                            if (vs && vs->drop_flag_llvm) cg_emit("store i1 false, ptr %s", vs->drop_flag_llvm);
                         }
                         cg_stmts(eh->body, eh->body_count);
-                        cg_br(l_fin ? l_fin : l_end);
+                        if (!g_cg.block_terminated) {
+                            ClassInfo* eci = eh->exc_type ? find_class_in_mod(g_cg.cur_mod, eh->exc_type) : NULL;
+                            if (eci && type_is_owned(eci->type)) {
+                                emit_drop_for_type(eci->type);
+                                const char* eobj = cg_reg();
+                                cg_emit("%s = call ptr @stricta_exc_obj()", eobj);
+                                cg_emit("call void @_drop_%s(ptr %s)", eci->type->mangled, eobj);
+                                cg_emit("call void @stricta_clear_exc(i32 0)");
+                            } else {
+                                cg_emit("call void @stricta_clear_exc(i32 1)");
+                            }
+                        }
+                        cg_br(post_try_target);
                         cg_label(l_nxt);
+                        if (!eh->exc_type) break;
                     }
-                    if (l_fin) cg_stmts(s->try_s.finally_body, s->try_s.finally_count);
-                    cg_emit("call void @stricta_reraise()");
-                    cg_emit("unreachable");
-                    g_cg.block_terminated = true;
+                    g_cg.cur_unwind_lbl = post_exc_unwind;
+                    cg_raise_branch();
                 }
-                if (l_fin) {
-                    cg_label(l_fin);
+
+                if (l_fin_ok) {
+                    cg_label(l_fin_ok);
+                    g_cg.cur_unwind_lbl = prev_unwind;
                     cg_stmts(s->try_s.finally_body, s->try_s.finally_count);
                     cg_br(l_end);
                 }
+                if (l_fin_exc) {
+                    cg_label(l_fin_exc);
+                    g_cg.cur_unwind_lbl = prev_unwind;
+                    cg_stmts(s->try_s.finally_body, s->try_s.finally_count);
+                    cg_raise_branch();
+                }
                 cg_label(l_end);
+                g_cg.cur_unwind_lbl = prev_unwind;
                 break;
             }
             case STMT_WITH: {
@@ -10354,67 +12641,80 @@ static void cg_stmts(Stmt** stmts, int count) {
                 const char* bound = cv;
                 if (ct->kind == TY_CLASS) {
                     FuncInfo* ent = find_method_in_class(ct->cls, "__enter__");
-                    bound = cg_reg();
-                    cg_emit("%s = call %s %s(%s %s)", bound, llvm_reg_ty(ent->ret_type), ent->llvm_name, llvm_reg_ty(ct), cv);
+                    StrBuf eca; sb_init(&eca);
+                    sb_printf(&eca, "%s %s", llvm_reg_ty(ct), cv);
+                    bound = cg_emit_call_check(ent, ent->llvm_name, eca.data);
+                    free(eca.data);
                     if (s->with_s.as_name) {
                         Type* vt = NULL; const char* vp = cg_var_ptr(s->with_s.as_name, &vt);
+                        VarSym* vs = cg_find_var_sym(s->with_s.as_name);
+                        if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
                         cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(bound, vt), vp);
+                        if (vs && vs->drop_flag_llvm) cg_emit("store i1 false, ptr %s", vs->drop_flag_llvm);
                     }
                 } else if (ct->kind == TY_FILE && s->with_s.as_name) {
                     Type* vt = NULL; const char* vp = cg_var_ptr(s->with_s.as_name, &vt);
+                    VarSym* vs = cg_find_var_sym(s->with_s.as_name);
+                    if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
                     cg_emit("store ptr %s, ptr %s", bound, vp);
+                    if (vs && vs->drop_flag_llvm) cg_emit("store i1 false, ptr %s", vs->drop_flag_llvm);
                 }
-                const char* jbuf = cg_reg(); const char* sj = cg_reg(); const char* ok = cg_reg();
-                const char* l_ok = cg_lbl("w_ok"); const char* l_ex = cg_lbl("w_ex"); const char* l_end = cg_lbl("w_end");
-                cg_emit("%s = call ptr @stricta_try_push()", jbuf);
-                cg_emit("%s = call i32 @setjmp(ptr %s) returns_twice", sj, jbuf);
-                cg_emit("%s = icmp eq i32 %s, 0", ok, sj);
-                cg_cond_br(ok, l_ok, l_ex);
-                cg_label(l_ok);
+                const char* l_ex = cg_lbl("w_ex");
+                const char* l_end = cg_lbl("w_end");
+                const char* prev_unwind = g_cg.cur_unwind_lbl;
+                g_cg.cur_unwind_lbl = l_ex;
                 cg_stmts(s->with_s.body, s->with_s.body_count);
-                cg_emit("call void @stricta_try_pop()");
-                if (ct->kind == TY_FILE) {
-                    cg_emit("call void @stricta_file_close(ptr %s)", cv);
-                } else if (ct->kind == TY_CLASS) {
-                    FuncInfo* ex = find_method_in_class(ct->cls, "__exit__");
-                    if (ex) {
-                        const char* zr = cg_reg();
-                        cg_emit("%s = call i1 %s(%s %s, %s %s, %s %s, %s %s)", zr, ex->llvm_name,
-                                llvm_reg_ty(ct), cv,
-                                llvm_reg_ty(ex->param_types[1]), llvm_zero(ex->param_types[1]),
-                                llvm_reg_ty(ex->param_types[2]), llvm_zero(ex->param_types[2]),
-                                llvm_reg_ty(ex->param_types[3]), llvm_zero(ex->param_types[3]));
+                g_cg.cur_unwind_lbl = prev_unwind;
+                if (!g_cg.block_terminated) {
+                    if (ct->kind == TY_FILE) {
+                        cg_emit("call void @stricta_file_close(ptr %s)", cv);
+                    } else if (ct->kind == TY_CLASS) {
+                        FuncInfo* ex = find_method_in_class(ct->cls, "__exit__");
+                        if (ex) {
+                            StrBuf exa; sb_init(&exa);
+                            sb_printf(&exa, "%s %s, %s %s, %s %s, %s %s",
+                                      llvm_reg_ty(ct), cv,
+                                      llvm_reg_ty(ex->param_types[1]), llvm_zero(ex->param_types[1]),
+                                      llvm_reg_ty(ex->param_types[2]), llvm_zero(ex->param_types[2]),
+                                      llvm_reg_ty(ex->param_types[3]), llvm_zero(ex->param_types[3]));
+                            cg_emit_call_check(ex, ex->llvm_name, exa.data);
+                            free(exa.data);
+                        }
                     }
+                    cg_br(l_end);
                 }
-                cg_br(l_end);
                 cg_label(l_ex);
-                cg_emit("call void @stricta_try_pop()");
+                g_cg.cur_unwind_lbl = prev_unwind;
                 if (ct->kind == TY_FILE) {
                     cg_emit("call void @stricta_file_close(ptr %s)", cv);
-                    cg_emit("call void @stricta_reraise()");
-                    cg_emit("unreachable");
+                    cg_raise_branch();
                 } else if (ct->kind == TY_CLASS) {
                     FuncInfo* ex = find_method_in_class(ct->cls, "__exit__");
                     if (ex) {
-                        const char* sup = cg_reg();
-                        cg_emit("%s = call i1 %s(%s %s, %s %s, %s %s, %s %s)", sup, ex->llvm_name,
-                                llvm_reg_ty(ct), cv,
-                                llvm_reg_ty(ex->param_types[1]), llvm_zero(ex->param_types[1]),
-                                llvm_reg_ty(ex->param_types[2]), llvm_zero(ex->param_types[2]),
-                                llvm_reg_ty(ex->param_types[3]), llvm_zero(ex->param_types[3]));
+                        StrBuf exa; sb_init(&exa);
+                        sb_printf(&exa, "%s %s, %s %s, %s %s, %s %s",
+                                  llvm_reg_ty(ct), cv,
+                                  llvm_reg_ty(ex->param_types[1]), llvm_zero(ex->param_types[1]),
+                                  llvm_reg_ty(ex->param_types[2]), llvm_zero(ex->param_types[2]),
+                                  llvm_reg_ty(ex->param_types[3]), llvm_zero(ex->param_types[3]));
+                        const char* sup = cg_emit_call_check(ex, ex->llvm_name, exa.data);
+                        free(exa.data);
                         const char* l_rr = cg_lbl("w_rr");
                         cg_cond_br(sup, l_end, l_rr);
                         cg_label(l_rr);
                     }
-                    cg_emit("call void @stricta_reraise()");
-                    cg_emit("unreachable");
+                    cg_raise_branch();
                 }
                 cg_label(l_end);
+                g_cg.cur_unwind_lbl = prev_unwind;
                 break;
             }
             case STMT_DEL: {
                 Expr* dt = s->del_s.target;
-                if (dt->kind == EXPR_INDEX) {
+                if (dt->kind == EXPR_VAR) {
+                    VarSym* vs = cg_find_var_sym(dt->var.name);
+                    if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
+                } else if (dt->kind == EXPR_INDEX) {
                     const char* ov = cg_expr(dt->index.obj, NULL);
                     Type* ot = dt->index.obj->ty;
                     if (ot->kind == TY_LIST) {
@@ -10438,13 +12738,18 @@ static void cg_stmts(Stmt** stmts, int count) {
                     if (!mc->pattern) {
                         if (mc->capture) {
                             Type* vt = NULL; const char* vp = cg_var_ptr(mc->capture, &vt);
+                            VarSym* vs = cg_find_var_sym(mc->capture);
+                            if (vs && vs->drop_flag_llvm) cg_drop_var_if_alive(vs);
                             const char* cv = cg_coerce(sv, st, vt);
                             cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(cv, vt), vp);
+                            if (vs && vs->drop_flag_llvm) cg_emit("store i1 false, ptr %s", vs->drop_flag_llvm);
                         }
                         cg_br(l_b);
                     } else {
+                        int pm = g_cg.temp_count;
                         const char* pv = cg_expr(mc->pattern, st);
                         const char* eq = cg_binop_values("==", sv, st, pv, mc->pattern->ty, g_ty_bool);
+                        cg_flush_temps(pm);
                         cg_cond_br(eq, l_b, l_n);
                     }
                     cg_label(l_b);
@@ -10458,6 +12763,7 @@ static void cg_stmts(Stmt** stmts, int count) {
                 break;
             }
         }
+        cg_flush_temps(stm_mark);
     }
 }
 
@@ -10468,6 +12774,7 @@ static void emit_func_ir(FuncInfo* fn) {
     g_cg.block_terminated = false;
     g_cg.reg_id = 0;
     g_cg.fn_alloca_count = 0;
+    g_cg.temp_count = 0;
     g_cg.cur_entry.len = 0; g_cg.cur_entry.data[0] = '\0';
     g_cg.cur_body.len = 0; g_cg.cur_body.data[0] = '\0';
     g_cg.yield_list_reg = NULL;
@@ -10481,24 +12788,21 @@ static void emit_func_ir(FuncInfo* fn) {
     for (int i = 0; i < fn->param_count; i++) {
         if (arg_idx > 0 || i > 0) sb_append(&sig, ", ");
         sb_printf(&sig, "%s %%arg_%d", llvm_reg_ty(fn->param_types[i]), i);
-        VarSym* lv = find_local_in_fn(fn, fn->param_names[i]);
-        if (lv) {
-            cg_ensure_local_alloca(lv->llvm_name, lv->type);
-            cg_entry("store %s %s, ptr %s", llvm_mem_ty(lv->type),
-                     (lv->type->kind == TY_BOOL) ? arena_sprintf("%%bext_%d", i) : arena_sprintf("%%arg_%d", i),
-                     lv->llvm_name);
-            if (lv->type->kind == TY_BOOL) {
-                /* emit zext before store in entry */
-                StrBuf tmp; sb_init(&tmp);
-                sb_printf(&tmp, "  %%bext_%d = zext i1 %%arg_%d to i8\n", i, i);
-                /* prepend to cur_entry? Better: emit zext in body or rebuild entry */
-                free(tmp.data);
-            }
+    }
+    g_cg.fn_unwind_lbl = fn->can_raise ? cg_lbl("fn_unwind") : NULL;
+    g_cg.cur_unwind_lbl = g_cg.fn_unwind_lbl;
+    for (int i = 0; i < fn->local_count; i++) {
+        VarSym* lv = &fn->locals[i];
+        cg_ensure_local_alloca(lv->llvm_name, lv->type);
+        lv->is_stack_owned = false;
+        if (type_is_owned(lv->type)) {
+            lv->drop_flag_llvm = arena_sprintf("%s_alive", lv->llvm_name);
+            cg_entry("%s = alloca i1", lv->drop_flag_llvm);
+            cg_entry("store i1 false, ptr %s", lv->drop_flag_llvm);
+        } else {
+            lv->drop_flag_llvm = NULL;
         }
     }
-    /* Cleanly rebuild entry parameter stores so bool zext precedes store */
-    g_cg.cur_entry.len = 0; g_cg.cur_entry.data[0] = '\0';
-    g_cg.fn_alloca_count = 0;
     for (int i = 0; i < fn->param_count; i++) {
         VarSym* lv = find_local_in_fn(fn, fn->param_names[i]);
         if (lv) {
@@ -10509,6 +12813,9 @@ static void emit_func_ir(FuncInfo* fn) {
             } else {
                 cg_entry("store %s %%arg_%d, ptr %s", llvm_mem_ty(lv->type), i, lv->llvm_name);
             }
+            if (lv->drop_flag_llvm && fn->param_modes && fn->param_modes[i] == PM_MOVE) {
+                cg_entry("store i1 true, ptr %s", lv->drop_flag_llvm);
+            }
         }
     }
 
@@ -10518,36 +12825,305 @@ static void emit_func_ir(FuncInfo* fn) {
     }
 
     if (fn->is_lambda) {
-        const char* rv = cg_coerce(cg_expr(fn->lambda_ast->lambda.body, fn->ret_type), fn->lambda_ast->lambda.body->ty, fn->ret_type);
-        if (fn->ret_type->kind == TY_VOID) cg_emit("ret void");
-        else cg_emit("ret %s %s", llvm_reg_ty(fn->ret_type), rv);
+        Expr* lb = fn->lambda_ast->lambda.body;
+        const char* raw_rv = cg_expr(lb, fn->ret_type);
+        cg_consume_expr(lb, raw_rv);
+        const char* rv = cg_coerce(raw_rv, lb->ty, fn->ret_type);
+        cg_flush_temps_preserve(0);
+        cg_drop_all_fn_locals(fn);
+        if (fn->can_raise) {
+            if (fn->ret_type->kind == TY_VOID) cg_emit("ret i1 false");
+            else {
+                const char* rty = llvm_fn_ret_ty(fn);
+                const char* pkt = cg_reg();
+                cg_emit("%s = insertvalue %s { i1 false, %s undef }, %s %s, 1",
+                        pkt, rty, llvm_reg_ty(fn->ret_type), llvm_reg_ty(fn->ret_type), rv);
+                cg_emit("ret %s %s", rty, pkt);
+            }
+        } else {
+            if (fn->ret_type->kind == TY_VOID) cg_emit("ret void");
+            else cg_emit("ret %s %s", llvm_reg_ty(fn->ret_type), rv);
+        }
         g_cg.block_terminated = true;
     } else if (fn->ast) {
         cg_stmts(fn->ast->def_s.body, fn->ast->def_s.body_count);
     }
 
     if (!g_cg.block_terminated) {
-        if (fn->is_generator) cg_emit("ret ptr %s", g_cg.yield_list_reg);
-        else if (fn->ret_type->kind == TY_VOID) cg_emit("ret void");
-        else cg_emit("ret %s %s", llvm_reg_ty(fn->ret_type), llvm_zero(fn->ret_type));
+        cg_flush_temps(0);
+        cg_drop_all_fn_locals(fn);
+        if (fn->can_raise) {
+            if (fn->is_generator) {
+                const char* rty = llvm_fn_ret_ty(fn);
+                const char* pkt = cg_reg();
+                cg_emit("%s = insertvalue %s { i1 false, ptr undef }, ptr %s, 1", pkt, rty, g_cg.yield_list_reg);
+                cg_emit("ret %s %s", rty, pkt);
+            } else if (fn->ret_type->kind == TY_VOID) {
+                cg_emit("ret i1 false");
+            } else {
+                const char* rty = llvm_fn_ret_ty(fn);
+                const char* pkt = cg_reg();
+                cg_emit("%s = insertvalue %s { i1 false, %s undef }, %s %s, 1",
+                        pkt, rty, llvm_reg_ty(fn->ret_type), llvm_reg_ty(fn->ret_type), llvm_zero(fn->ret_type));
+                cg_emit("ret %s %s", rty, pkt);
+            }
+        } else {
+            if (fn->is_generator) cg_emit("ret ptr %s", g_cg.yield_list_reg);
+            else if (fn->ret_type->kind == TY_VOID) cg_emit("ret void");
+            else cg_emit("ret %s %s", llvm_reg_ty(fn->ret_type), llvm_zero(fn->ret_type));
+        }
     }
 
-    sb_printf(&g_cg.funcs, "define %s %s(%s) {\nentry:\n", llvm_reg_ty(fn->ret_type), fn->llvm_name, sig.data);
+    if (fn->can_raise && g_cg.fn_unwind_lbl) {
+        cg_label(g_cg.fn_unwind_lbl);
+        cg_drop_all_fn_locals(fn);
+        if (fn->ret_type->kind == TY_VOID) {
+            cg_emit("ret i1 true");
+        } else {
+            cg_emit("ret %s { i1 true, %s %s }", llvm_fn_ret_ty(fn), llvm_reg_ty(fn->ret_type), llvm_zero(fn->ret_type));
+        }
+    }
+
+    sb_printf(&g_cg.funcs, "define %s %s(%s) {\nentry:\n", llvm_fn_ret_ty(fn), fn->llvm_name, sig.data);
     sb_append_n(&g_cg.funcs, g_cg.cur_entry.data, g_cg.cur_entry.len);
     sb_append_n(&g_cg.funcs, g_cg.cur_body.data, g_cg.cur_body.len);
     sb_append(&g_cg.funcs, "}\n\n");
     free(sig.data);
+    g_cg.fn_unwind_lbl = NULL;
+    g_cg.cur_unwind_lbl = NULL;
     g_cg.in_func = false;
     g_cg.cur_fn = NULL;
 }
 
+static bool expr_can_raise(FuncInfo* cur_fn, Expr* e, bool in_catch_all) {
+    if (!e) return false;
+    switch (e->kind) {
+        case EXPR_FSTRING:
+            for (int i = 0; i < e->fstr.count; i++) {
+                if (e->fstr.parts[i].is_expr && expr_can_raise(cur_fn, e->fstr.parts[i].expr, in_catch_all)) return true;
+            }
+            return false;
+        case EXPR_BINOP:
+            return expr_can_raise(cur_fn, e->binop.left, in_catch_all) ||
+                   expr_can_raise(cur_fn, e->binop.right, in_catch_all);
+        case EXPR_UNOP:
+            return expr_can_raise(cur_fn, e->unop.operand, in_catch_all);
+        case EXPR_TERNARY:
+            return expr_can_raise(cur_fn, e->ternary.cond, in_catch_all) ||
+                   expr_can_raise(cur_fn, e->ternary.then_e, in_catch_all) ||
+                   expr_can_raise(cur_fn, e->ternary.else_e, in_catch_all);
+        case EXPR_WALRUS:
+            return expr_can_raise(cur_fn, e->walrus.val, in_catch_all);
+        case EXPR_INDEX:
+            return expr_can_raise(cur_fn, e->index.obj, in_catch_all) ||
+                   expr_can_raise(cur_fn, e->index.index, in_catch_all);
+        case EXPR_SLICE:
+            return expr_can_raise(cur_fn, e->slice.obj, in_catch_all) ||
+                   expr_can_raise(cur_fn, e->slice.start, in_catch_all) ||
+                   expr_can_raise(cur_fn, e->slice.stop, in_catch_all);
+        case EXPR_ATTR:
+            if (e->attr.obj->ty && e->attr.obj->ty->kind == TY_CLASS) {
+                FuncInfo* prop = find_method_in_class(e->attr.obj->ty->cls, e->attr.attr);
+                if (prop && prop->is_property && prop->can_raise && !in_catch_all) return true;
+            }
+            return expr_can_raise(cur_fn, e->attr.obj, in_catch_all);
+        case EXPR_LIST:
+        case EXPR_TUPLE:
+        case EXPR_SET:
+            for (int i = 0; i < e->seq.count; i++) {
+                if (expr_can_raise(cur_fn, e->seq.items[i], in_catch_all)) return true;
+            }
+            return false;
+        case EXPR_DICT:
+            for (int i = 0; i < e->dict.count; i++) {
+                if (expr_can_raise(cur_fn, e->dict.keys[i], in_catch_all) ||
+                    expr_can_raise(cur_fn, e->dict.vals[i], in_catch_all)) return true;
+            }
+            return false;
+        case EXPR_LISTCOMP:
+        case EXPR_SETCOMP:
+        case EXPR_DICTCOMP:
+        case EXPR_GENEXPR:
+            if (expr_can_raise(cur_fn, e->comp.elt, in_catch_all) ||
+                expr_can_raise(cur_fn, e->comp.val, in_catch_all)) return true;
+            for (int i = 0; i < e->comp.gen_count; i++) {
+                if (expr_can_raise(cur_fn, e->comp.gens[i].iter, in_catch_all)) return true;
+                for (int f = 0; f < e->comp.gens[i].if_count; f++) {
+                    if (expr_can_raise(cur_fn, e->comp.gens[i].ifs[f], in_catch_all)) return true;
+                }
+            }
+            return false;
+        case EXPR_CALL:
+            for (int i = 0; i < e->call.arg_count; i++) {
+                if (expr_can_raise(cur_fn, e->call.args[i], in_catch_all)) return true;
+            }
+            if (e->call.callee->kind == EXPR_ATTR) {
+                if (expr_can_raise(cur_fn, e->call.callee->attr.obj, in_catch_all)) return true;
+                Type* ot = e->call.callee->attr.obj->ty;
+                if (ot && ot->kind == TY_CLASS) {
+                    FuncInfo* m = e->call.resolved_fn ? e->call.resolved_fn : find_method_in_class(ot->cls, e->call.callee->attr.attr);
+                    if (m && m->can_raise && !in_catch_all) return true;
+                } else if (ot && ot->kind == TY_MODULE) {
+                    FuncInfo* mf = e->call.resolved_fn ? e->call.resolved_fn : find_func_in_mod(ot->mod, e->call.callee->attr.attr);
+                    if (mf && mf->can_raise && !in_catch_all) return true;
+                    ClassInfo* mci = find_class_in_mod(ot->mod, e->call.callee->attr.attr);
+                    if (mci && !in_catch_all) {
+                        if (mci->has_unimpl_abstract) return true;
+                        FuncInfo* inf = find_method_in_class(mci, "__init__");
+                        if (inf && inf->can_raise) return true;
+                    }
+                }
+                return false;
+            }
+            if (e->call.callee->kind == EXPR_VAR) {
+                const char* cname = e->call.callee->var.name;
+                if (strcmp(cname, "next") == 0 && e->call.arg_count == 1 && !in_catch_all) return true;
+                if (e->call.resolved_fn && e->call.resolved_fn->can_raise && !in_catch_all) return true;
+                ClassInfo* ci = cur_fn ? find_class_in_mod(cur_fn->mod, cname) : NULL;
+                if (ci && !in_catch_all) {
+                    if (ci->has_unimpl_abstract) return true;
+                    FuncInfo* inf = find_method_in_class(ci, "__init__");
+                    if (inf && inf->can_raise) return true;
+                }
+                FuncInfo* tf = cur_fn ? find_func_in_mod(cur_fn->mod, cname) : NULL;
+                if (tf && tf->can_raise && !in_catch_all) return true;
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+static bool stmts_can_raise(FuncInfo* cur_fn, Stmt** stmts, int count, bool in_catch_all) {
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        switch (s->kind) {
+            case STMT_RAISE:
+                if (!in_catch_all) return true;
+                break;
+            case STMT_RETURN:
+                if (expr_can_raise(cur_fn, s->ret.expr, in_catch_all)) return true;
+                break;
+            case STMT_EXPR:
+            case STMT_YIELD:
+            case STMT_YIELD_FROM:
+                if (expr_can_raise(cur_fn, s->expr_s.expr, in_catch_all)) return true;
+                break;
+            case STMT_ASSIGN:
+                if (expr_can_raise(cur_fn, s->assign.target, in_catch_all) ||
+                    expr_can_raise(cur_fn, s->assign.value, in_catch_all)) return true;
+                break;
+            case STMT_MULTI_ASSIGN:
+                if (expr_can_raise(cur_fn, s->multi_assign.value, in_catch_all)) return true;
+                break;
+            case STMT_AUG_ASSIGN:
+                if (expr_can_raise(cur_fn, s->aug_assign.target, in_catch_all) ||
+                    expr_can_raise(cur_fn, s->aug_assign.value, in_catch_all)) return true;
+                break;
+            case STMT_IF:
+                for (int b = 0; b < s->if_s.branch_count; b++) {
+                    if (expr_can_raise(cur_fn, s->if_s.conds[b], in_catch_all)) return true;
+                    if (stmts_can_raise(cur_fn, s->if_s.bodies[b], s->if_s.body_counts[b], in_catch_all)) return true;
+                }
+                if (stmts_can_raise(cur_fn, s->if_s.else_body, s->if_s.else_count, in_catch_all)) return true;
+                break;
+            case STMT_WHILE:
+                if (expr_can_raise(cur_fn, s->while_s.cond, in_catch_all) ||
+                    stmts_can_raise(cur_fn, s->while_s.body, s->while_s.body_count, in_catch_all) ||
+                    stmts_can_raise(cur_fn, s->while_s.else_body, s->while_s.else_count, in_catch_all)) return true;
+                break;
+            case STMT_FOR:
+                if (expr_can_raise(cur_fn, s->for_s.iter, in_catch_all) ||
+                    stmts_can_raise(cur_fn, s->for_s.body, s->for_s.body_count, in_catch_all) ||
+                    stmts_can_raise(cur_fn, s->for_s.else_body, s->for_s.else_count, in_catch_all)) return true;
+                break;
+            case STMT_TRY: {
+                bool has_bare = false;
+                for (int h = 0; h < s->try_s.handler_count; h++) {
+                    if (!s->try_s.handlers[h].exc_type) { has_bare = true; break; }
+                }
+                if (stmts_can_raise(cur_fn, s->try_s.try_body, s->try_s.try_count, in_catch_all || has_bare)) return true;
+                for (int h = 0; h < s->try_s.handler_count; h++) {
+                    if (stmts_can_raise(cur_fn, s->try_s.handlers[h].body, s->try_s.handlers[h].body_count, in_catch_all)) return true;
+                }
+                if (stmts_can_raise(cur_fn, s->try_s.else_body, s->try_s.else_count, in_catch_all)) return true;
+                if (stmts_can_raise(cur_fn, s->try_s.finally_body, s->try_s.finally_count, in_catch_all)) return true;
+                break;
+            }
+            case STMT_WITH:
+                if (expr_can_raise(cur_fn, s->with_s.ctx, in_catch_all) ||
+                    stmts_can_raise(cur_fn, s->with_s.body, s->with_s.body_count, in_catch_all)) return true;
+                break;
+            case STMT_ASSERT:
+                if (expr_can_raise(cur_fn, s->assert_s.cond, in_catch_all) ||
+                    expr_can_raise(cur_fn, s->assert_s.msg, in_catch_all)) return true;
+                break;
+            case STMT_DEL:
+                if (expr_can_raise(cur_fn, s->del_s.target, in_catch_all)) return true;
+                break;
+            case STMT_MATCH:
+                if (expr_can_raise(cur_fn, s->match_s.subject, in_catch_all)) return true;
+                for (int c = 0; c < s->match_s.case_count; c++) {
+                    if (expr_can_raise(cur_fn, s->match_s.cases[c].pattern, in_catch_all) ||
+                        stmts_can_raise(cur_fn, s->match_s.cases[c].body, s->match_s.cases[c].body_count, in_catch_all)) return true;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
+static void analyze_can_raise(void) {
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < g_all_func_count; i++) {
+            FuncInfo* fn = g_all_funcs[i];
+            if (fn->is_generic || fn->can_raise) continue;
+            bool cr = false;
+            if (fn->is_lambda && fn->lambda_ast) {
+                cr = expr_can_raise(fn, fn->lambda_ast->lambda.body, false);
+            } else if (fn->ast) {
+                cr = stmts_can_raise(fn, fn->ast->def_s.body, fn->ast->def_s.body_count, false);
+            }
+            if (cr) { fn->can_raise = true; changed = true; }
+        }
+        /* Propagate can_raise across vtable families so overrides share exact LLVM return ABI */
+        for (int c = 0; c < g_all_class_count; c++) {
+            ClassInfo* cls = g_all_classes[c];
+            for (int v = 0; v < cls->vtable_count; v++) {
+                FuncInfo* vm = cls->vtable[v].fn;
+                if (!vm) continue;
+                for (int m = 0; m < cls->mro_count; m++) {
+                    FuncInfo* am = find_method_in_class_exact(cls->mro[m], cls->vtable[v].name);
+                    if (am && am->can_raise != vm->can_raise) {
+                        am->can_raise = true;
+                        vm->can_raise = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
     cg_init();
+    analyze_can_raise();
 
     /* Header: external runtime declarations & core structs */
     sb_append(&g_cg.hdr, "; Stricta Static LLVM IR Compiler Output\n\n");
-    sb_append(&g_cg.hdr, "%StrictaStr = type { i32, i32, ptr }\n");
+    sb_append(&g_cg.hdr, "%StrictaStr = type { i32, i32, ptr, i32 }\n");
     sb_append(&g_cg.hdr, "%StrictaBytes = type { i32, i32, ptr }\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_str_free(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_clone(ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_bytes_free(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bytes_clone(ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_bigint_free(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_clone(ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_file_free(ptr)\n");
     sb_append(&g_cg.hdr, "@stricta_sys_argv = external global ptr\n");
     sb_append(&g_cg.hdr, "declare void @stricta_init_args(i32, ptr)\n");
     sb_append(&g_cg.hdr, "declare noalias ptr @malloc(i64)\n");
@@ -10558,15 +13134,14 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
     sb_append(&g_cg.hdr, "declare ptr @stricta_calloc(i64, i64)\n");
     sb_append(&g_cg.hdr, "declare ptr @stricta_realloc(ptr, i64)\n");
     sb_append(&g_cg.hdr, "declare void @stricta_free(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_try_push()\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_try_pop()\n");
-    sb_append(&g_cg.hdr, "declare i32 @setjmp(ptr) returns_twice\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_raise(i32, ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_reraise()\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_set_exc(i32, ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_clear_exc(i32)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_unhandled_exc()\n");
     sb_append(&g_cg.hdr, "declare i32 @stricta_exc_type_id()\n");
     sb_append(&g_cg.hdr, "declare ptr @stricta_exc_obj()\n");
     sb_append(&g_cg.hdr, "declare ptr @stricta_exc_msg()\n");
     sb_append(&g_cg.hdr, "declare void @stricta_assert_fail(ptr, ptr, i32)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_bounds_fail(i64, i64, ptr, i32)\n");
     sb_append(&g_cg.hdr, "declare ptr @stricta_str_concat(ptr, ptr)\n");
     sb_append(&g_cg.hdr, "declare ptr @stricta_str_repeat(ptr, i64)\n");
     sb_append(&g_cg.hdr, "declare ptr @stricta_str_slice(ptr, i64, i64)\n");
@@ -10689,6 +13264,10 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
             const char* expected = arena_sprintf("@%s%s", mod->prefix, gv->name);
             if (strcmp(gv->llvm_name, expected) != 0) continue;
             sb_printf(&globs, "%s = global %s %s\n", gv->llvm_name, llvm_mem_ty(gv->type), llvm_mem_zero(gv->type));
+            if (type_is_owned(gv->type)) {
+                gv->drop_flag_llvm = arena_sprintf("@_alive_%s%s", mod->prefix, gv->name);
+                sb_printf(&globs, "%s = global i1 false\n", gv->drop_flag_llvm);
+            }
         }
         for (int f = 0; f < mod->func_count; f++) {
             FuncInfo* fn = mod->funcs[f];
@@ -10715,6 +13294,7 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
         g_cg.block_terminated = false;
         g_cg.reg_id = 0;
         g_cg.fn_alloca_count = 0;
+        g_cg.temp_count = 0;
         g_cg.cur_entry.len = 0; g_cg.cur_entry.data[0] = '\0';
         g_cg.cur_body.len = 0; g_cg.cur_body.data[0] = '\0';
         for (int c = 0; c < mod->class_count; c++) {
@@ -10742,6 +13322,7 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
     g_cg.block_terminated = false;
     g_cg.reg_id = 0;
     g_cg.fn_alloca_count = 0;
+    g_cg.temp_count = 0;
     g_cg.cur_entry.len = 0; g_cg.cur_entry.data[0] = '\0';
     g_cg.cur_body.len = 0; g_cg.cur_body.data[0] = '\0';
     for (int m = 0; m < g_module_count; m++) {
@@ -10777,6 +13358,12 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
         }
     }
     cg_stmts(main_mod->stmts, main_mod->stmt_count);
+    for (int m = 0; m < g_module_count; m++) {
+        ModuleInfo* mod = g_modules[m];
+        for (int g = 0; g < mod->global_count; g++) {
+            cg_drop_var_if_alive(&mod->globals[g]);
+        }
+    }
     sb_append(&g_cg.funcs, "define void @stricta_main() {\nentry:\n");
     sb_append_n(&g_cg.funcs, g_cg.cur_entry.data, g_cg.cur_entry.len);
     sb_append_n(&g_cg.funcs, g_cg.cur_body.data, g_cg.cur_body.len);
@@ -10819,12 +13406,18 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
     /* Emit monomorphized functions (note: dict emits popitem/items which might add tuples/lists, so iterate while count grows!) */
     int li = 0, si = 0, di = 0;
     while (li < g_mono_lists.count || si < g_mono_sets.count || di < g_mono_dicts.count) {
+        int prev_oc = g_mono_opts.count;
         int prev_tc = g_mono_tuples.count;
         int prev_lc = g_mono_lists.count;
+        int prev_sc = g_mono_sets.count;
+        int prev_dc = g_mono_dicts.count;
         while (di < g_mono_dicts.count) emit_mono_dict(g_mono_dicts.items[di++]);
         while (si < g_mono_sets.count) emit_mono_set(g_mono_sets.items[si++]);
         while (li < g_mono_lists.count) emit_mono_list(g_mono_lists.items[li++]);
-        /* If dict added new tuples or lists, emit their struct definitions into hdr! */
+        for (int k = prev_oc; k < g_mono_opts.count; k++) {
+            Type* t = g_mono_opts.items[k];
+            sb_printf(&g_cg.hdr, "%%%s = type { i8, %s }\n", t->mangled, llvm_mem_ty(t->elem));
+        }
         for (int k = prev_tc; k < g_mono_tuples.count; k++) {
             Type* t = g_mono_tuples.items[k];
             sb_printf(&g_cg.hdr, "%%%s = type { ", t->mangled);
@@ -10838,6 +13431,14 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
         for (int k = prev_lc; k < g_mono_lists.count; k++) {
             Type* t = g_mono_lists.items[k];
             sb_printf(&g_cg.hdr, "%%%s = type { i32, i32, ptr }\n", t->mangled);
+        }
+        for (int k = prev_sc; k < g_mono_sets.count; k++) {
+            Type* t = g_mono_sets.items[k];
+            sb_printf(&g_cg.hdr, "%%%s = type { ptr, ptr, i32, i32, i32 }\n", t->mangled);
+        }
+        for (int k = prev_dc; k < g_mono_dicts.count; k++) {
+            Type* t = g_mono_dicts.items[k];
+            sb_printf(&g_cg.hdr, "%%%s = type { ptr, ptr, ptr, i32, i32, i32, i32 }\n", t->mangled);
         }
     }
 
@@ -10920,6 +13521,7 @@ int main(int argc, char** argv) {
     g_modules = (ModuleInfo**)realloc(g_modules, sizeof(ModuleInfo*) * (size_t)(g_module_count + 1));
     g_modules[g_module_count++] = main_mod;
     analyze_module(main_mod);
+    check_program_ownership();
 
     StrBuf ir;
     sb_init(&ir);
