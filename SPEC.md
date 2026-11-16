@@ -27,11 +27,12 @@ Stricta enforces strict static types on all bindings, parameters, fields, and co
 - `Callable[[ArgTypes...], RetType]`: Typed function pointer.
 
 ### 1.3 Strict Typing & Inference Rules
-- Function parameters (except `self`, `cls`, and parameters with a concrete default value like `def f(x = 0) -> int:`) require explicit type annotations: `def add(a: int, b: int) -> int:`. Parameters with default `None`, `[]`, `{}`, or `set()` still require an explicit annotation (`x: T | None = None`).
-- Functions without `-> RetType` default to `-> None`; returning a value from a `-> None` function is a compile-time error.
-- Local variables infer their static type deterministically from non-ambiguous initializers (`x = 10` → `int`, `v = Vec2D(1, 2)` → `Vec2D`), or use explicit annotations (`x: list[int] = []`, `root: BSTNode | None = None`).
-- Empty `[]`, `{}`, `set()`, and bare `None` without an explicit annotation or contextual target type are rejected at compile time with `file:line:col: error: ...`.
-- Flow-sensitive narrowing refines `T | None` to `T` after `if x is None: return/break/continue/raise` and inside `if x is not None:` / `else:` blocks.
+- Function parameters (except `self`, `cls`, and parameters with a concrete default value like `def f(x = 0)`) require explicit type annotations: `def add(a: int, b: int) -> int:`. Parameters with default `None`, `[]`, `{}`, or `set()` still require an explicit annotation (`x: T | None = None`).
+- Functions with an explicit `-> RetType` enforce it strictly; functions omitting `-> RetType` infer their static return type (`T`, `T | None`, `list[T]` for generators, or `None` when returning nothing) from their `return` / `yield` statements.
+- Local variables and module globals infer their static type deterministically from initializers (`x = 10` → `int`, `ORIGIN = Vec2D(0, 0)` → `Vec2D`), or from deferred first-use operations on empty containers (`items = []; items.append(1)` → `list[int]`, `counts = {}; counts["a"] = 1` → `dict[str, int]`, `seen = set(); seen.add("x")` → `set[str]`), or optional auto-promotion (`best = None; best = node` → `Node | None`).
+- Unpopulated empty `[]`, `{}`, `set()`, and bare `None` never promoted in scope are rejected at compile time with `file:line:col: error: ...`.
+- Flow-sensitive narrowing refines `T | None` to `T` via `is None` / `is not None`, and refines `Base` to `Sub` inside `if isinstance(x, Sub):` blocks.
+- Bidirectional inference propagates `Callable` and `map`/`filter`/`sorted(..., key=...)` parameter and return types into `lambda` expressions, while escape and range analysis stack-allocate non-escaping locals/classes and elide negative-index checks on non-negative loop indices.
 
 ---
 

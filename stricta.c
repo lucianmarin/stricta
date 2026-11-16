@@ -551,6 +551,7 @@ struct Expr {
     ExprKind kind;
     SrcLoc loc;
     Type* ty; /* resolved by sema */
+    bool is_nonneg;
     union {
         struct { const char* raw; int64_t ival; uint64_t uval; bool is_big; } int_lit;
         struct { double fval; } float_lit;
@@ -1327,6 +1328,43 @@ static Expr* parse_no_ternary(Parser* ps) {
     return parse_or(ps);
 }
 
+static int skip_lambda_type_ann(Parser* ps, int pos) {
+    if (pos >= ps->count || ps->toks[pos].kind != TOK_NAME) return -1;
+    pos++;
+    while (pos + 1 < ps->count && ps->toks[pos].kind == TOK_DOT && ps->toks[pos + 1].kind == TOK_NAME) {
+        pos += 2;
+    }
+    if (pos < ps->count && ps->toks[pos].kind == TOK_LBRACK) {
+        int d = 1; pos++;
+        while (pos < ps->count && d > 0) {
+            if (ps->toks[pos].kind == TOK_LBRACK) d++;
+            else if (ps->toks[pos].kind == TOK_RBRACK) d--;
+            pos++;
+        }
+        if (d != 0) return -1;
+    }
+    while (pos < ps->count && ps->toks[pos].kind == TOK_PIPE) {
+        pos = skip_lambda_type_ann(ps, pos + 1);
+        if (pos < 0) return -1;
+    }
+    return pos;
+}
+
+static bool lambda_colon_is_type_ann(Parser* ps) {
+    int pos = skip_lambda_type_ann(ps, ps->pos + 1);
+    if (pos < 0 || pos >= ps->count) return false;
+    while (pos < ps->count && ps->toks[pos].kind == TOK_COMMA) {
+        pos++;
+        if (pos >= ps->count || ps->toks[pos].kind != TOK_NAME) return false;
+        pos++;
+        if (pos < ps->count && ps->toks[pos].kind == TOK_COLON) {
+            pos = skip_lambda_type_ann(ps, pos + 1);
+            if (pos < 0) return false;
+        }
+    }
+    return pos < ps->count && (ps->toks[pos].kind == TOK_COLON || ps->toks[pos].kind == TOK_ARROW);
+}
+
 static Expr* parse_expr(Parser* ps) {
     if (p_check(ps, TOK_LAMBDA)) {
         Token* t = p_consume(ps, TOK_LAMBDA);
@@ -1335,7 +1373,10 @@ static Expr* parse_expr(Parser* ps) {
             do {
                 Token* id = p_consume(ps, TOK_NAME);
                 TypeExpr* pt = NULL;
-                if (p_match(ps, TOK_COLON)) pt = parse_type_expr(ps);
+                if (p_check(ps, TOK_COLON) && lambda_colon_is_type_ann(ps)) {
+                    p_consume(ps, TOK_COLON);
+                    pt = parse_type_expr(ps);
+                }
                 if (pcnt >= pcap) {
                     pcap = pcap ? pcap * 2 : 4;
                     pnames = (const char**)realloc(pnames, sizeof(char*) * (size_t)pcap);
@@ -1943,6 +1984,7 @@ typedef struct VarSym {
     bool is_nonlocal;
     bool is_captured;
     bool is_param;
+    bool is_nonneg;
     const char* llvm_name;
     SrcLoc loc;
 } VarSym;
@@ -1961,6 +2003,11 @@ struct FuncInfo {
     Expr** param_defaults;
     int param_count;
     Type* ret_type;
+    bool infer_ret;
+    bool checking_body;
+    bool body_checked;
+    Type* inferred_ret_type;
+    bool saw_void_return;
     bool is_method;
     bool is_static;
     bool is_classmethod;
@@ -2556,6 +2603,42 @@ static bool stmt_has_yield(Stmt** body, int count) {
 
 static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint);
 static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count);
+static void check_func_body(ModuleInfo* mod, FuncInfo* fn);
+static VarSym* resolve_var(ModuleInfo* mod, FuncInfo* fn, const char* name, FuncInfo** out_owner_fn);
+
+static bool expr_is_nonneg(ModuleInfo* mod, FuncInfo* fn, Expr* e) {
+    if (!e) return false;
+    if (e->ty && type_is_unsigned_int(e->ty)) return true;
+    switch (e->kind) {
+        case EXPR_INT:
+            return !e->int_lit.is_big && e->int_lit.ival >= 0;
+        case EXPR_VAR: {
+            VarSym* v = resolve_var(mod, fn, e->var.name, NULL);
+            return v && v->is_nonneg;
+        }
+        case EXPR_CALL:
+            return e->call.callee->kind == EXPR_VAR && strcmp(e->call.callee->var.name, "len") == 0;
+        case EXPR_BINOP:
+            if (strcmp(e->binop.op, "+") == 0 || strcmp(e->binop.op, "*") == 0 || strcmp(e->binop.op, "//") == 0) {
+                return expr_is_nonneg(mod, fn, e->binop.left) && expr_is_nonneg(mod, fn, e->binop.right);
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+static Type* ensure_func_ret_type(FuncInfo* callee, SrcLoc loc) {
+    if (!callee) return g_ty_void;
+    if (callee->infer_ret && !callee->body_checked) {
+        if (callee->checking_body) {
+            if (callee->inferred_ret_type) return callee->inferred_ret_type;
+            error_at(loc, "cannot infer return type of recursive function '%s' before a return statement; add '-> ReturnType'", callee->name);
+        }
+        check_func_body(callee->mod, callee);
+    }
+    return callee->ret_type;
+}
 
 static VarSym* resolve_var(ModuleInfo* mod, FuncInfo* fn, const char* name, FuncInfo** out_owner_fn) {
     if (out_owner_fn) *out_owner_fn = NULL;
@@ -2681,6 +2764,14 @@ static void check_comp_gens(ModuleInfo* mod, FuncInfo* fn, CompGen* gens, int ge
             cg->iter->ty = make_list_type(g_ty_i64);
             if (cg->target_count != 1) error_at(cg->iter->loc, "expected 1 loop target for range()");
             bind_var(mod, fn, cg->targets[0], g_ty_i64, cg->iter->loc);
+            VarSym* lv = resolve_var(mod, fn, cg->targets[0], NULL);
+            if (lv) {
+                int ac = cg->iter->call.arg_count;
+                bool nn = (ac == 1) ||
+                          (expr_is_nonneg(mod, fn, cg->iter->call.args[0]) &&
+                           (ac == 2 || expr_is_nonneg(mod, fn, cg->iter->call.args[2])));
+                lv->is_nonneg = nn;
+            }
         } else {
             Type* it_ty = check_expr(mod, fn, cg->iter, NULL);
             if (cg->target_count == 1) {
@@ -2914,7 +3005,7 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
                              i + 1, mname, type_str(target_m->param_types[i + 1]), type_str(at));
                 }
             }
-            return target_m->ret_type;
+            return ensure_func_ret_type(target_m, call->loc);
         }
 
         FuncInfo* m = find_method_in_class(cls, mname);
@@ -2937,7 +3028,7 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
                          i + 1, cls->name, mname, type_str(pt), type_str(at));
             }
         }
-        return m->ret_type;
+        return ensure_func_ret_type(m, call->loc);
     }
 
     if (obj_ty->kind == TY_MODULE) {
@@ -2949,7 +3040,7 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
                 Type* at = check_expr(mod, fn, args[i], mf->param_types[i]);
                 if (!type_assignable(mf->param_types[i], at)) error_at(args[i]->loc, "argument type mismatch");
             }
-            return mf->ret_type;
+            return ensure_func_ret_type(mf, call->loc);
         }
         ClassInfo* mci = find_class_in_mod(mmod, mname);
         if (mci) {
@@ -3026,7 +3117,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
             ClassInfo* ci = find_class_in_mod(mod, n);
             if (ci) { res = ci->type; break; }
             FuncInfo* fi = find_func_in_mod(mod, n);
-            if (fi) { res = fi->type; break; }
+            if (fi) { ensure_func_ret_type(fi, e->loc); res = fi->type; break; }
             if (is_builtin_fn_name(n)) { res = g_ty_void; break; }
             error_at(e->loc, "undefined identifier '%s'", n);
             break;
@@ -3269,6 +3360,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
             if (ot->kind == TY_LIST) {
                 Type* it = check_expr(mod, fn, e->index.index, g_ty_i64);
                 if (!type_is_int(it)) error_at(e->index.index->loc, "list index must be int");
+                e->index.index->is_nonneg = expr_is_nonneg(mod, fn, e->index.index);
                 res = ot->elem;
             } else if (ot->kind == TY_STR) {
                 Type* it = check_expr(mod, fn, e->index.index, g_ty_i64);
@@ -3318,7 +3410,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 FieldInfo* ca = find_class_attr(cls, an);
                 if (ca) { res = ca->type; break; }
                 FuncInfo* prop = find_method_in_class(cls, an);
-                if (prop && prop->is_property) { res = prop->ret_type; break; }
+                if (prop && prop->is_property) { res = ensure_func_ret_type(prop, e->loc); break; }
                 error_at(e->loc, "class '%s' has no attribute '%s'", cls->name, an);
             } else if (ot->kind == TY_MODULE) {
                 if (strcmp(ot->mod->name, "sys") == 0 && strcmp(an, "argv") == 0) {
@@ -3330,7 +3422,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 ClassInfo* mci = find_class_in_mod(ot->mod, an);
                 if (mci) { res = mci->type; break; }
                 FuncInfo* mfi = find_func_in_mod(ot->mod, an);
-                if (mfi) { res = mfi->type; break; }
+                if (mfi) { ensure_func_ret_type(mfi, e->loc); res = mfi->type; break; }
                 error_at(e->loc, "module '%s' has no attribute '%s'", ot->mod->name, an);
             } else {
                 error_at(e->loc, "type '%s' has no attribute '%s'", type_str(ot), an);
@@ -3365,10 +3457,10 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
             Type* rh = e->lambda.ret_type ? resolve_type_expr(mod, e->lambda.ret_type)
                                           : ((hint && hint->kind == TY_FUNC) ? hint->func_ret : NULL);
             Type* rty = check_expr(mod, lfn, e->lambda.body, rh);
-            if (e->lambda.ret_type && !type_assignable(rh, rty)) {
-                error_at(e->loc, "lambda return type '%s' incompatible with annotation '%s'", type_str(rty), type_str(rh));
+            if (rh && !type_assignable(rh, rty)) {
+                error_at(e->loc, "lambda return type '%s' incompatible with expected '%s'", type_str(rty), type_str(rh));
             }
-            lfn->ret_type = e->lambda.ret_type ? rh : rty;
+            lfn->ret_type = rh ? rh : rty;
             lfn->type = make_func_type(ptypes, pc, lfn->ret_type);
             g_all_funcs = (FuncInfo**)realloc(g_all_funcs, sizeof(FuncInfo*) * (size_t)(g_all_func_count + 1));
             g_all_funcs[g_all_func_count++] = lfn;
@@ -3482,10 +3574,50 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                     check_expr(mod, fn, args[0], NULL);
                     res = g_ty_bool; break;
                 }
-                if (strcmp(cname, "sorted") == 0 || strcmp(cname, "reversed") == 0) {
-                    if (argc != 1) error_at(e->loc, "%s() takes 1 argument", cname);
+                if (strcmp(cname, "sorted") == 0) {
+                    if (argc < 1 || argc > 2) error_at(e->loc, "sorted() takes 1 or 2 arguments");
                     Type* at = check_expr(mod, fn, args[0], NULL);
                     Type* el = iter_element_type(at, args[0]->loc);
+                    if (argc == 2) {
+                        if (e->call.kw_names[1] && strcmp(e->call.kw_names[1], "key") != 0) {
+                            error_at(args[1]->loc, "sorted() unsupported keyword argument '%s'", e->call.kw_names[1]);
+                        }
+                        Type* kh_params[1] = {el};
+                        Type khint = {0}; khint.kind = TY_FUNC; khint.func_param_count = 1; khint.func_params = kh_params; khint.func_ret = NULL;
+                        Type* kf = check_expr(mod, fn, args[1], &khint);
+                        if (kf->kind != TY_FUNC || kf->func_param_count != 1 || !type_assignable(kf->func_params[0], el)) {
+                            error_at(args[1]->loc, "sorted() key function must accept '%s'", type_str(el));
+                        }
+                    }
+                    res = make_list_type(el); break;
+                }
+                if (strcmp(cname, "reversed") == 0) {
+                    if (argc != 1) error_at(e->loc, "reversed() takes 1 argument");
+                    Type* at = check_expr(mod, fn, args[0], NULL);
+                    Type* el = iter_element_type(at, args[0]->loc);
+                    res = make_list_type(el); break;
+                }
+                if (strcmp(cname, "map") == 0) {
+                    if (argc != 2) error_at(e->loc, "map() takes 2 arguments");
+                    Type* at = check_expr(mod, fn, args[1], NULL);
+                    Type* el = iter_element_type(at, args[1]->loc);
+                    Type* fh_params[1] = {el};
+                    Type fhint = {0}; fhint.kind = TY_FUNC; fhint.func_param_count = 1; fhint.func_params = fh_params; fhint.func_ret = NULL;
+                    Type* fty = check_expr(mod, fn, args[0], &fhint);
+                    if (fty->kind != TY_FUNC || fty->func_param_count != 1 || !type_assignable(fty->func_params[0], el)) {
+                        error_at(args[0]->loc, "map() function must accept '%s'", type_str(el));
+                    }
+                    res = make_list_type(fty->func_ret); break;
+                }
+                if (strcmp(cname, "filter") == 0) {
+                    if (argc != 2) error_at(e->loc, "filter() takes 2 arguments");
+                    Type* at = check_expr(mod, fn, args[1], NULL);
+                    Type* el = iter_element_type(at, args[1]->loc);
+                    Type* fhint = make_func_type(&el, 1, g_ty_bool);
+                    Type* fty = check_expr(mod, fn, args[0], fhint);
+                    if (fty->kind != TY_FUNC || fty->func_param_count != 1 || !type_assignable(fty->func_params[0], el)) {
+                        error_at(args[0]->loc, "filter() function must accept '%s'", type_str(el));
+                    }
                     res = make_list_type(el); break;
                 }
                 if (strcmp(cname, "list") == 0) {
@@ -3646,7 +3778,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                             error_at(args[i]->loc, "arg %d of %s(): expected '%s', got '%s'", i + 1, cname, type_str(pt), type_str(at));
                         }
                     }
-                    res = target_fn->ret_type;
+                    res = ensure_func_ret_type(target_fn, e->loc);
                     break;
                 }
             }
@@ -3694,6 +3826,22 @@ static Type* resolve_param_type(ModuleInfo* mod, FuncInfo* ctx_fn, Param* pr, co
     return NULL;
 }
 
+static void check_func_body(ModuleInfo* mod, FuncInfo* fn) {
+    if (!fn || fn->body_checked || fn->checking_body || !fn->ast) return;
+    fn->checking_body = true;
+    check_stmts(mod, fn, fn->ast->def_s.body, fn->ast->def_s.body_count);
+    if (fn->infer_ret) {
+        if (fn->inferred_ret_type) {
+            fn->ret_type = fn->saw_void_return ? make_optional_type(fn->inferred_ret_type) : fn->inferred_ret_type;
+        } else {
+            fn->ret_type = g_ty_void;
+        }
+        fn->type = make_func_type(fn->param_types, fn->param_count, fn->ret_type);
+    }
+    fn->checking_body = false;
+    fn->body_checked = true;
+}
+
 static void register_nested_func(ModuleInfo* mod, FuncInfo* parent, Stmt* s) {
     FuncInfo* nf = (FuncInfo*)arena_alloc(sizeof(FuncInfo));
     nf->name = s->def_s.name;
@@ -3714,12 +3862,17 @@ static void register_nested_func(ModuleInfo* mod, FuncInfo* parent, Stmt* s) {
         add_local_in_fn(nf, p->name, nf->param_types[i], true, p->loc);
     }
     nf->ret_type = s->def_s.ret_type ? resolve_type_expr(mod, s->def_s.ret_type) : g_ty_void;
+    nf->infer_ret = (s->def_s.ret_type == NULL);
     nf->type = make_func_type(nf->param_types, nf->param_count, nf->ret_type);
     nf->is_generator = stmt_has_yield(s->def_s.body, s->def_s.body_count);
     g_all_funcs = (FuncInfo**)realloc(g_all_funcs, sizeof(FuncInfo*) * (size_t)(g_all_func_count + 1));
     g_all_funcs[g_all_func_count++] = nf;
     if (parent) add_local_in_fn(parent, nf->name, nf->type, false, s->loc);
-    check_stmts(mod, nf, s->def_s.body, s->def_s.body_count);
+    check_func_body(mod, nf);
+    if (parent) {
+        VarSym* pv = find_local_in_fn(parent, nf->name);
+        if (pv) pv->type = nf->type;
+    }
 }
 
 static const char* extract_is_none_var(Expr* cond, bool* out_is_not_none) {
@@ -3728,6 +3881,128 @@ static const char* extract_is_none_var(Expr* cond, bool* out_is_not_none) {
         *out_is_not_none = (strcmp(cond->binop.op, "is not") == 0);
         if (cond->binop.left->kind == EXPR_VAR && cond->binop.right->kind == EXPR_NONE) return cond->binop.left->var.name;
         if (cond->binop.right->kind == EXPR_VAR && cond->binop.left->kind == EXPR_NONE) return cond->binop.right->var.name;
+    }
+    return NULL;
+}
+
+static const char* extract_isinstance_var(ModuleInfo* mod, Expr* cond, ClassInfo** out_cls) {
+    if (!cond || cond->kind != EXPR_CALL || cond->call.callee->kind != EXPR_VAR) return NULL;
+    if (strcmp(cond->call.callee->var.name, "isinstance") != 0 || cond->call.arg_count != 2) return NULL;
+    if (cond->call.args[0]->kind != EXPR_VAR || cond->call.args[1]->kind != EXPR_VAR) return NULL;
+    ClassInfo* ci = find_class_in_mod(mod, cond->call.args[1]->var.name);
+    if (!ci) return NULL;
+    *out_cls = ci;
+    return cond->call.args[0]->var.name;
+}
+
+static int empty_container_kind(Expr* rhs) {
+    if (!rhs) return 0;
+    if (rhs->kind == EXPR_LIST && rhs->seq.count == 0) return 1;
+    if (rhs->kind == EXPR_DICT && rhs->dict.count == 0) return 3;
+    if (rhs->kind == EXPR_CALL && rhs->call.callee->kind == EXPR_VAR && rhs->call.arg_count == 0) {
+        const char* fn = rhs->call.callee->var.name;
+        if (strcmp(fn, "list") == 0) return 1;
+        if (strcmp(fn, "set") == 0) return 2;
+        if (strcmp(fn, "dict") == 0) return 3;
+    }
+    return 0;
+}
+
+static Type* scan_empty_container_use(ModuleInfo* mod, FuncInfo* fn, const char* vname, int ckind, Stmt** stmts, int count) {
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        if (s->kind == STMT_EXPR && s->expr_s.expr && s->expr_s.expr->kind == EXPR_CALL) {
+            Expr* c = s->expr_s.expr;
+            if (c->call.callee->kind == EXPR_ATTR && c->call.callee->attr.obj->kind == EXPR_VAR &&
+                strcmp(c->call.callee->attr.obj->var.name, vname) == 0) {
+                const char* mn = c->call.callee->attr.attr;
+                if (ckind == 1) {
+                    if (strcmp(mn, "append") == 0 && c->call.arg_count == 1) {
+                        return make_list_type(check_expr(mod, fn, c->call.args[0], NULL));
+                    }
+                    if (strcmp(mn, "insert") == 0 && c->call.arg_count == 2) {
+                        return make_list_type(check_expr(mod, fn, c->call.args[1], NULL));
+                    }
+                    if (strcmp(mn, "extend") == 0 && c->call.arg_count == 1) {
+                        Type* it = check_expr(mod, fn, c->call.args[0], NULL);
+                        return make_list_type(iter_element_type(it, c->call.args[0]->loc));
+                    }
+                } else if (ckind == 2) {
+                    if (strcmp(mn, "add") == 0 && c->call.arg_count == 1) {
+                        return make_set_type(check_expr(mod, fn, c->call.args[0], NULL));
+                    }
+                    if (strcmp(mn, "update") == 0 && c->call.arg_count == 1) {
+                        Type* it = check_expr(mod, fn, c->call.args[0], NULL);
+                        return make_set_type(iter_element_type(it, c->call.args[0]->loc));
+                    }
+                } else if (ckind == 3) {
+                    if (strcmp(mn, "setdefault") == 0 && c->call.arg_count == 2) {
+                        Type* kt = check_expr(mod, fn, c->call.args[0], NULL);
+                        Type* vt = check_expr(mod, fn, c->call.args[1], NULL);
+                        return make_dict_type(kt, vt);
+                    }
+                }
+            }
+        } else if (s->kind == STMT_ASSIGN && ckind == 3 && s->assign.target->kind == EXPR_INDEX &&
+                   s->assign.target->index.obj->kind == EXPR_VAR &&
+                   strcmp(s->assign.target->index.obj->var.name, vname) == 0 && s->assign.value) {
+            Type* kt = check_expr(mod, fn, s->assign.target->index.index, NULL);
+            Type* vt = check_expr(mod, fn, s->assign.value, NULL);
+            return make_dict_type(kt, vt);
+        } else if (s->kind == STMT_IF) {
+            for (int b = 0; b < s->if_s.branch_count; b++) {
+                Type* r = scan_empty_container_use(mod, fn, vname, ckind, s->if_s.bodies[b], s->if_s.body_counts[b]);
+                if (r) return r;
+            }
+            Type* r = scan_empty_container_use(mod, fn, vname, ckind, s->if_s.else_body, s->if_s.else_count);
+            if (r) return r;
+        } else if (s->kind == STMT_WHILE) {
+            Type* r = scan_empty_container_use(mod, fn, vname, ckind, s->while_s.body, s->while_s.body_count);
+            if (r) return r;
+        } else if (s->kind == STMT_FOR) {
+            Type* r = scan_empty_container_use(mod, fn, vname, ckind, s->for_s.body, s->for_s.body_count);
+            if (r) return r;
+        } else if (s->kind == STMT_TRY) {
+            Type* r = scan_empty_container_use(mod, fn, vname, ckind, s->try_s.try_body, s->try_s.try_count);
+            if (r) return r;
+        } else if (s->kind == STMT_WITH) {
+            Type* r = scan_empty_container_use(mod, fn, vname, ckind, s->with_s.body, s->with_s.body_count);
+            if (r) return r;
+        }
+    }
+    return NULL;
+}
+
+static Type* scan_later_non_none_assign(ModuleInfo* mod, FuncInfo* fn, const char* vname, Stmt** stmts, int count) {
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        if (s->kind == STMT_ASSIGN && s->assign.target->kind == EXPR_VAR &&
+            strcmp(s->assign.target->var.name, vname) == 0 &&
+            s->assign.value && s->assign.value->kind != EXPR_NONE) {
+            if (empty_container_kind(s->assign.value) == 0) {
+                Type* vt = check_expr(mod, fn, s->assign.value, NULL);
+                if (vt && vt->kind != TY_NONE_LIT) return make_optional_type(vt);
+            }
+        } else if (s->kind == STMT_IF) {
+            for (int b = 0; b < s->if_s.branch_count; b++) {
+                Type* r = scan_later_non_none_assign(mod, fn, vname, s->if_s.bodies[b], s->if_s.body_counts[b]);
+                if (r) return r;
+            }
+            Type* r = scan_later_non_none_assign(mod, fn, vname, s->if_s.else_body, s->if_s.else_count);
+            if (r) return r;
+        } else if (s->kind == STMT_WHILE) {
+            Type* r = scan_later_non_none_assign(mod, fn, vname, s->while_s.body, s->while_s.body_count);
+            if (r) return r;
+        } else if (s->kind == STMT_FOR) {
+            Type* r = scan_later_non_none_assign(mod, fn, vname, s->for_s.body, s->for_s.body_count);
+            if (r) return r;
+        } else if (s->kind == STMT_TRY) {
+            Type* r = scan_later_non_none_assign(mod, fn, vname, s->try_s.try_body, s->try_s.try_count);
+            if (r) return r;
+        } else if (s->kind == STMT_WITH) {
+            Type* r = scan_later_non_none_assign(mod, fn, vname, s->with_s.body, s->with_s.body_count);
+            if (r) return r;
+        }
     }
     return NULL;
 }
@@ -3767,6 +4042,26 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                 break;
             case STMT_RETURN:
                 if (!fn) error_at(s->loc, "'return' outside function");
+                if (fn->infer_ret) {
+                    if (!s->ret.expr) {
+                        fn->saw_void_return = true;
+                    } else {
+                        Type* rt = check_expr(mod, fn, s->ret.expr, fn->inferred_ret_type);
+                        if (rt->kind == TY_NONE_LIT) {
+                            fn->saw_void_return = true;
+                        } else if (!fn->inferred_ret_type) {
+                            fn->inferred_ret_type = rt;
+                        } else if (type_assignable(fn->inferred_ret_type, rt)) {
+                            /* compatible */
+                        } else if (type_assignable(rt, fn->inferred_ret_type)) {
+                            fn->inferred_ret_type = rt;
+                        } else {
+                            error_at(s->loc, "inconsistent return types '%s' and '%s' in '%s'",
+                                     type_str(fn->inferred_ret_type), type_str(rt), fn->name);
+                        }
+                    }
+                    break;
+                }
                 if (s->ret.expr) {
                     if (fn->ret_type->kind == TY_VOID) {
                         error_at(s->loc, "function '%s' has return type None; cannot return a value (add '-> ReturnType')", fn->name);
@@ -3780,14 +4075,33 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                 }
                 break;
             case STMT_YIELD:
-                if (!fn || fn->ret_type->kind != TY_LIST) error_at(s->loc, "'yield' function must declare return type 'list[T]'");
+                if (!fn) error_at(s->loc, "'yield' outside function");
+                if (fn->infer_ret) {
+                    Type* eh = (fn->inferred_ret_type && fn->inferred_ret_type->kind == TY_LIST) ? fn->inferred_ret_type->elem : NULL;
+                    Type* yt = s->expr_s.expr ? check_expr(mod, fn, s->expr_s.expr, eh) : g_ty_void;
+                    if (!fn->inferred_ret_type) fn->inferred_ret_type = make_list_type(yt);
+                    else if (fn->inferred_ret_type->kind != TY_LIST || !type_assignable(fn->inferred_ret_type->elem, yt)) {
+                        error_at(s->loc, "yield type mismatch");
+                    }
+                    break;
+                }
+                if (fn->ret_type->kind != TY_LIST) error_at(s->loc, "'yield' function must declare return type 'list[T]'");
                 if (s->expr_s.expr) {
                     Type* yt = check_expr(mod, fn, s->expr_s.expr, fn->ret_type->elem);
                     if (!type_assignable(fn->ret_type->elem, yt)) error_at(s->loc, "yield type mismatch");
                 }
                 break;
             case STMT_YIELD_FROM:
-                if (!fn || fn->ret_type->kind != TY_LIST) error_at(s->loc, "'yield from' function must declare return type 'list[T]'");
+                if (!fn) error_at(s->loc, "'yield from' outside function");
+                if (fn->infer_ret) {
+                    Type* st = check_expr(mod, fn, s->expr_s.expr, fn->inferred_ret_type);
+                    Type* el = iter_element_type(st, s->expr_s.expr->loc);
+                    Type* lt = make_list_type(el);
+                    if (!fn->inferred_ret_type) fn->inferred_ret_type = lt;
+                    else if (!type_eq(fn->inferred_ret_type, lt)) error_at(s->loc, "yield from type mismatch");
+                    break;
+                }
+                if (fn->ret_type->kind != TY_LIST) error_at(s->loc, "'yield from' function must declare return type 'list[T]'");
                 check_expr(mod, fn, s->expr_s.expr, fn->ret_type);
                 break;
             case STMT_EXPR:
@@ -3804,6 +4118,25 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                         break;
                     }
                     VarSym* existing = resolve_var(mod, fn, vname, NULL);
+                    if (!ann_ty && !existing) {
+                        int ckind = empty_container_kind(s->assign.value);
+                        if (ckind != 0) {
+                            Type* inf = scan_empty_container_use(mod, fn, vname, ckind, stmts + i + 1, count - i - 1);
+                            if (inf) {
+                                s->assign.value->ty = inf;
+                                bind_var(mod, fn, vname, inf, s->loc);
+                                break;
+                            }
+                        }
+                        if (s->assign.value->kind == EXPR_NONE) {
+                            Type* inf = scan_later_non_none_assign(mod, fn, vname, stmts + i + 1, count - i - 1);
+                            if (inf) {
+                                s->assign.value->ty = inf;
+                                bind_var(mod, fn, vname, inf, s->loc);
+                                break;
+                            }
+                        }
+                    }
                     Type* hint = ann_ty ? ann_ty : (existing ? existing->type : NULL);
                     Type* vt = check_expr(mod, fn, s->assign.value, hint);
                     if (ann_ty) {
@@ -3817,6 +4150,8 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                         }
                         bind_var(mod, fn, vname, vt, s->loc);
                     }
+                    VarSym* bv = resolve_var(mod, fn, vname, NULL);
+                    if (bv) bv->is_nonneg = expr_is_nonneg(mod, fn, s->assign.value);
                 } else if (tgt->kind == EXPR_ATTR) {
                     Type* ot = check_expr(mod, fn, tgt->attr.obj, NULL);
                     if (ot->kind != TY_CLASS) error_at(tgt->loc, "cannot set attribute on type '%s'", type_str(ot));
@@ -3837,6 +4172,7 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                     Type* ot = check_expr(mod, fn, tgt->index.obj, NULL);
                     if (ot->kind == TY_LIST) {
                         if (!type_is_int(check_expr(mod, fn, tgt->index.index, g_ty_i64))) error_at(tgt->index.index->loc, "list index must be int");
+                        tgt->index.index->is_nonneg = expr_is_nonneg(mod, fn, tgt->index.index);
                         tgt->ty = ot->elem;
                         Type* vt = check_expr(mod, fn, s->assign.value, ot->elem);
                         if (!type_assignable(ot->elem, vt)) error_at(s->loc, "list element assignment type mismatch");
@@ -3869,6 +4205,12 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
             case STMT_AUG_ASSIGN: {
                 Type* tt = check_expr(mod, fn, s->aug_assign.target, NULL);
                 Type* vt = check_expr(mod, fn, s->aug_assign.value, tt);
+                if (s->aug_assign.target->kind == EXPR_VAR) {
+                    VarSym* bv = resolve_var(mod, fn, s->aug_assign.target->var.name, NULL);
+                    if (bv && (strcmp(s->aug_assign.op, "+=") != 0 || !expr_is_nonneg(mod, fn, s->aug_assign.value))) {
+                        bv->is_nonneg = false;
+                    }
+                }
                 if (tt->kind == TY_SET && type_eq(tt, vt)) break;
                 if (tt->kind == TY_STR && vt->kind == TY_STR && strcmp(s->aug_assign.op, "+=") == 0) break;
                 if (tt->kind == TY_LIST && type_eq(tt, vt) && strcmp(s->aug_assign.op, "+=") == 0) break;
@@ -3888,7 +4230,21 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                         orig_t = nsym->type;
                         nsym->type = orig_t->elem;
                     }
+                    ClassInfo* sub_cls = NULL;
+                    const char* ivar = extract_isinstance_var(mod, s->if_s.conds[b], &sub_cls);
+                    VarSym* isym = ivar ? resolve_var(mod, fn, ivar, NULL) : NULL;
+                    Type* orig_it = NULL;
+                    if (isym && sub_cls && isym->type &&
+                        ((isym->type->kind == TY_CLASS && !isym->type->cls->is_value_type && !sub_cls->is_value_type &&
+                          class_is_subclass(sub_cls, isym->type->cls)) ||
+                         (isym->type->kind == TY_OPTIONAL && isym->type->elem->kind == TY_CLASS &&
+                          !isym->type->elem->cls->is_value_type && !sub_cls->is_value_type &&
+                          class_is_subclass(sub_cls, isym->type->elem->cls)))) {
+                        orig_it = isym->type;
+                        isym->type = sub_cls->type;
+                    }
                     check_stmts(mod, fn, s->if_s.bodies[b], s->if_s.body_counts[b]);
+                    if (orig_it) isym->type = orig_it;
                     if (orig_t) nsym->type = orig_t;
                 }
                 if (s->if_s.else_count > 0) {
@@ -3923,6 +4279,9 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                 break;
             case STMT_FOR: {
                 Expr* it = s->for_s.iter;
+                bool set_nn = false;
+                bool prev_nn = false;
+                VarSym* loop_v = NULL;
                 if (it->kind == EXPR_CALL && it->call.callee->kind == EXPR_VAR &&
                     strcmp(it->call.callee->var.name, "range") == 0) {
                     for (int a = 0; a < it->call.arg_count; a++) {
@@ -3933,6 +4292,16 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                     it->ty = make_list_type(g_ty_i64);
                     if (s->for_s.target_count != 1) error_at(s->loc, "expected 1 loop variable for range()");
                     bind_var(mod, fn, s->for_s.targets[0], g_ty_i64, s->loc);
+                    loop_v = resolve_var(mod, fn, s->for_s.targets[0], NULL);
+                    if (loop_v) {
+                        prev_nn = loop_v->is_nonneg;
+                        int ac = it->call.arg_count;
+                        bool nn = (ac == 1) ||
+                                  (expr_is_nonneg(mod, fn, it->call.args[0]) &&
+                                   (ac == 2 || expr_is_nonneg(mod, fn, it->call.args[2])));
+                        loop_v->is_nonneg = nn;
+                        set_nn = true;
+                    }
                 } else {
                     Type* it_ty = check_expr(mod, fn, it, NULL);
                     if (s->for_s.target_count == 1) {
@@ -3946,6 +4315,7 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                     }
                 }
                 check_stmts(mod, fn, s->for_s.body, s->for_s.body_count);
+                if (set_nn && loop_v) loop_v->is_nonneg = prev_nn;
                 if (s->for_s.else_count > 0) check_stmts(mod, fn, s->for_s.else_body, s->for_s.else_count);
                 break;
             }
@@ -4227,6 +4597,7 @@ static void analyze_module(ModuleInfo* mod) {
                     add_local_in_fn(mf, pr->name, mf->param_types[p], true, pr->loc);
                 }
                 mf->ret_type = bs->def_s.ret_type ? resolve_type_expr(mod, bs->def_s.ret_type) : g_ty_void;
+                mf->infer_ret = (bs->def_s.ret_type == NULL && strcmp(mf->name, "__init__") != 0);
                 mf->type = make_func_type(mf->param_types, mf->param_count, mf->ret_type);
                 cls->methods = (FuncInfo**)realloc(cls->methods, sizeof(FuncInfo*) * (size_t)(cls->method_count + 1));
                 cls->methods[cls->method_count++] = mf;
@@ -4333,6 +4704,7 @@ static void analyze_module(ModuleInfo* mod) {
             fn->param_types = fn->param_count ? (Type**)arena_alloc(sizeof(Type*) * (size_t)fn->param_count) : NULL;
             fn->param_defaults = fn->param_count ? (Expr**)arena_alloc(sizeof(Expr*) * (size_t)fn->param_count) : NULL;
             fn->ret_type = s->def_s.ret_type ? resolve_type_expr(mod, s->def_s.ret_type) : g_ty_void;
+            fn->infer_ret = (s->def_s.ret_type == NULL);
             fn->is_generator = stmt_has_yield(s->def_s.body, s->def_s.body_count);
             mod->funcs = (FuncInfo**)realloc(mod->funcs, sizeof(FuncInfo*) * (size_t)(mod->func_count + 1));
             mod->funcs[mod->func_count++] = fn;
@@ -4355,19 +4727,33 @@ static void analyze_module(ModuleInfo* mod) {
         fn->type = make_func_type(fn->param_types, fn->param_count, fn->ret_type);
     }
 
+    /* Pre-infer general non-annotated module globals (e.g. ORIGIN = Vec2D(0, 0), PRIMES = [2, 3, 5]) */
+    for (int i = 0; i < mod->stmt_count; i++) {
+        Stmt* s = mod->stmts[i];
+        if (s->kind == STMT_ASSIGN && s->assign.target->kind == EXPR_VAR && !s->assign.type_ann && s->assign.value) {
+            const char* gname = s->assign.target->var.name;
+            if (find_global_in_mod(mod, gname)) continue;
+            if (empty_container_kind(s->assign.value) == 0 && s->assign.value->kind != EXPR_NONE) {
+                Type* gt = check_expr(mod, NULL, s->assign.value, NULL);
+                if (gt && gt->kind != TY_NONE_LIT) {
+                    add_global_in_mod(mod, gname, gt, s->loc);
+                }
+            }
+        }
+    }
+
     for (int i = 0; i < mod->class_count; i++) {
         ClassInfo* cls = mod->classes[i];
         if (!cls->ast) continue;
         for (int j = 0; j < cls->method_count; j++) {
-            FuncInfo* mf = cls->methods[j];
-            check_stmts(mod, mf, mf->ast->def_s.body, mf->ast->def_s.body_count);
+            check_func_body(mod, cls->methods[j]);
         }
     }
 
-    for (int i = 0; i < mod->func_count; i++) {
+    for (int i = mod_fn_start; i < mod->func_count; i++) {
         FuncInfo* fn = mod->funcs[i];
         if (fn->mod != mod || !fn->ast) continue;
-        check_stmts(mod, fn, fn->ast->def_s.body, fn->ast->def_s.body_count);
+        check_func_body(mod, fn);
     }
 
     check_stmts(mod, NULL, mod->stmts, mod->stmt_count);
@@ -4940,6 +5326,11 @@ static void emit_mono_list(Type* lt) {
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
     sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%i\n  %%v = load %s, ptr %%slot\n  ret %s %%v\n}\n\n", mty, mty, mty);
 
+    /* get_nn (statically proven non-negative index) */
+    sb_printf(b, "define internal %s @_%s_get_nn(ptr %%l, i64 %%idx) alwaysinline {\nentry:\n", mty, m);
+    sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
+    sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%idx\n  %%v = load %s, ptr %%slot\n  ret %s %%v\n}\n\n", mty, mty, mty);
+
     /* set */
     sb_printf(b, "define internal void @_%s_set(ptr %%l, i64 %%idx, %s %%val) alwaysinline {\nentry:\n", m, mty);
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%l, i32 0, i32 0\n  %%len32 = load i32, ptr %%lp\n", sty);
@@ -4947,6 +5338,11 @@ static void emit_mono_list(Type* lt) {
     sb_append(b, "  %i = select i1 %neg, i64 %adj, i64 %idx\n");
     sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
     sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%i\n  store %s %%val, ptr %%slot\n  ret void\n}\n\n", mty, mty);
+
+    /* set_nn (statically proven non-negative index) */
+    sb_printf(b, "define internal void @_%s_set_nn(ptr %%l, i64 %%idx, %s %%val) alwaysinline {\nentry:\n", m, mty);
+    sb_printf(b, "  %%ip = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%arr = load ptr, ptr %%ip\n", sty);
+    sb_printf(b, "  %%slot = getelementptr %s, ptr %%arr, i64 %%idx\n  store %s %%val, ptr %%slot\n  ret void\n}\n\n", mty, mty);
 
     /* del */
     sb_printf(b, "define internal void @_%s_del(ptr %%l, i64 %%idx) {\nentry:\n", m);
@@ -6145,7 +6541,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
     return r;
 }
 
-static const char* cg_construct_class(ClassInfo* cls, Expr** args, int argc) {
+static const char* cg_construct_class_at(ClassInfo* cls, Expr** args, int argc, const char* prealloc_obj) {
     if (cls->is_value_type) {
         const char* ptr = cg_reg();
         cg_entry("%s = alloca %s", ptr, cls->llvm_name);
@@ -6175,13 +6571,18 @@ static const char* cg_construct_class(ClassInfo* cls, Expr** args, int argc) {
         cg_emit("call void @stricta_raise(i32 5, ptr null, ptr %s)", cg_cstr_lit("TypeError: cannot instantiate abstract class", 44));
         return "null";
     }
-    const char* sz = cg_reg();
-    const char* obj = cg_reg();
-    cg_emit("%s = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64", sz, cls->llvm_name);
-    if (find_method_in_class(cls, "__init__") || cls->is_dataclass) {
-        cg_emit("%s = call ptr @malloc(i64 %s)", obj, sz);
-    } else {
-        cg_emit("%s = call ptr @calloc(i64 1, i64 %s)", obj, sz);
+    const char* obj = prealloc_obj;
+    if (!obj) {
+        const char* sz = cg_reg();
+        obj = cg_reg();
+        cg_emit("%s = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64", sz, cls->llvm_name);
+        if (find_method_in_class(cls, "__init__") || cls->is_dataclass) {
+            cg_emit("%s = call ptr @malloc(i64 %s)", obj, sz);
+        } else {
+            cg_emit("%s = call ptr @calloc(i64 1, i64 %s)", obj, sz);
+        }
+    } else if (!find_method_in_class(cls, "__init__") && !cls->is_dataclass) {
+        cg_emit("store %s zeroinitializer, ptr %s", cls->llvm_name, obj);
     }
     if (cls->needs_vtable) {
         const char* vp = cg_reg();
@@ -6217,6 +6618,10 @@ static const char* cg_construct_class(ClassInfo* cls, Expr** args, int argc) {
         }
     }
     return obj;
+}
+
+static const char* cg_construct_class(ClassInfo* cls, Expr** args, int argc) {
+    return cg_construct_class_at(cls, args, argc, NULL);
 }
 
 static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, Stmt** body, int body_count,
@@ -7222,7 +7627,13 @@ static const char* cg_expr(Expr* e, Type* hint) {
             if (vp) {
                 const char* mv = cg_reg();
                 cg_emit("%s = load %s, ptr %s", mv, llvm_mem_ty(vt), vp);
-                return cg_mem_to_reg(mv, vt);
+                const char* rv = cg_mem_to_reg(mv, vt);
+                if (vt->kind == TY_OPTIONAL && ty->kind != TY_OPTIONAL && !type_is_heap_ref(vt->elem)) {
+                    const char* unwrapped = cg_reg();
+                    cg_emit("%s = extractvalue %s %s, 1", unwrapped, llvm_reg_ty(vt), rv);
+                    return cg_mem_to_reg(unwrapped, vt->elem);
+                }
+                return rv;
             }
             FuncInfo* fi = find_func_in_mod(g_cg.cur_mod, n);
             if (fi) return fi->llvm_name;
@@ -7393,7 +7804,8 @@ static const char* cg_expr(Expr* e, Type* hint) {
             if (ot->kind == TY_LIST) {
                 const char* i64 = cg_coerce(iv, e->index.index->ty, g_ty_i64);
                 const char* mv = cg_reg();
-                cg_emit("%s = call %s @_%s_get(ptr %s, i64 %s)", mv, llvm_mem_ty(ot->elem), ot->mangled, ov, i64);
+                cg_emit("%s = call %s @_%s_%s(ptr %s, i64 %s)", mv, llvm_mem_ty(ot->elem), ot->mangled,
+                        e->index.index->is_nonneg ? "get_nn" : "get", ov, i64);
                 return cg_mem_to_reg(mv, ot->elem);
             }
             if (ot->kind == TY_DICT) {
@@ -7764,7 +8176,136 @@ static const char* cg_expr(Expr* e, Type* hint) {
                             cg_br(ll); cg_label(ld);
                         }
                     }
+                    if (strcmp(cname, "sorted") == 0 && argc == 2) {
+                        const char* kf = cg_expr(args[1], NULL);
+                        Type* kty = args[1]->ty->func_ret;
+                        const char* sty = arena_sprintf("%%%s", ty->mangled);
+                        const char* emty = llvm_mem_ty(ty->elem);
+                        const char* kmty = llvm_mem_ty(kty);
+                        const char* lp = cg_reg(); const char* len = cg_reg();
+                        const char* ip = cg_reg(); const char* arr = cg_reg();
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 0", lp, sty, res);
+                        cg_emit("%s = load i32, ptr %s", len, lp);
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 2", ip, sty, res);
+                        cg_emit("%s = load ptr, ptr %s", arr, ip);
+                        const char* len64 = cg_reg(); const char* ksz = cg_reg(); const char* karr = cg_reg();
+                        cg_emit("%s = sext i32 %s to i64", len64, len);
+                        cg_emit("%s = mul i64 %s, ptrtoint (ptr getelementptr (%s, ptr null, i32 1) to i64)", ksz, len64, kmty);
+                        cg_emit("%s = call ptr @malloc(i64 %s)", karr, ksz);
+                        const char* i_p = cg_reg(); cg_entry("%s = alloca i32", i_p); cg_emit("store i32 0, ptr %s", i_p);
+                        const char* lk1 = cg_lbl("sk_l"); const char* lb1 = cg_lbl("sk_b"); const char* ld1 = cg_lbl("sk_d");
+                        cg_br(lk1); cg_label(lk1);
+                        const char* iv = cg_reg(); const char* c1 = cg_reg();
+                        cg_emit("%s = load i32, ptr %s", iv, i_p); cg_emit("%s = icmp slt i32 %s, %s", c1, iv, len);
+                        cg_cond_br(c1, lb1, ld1); cg_label(lb1);
+                        const char* ep = cg_reg(); const char* ev = cg_reg(); const char* kv = cg_reg(); const char* kp = cg_reg();
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", ep, emty, arr, iv);
+                        cg_emit("%s = load %s, ptr %s", ev, emty, ep);
+                        cg_emit("%s = call %s %s(%s %s)", kv, llvm_reg_ty(kty), kf, llvm_reg_ty(ty->elem), cg_mem_to_reg(ev, ty->elem));
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", kp, kmty, karr, iv);
+                        cg_emit("store %s %s, ptr %s", kmty, cg_reg_to_mem(kv, kty), kp);
+                        const char* in1 = cg_reg(); cg_emit("%s = add i32 %s, 1", in1, iv); cg_emit("store i32 %s, ptr %s", in1, i_p);
+                        cg_br(lk1); cg_label(ld1);
+
+                        /* Insertion sort on arr + karr by karr */
+                        const char* j_p = cg_reg(); const char* key_p = cg_reg(); const char* val_p = cg_reg();
+                        cg_entry("%s = alloca i32", j_p); cg_entry("%s = alloca %s", key_p, kmty); cg_entry("%s = alloca %s", val_p, emty);
+                        cg_emit("store i32 1, ptr %s", i_p);
+                        const char* lo = cg_lbl("so_l"); const char* lob = cg_lbl("so_b"); const char* lod = cg_lbl("so_d");
+                        const char* li = cg_lbl("si_l"); const char* lic = cg_lbl("si_c"); const char* lib = cg_lbl("si_b"); const char* lid = cg_lbl("si_d");
+                        cg_br(lo); cg_label(lo);
+                        const char* io = cg_reg(); const char* co = cg_reg();
+                        cg_emit("%s = load i32, ptr %s", io, i_p); cg_emit("%s = icmp slt i32 %s, %s", co, io, len);
+                        cg_cond_br(co, lob, lod); cg_label(lob);
+                        const char* skp = cg_reg(); const char* skv = cg_reg(); const char* svp = cg_reg(); const char* svv = cg_reg();
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", skp, kmty, karr, io);
+                        cg_emit("%s = load %s, ptr %s", skv, kmty, skp); cg_emit("store %s %s, ptr %s", kmty, skv, key_p);
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", svp, emty, arr, io);
+                        cg_emit("%s = load %s, ptr %s", svv, emty, svp); cg_emit("store %s %s, ptr %s", emty, svv, val_p);
+                        const char* j0 = cg_reg(); cg_emit("%s = sub i32 %s, 1", j0, io); cg_emit("store i32 %s, ptr %s", j0, j_p);
+                        cg_br(li); cg_label(li);
+                        const char* jv = cg_reg(); const char* jge0 = cg_reg();
+                        cg_emit("%s = load i32, ptr %s", jv, j_p); cg_emit("%s = icmp sge i32 %s, 0", jge0, jv);
+                        cg_cond_br(jge0, lic, lid); cg_label(lic);
+                        const char* kjp = cg_reg(); const char* kjv = cg_reg(); const char* kcur = cg_reg();
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", kjp, kmty, karr, jv);
+                        cg_emit("%s = load %s, ptr %s", kjv, kmty, kjp);
+                        cg_emit("%s = load %s, ptr %s", kcur, kmty, key_p);
+                        const char* gt = cg_binop_values(">", cg_mem_to_reg(kjv, kty), kty, cg_mem_to_reg(kcur, kty), kty, g_ty_bool);
+                        cg_cond_br(gt, lib, lid); cg_label(lib);
+                        const char* jp1 = cg_reg();
+                        const char* vjp = cg_reg(); const char* vjv = cg_reg();
+                        const char* kdp = cg_reg(); const char* vdp = cg_reg();
+                        cg_emit("%s = add i32 %s, 1", jp1, jv);
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", vjp, emty, arr, jv);
+                        cg_emit("%s = load %s, ptr %s", vjv, emty, vjp);
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", kdp, kmty, karr, jp1);
+                        cg_emit("store %s %s, ptr %s", kmty, kjv, kdp);
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", vdp, emty, arr, jp1);
+                        cg_emit("store %s %s, ptr %s", emty, vjv, vdp);
+                        const char* jn = cg_reg(); cg_emit("%s = sub i32 %s, 1", jn, jv); cg_emit("store i32 %s, ptr %s", jn, j_p);
+                        cg_br(li); cg_label(lid);
+                        const char* jf = cg_reg(); const char* jfp1 = cg_reg();
+                        const char* fk = cg_reg(); const char* fv = cg_reg();
+                        const char* fkp = cg_reg(); const char* fvp = cg_reg();
+                        cg_emit("%s = load i32, ptr %s", jf, j_p); cg_emit("%s = add i32 %s, 1", jfp1, jf);
+                        cg_emit("%s = load %s, ptr %s", fk, kmty, key_p); cg_emit("%s = load %s, ptr %s", fv, emty, val_p);
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", fkp, kmty, karr, jfp1);
+                        cg_emit("store %s %s, ptr %s", kmty, fk, fkp);
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", fvp, emty, arr, jfp1);
+                        cg_emit("store %s %s, ptr %s", emty, fv, fvp);
+                        const char* ion = cg_reg(); cg_emit("%s = add i32 %s, 1", ion, io); cg_emit("store i32 %s, ptr %s", ion, i_p);
+                        cg_br(lo); cg_label(lod);
+                        cg_emit("call void @free(ptr %s)", karr);
+                        return res;
+                    }
                     cg_emit("call void @_%s_%s(ptr %s)", ty->mangled, strcmp(cname, "sorted") == 0 ? "sort" : "reverse", res);
+                    return res;
+                }
+                if (strcmp(cname, "map") == 0 || strcmp(cname, "filter") == 0) {
+                    bool is_map = (strcmp(cname, "map") == 0);
+                    const char* fv = cg_expr(args[0], NULL);
+                    const char* iv = cg_expr(args[1], NULL);
+                    Type* it = args[1]->ty;
+                    Type* el = it->elem;
+                    const char* res = cg_reg();
+                    cg_emit("%s = call ptr @_%s_new(i32 8)", res, ty->mangled);
+                    if (it->kind == TY_LIST || it->kind == TY_SET) {
+                        const char* sty = arena_sprintf("%%%s", it->mangled);
+                        int lfld = (it->kind == TY_SET) ? 2 : 0;
+                        int afld = (it->kind == TY_SET) ? 0 : 2;
+                        const char* lp = cg_reg(); const char* len = cg_reg();
+                        const char* ip = cg_reg(); const char* arr = cg_reg();
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", lp, sty, iv, lfld);
+                        cg_emit("%s = load i32, ptr %s", len, lp);
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", ip, sty, iv, afld);
+                        cg_emit("%s = load ptr, ptr %s", arr, ip);
+                        const char* i_p = cg_reg(); cg_entry("%s = alloca i32", i_p); cg_emit("store i32 0, ptr %s", i_p);
+                        const char* ll = cg_lbl("mf_l"); const char* lb = cg_lbl("mf_b"); const char* ld = cg_lbl("mf_d");
+                        cg_br(ll); cg_label(ll);
+                        const char* idx = cg_reg(); const char* c = cg_reg();
+                        cg_emit("%s = load i32, ptr %s", idx, i_p); cg_emit("%s = icmp slt i32 %s, %s", c, idx, len);
+                        cg_cond_br(c, lb, ld); cg_label(lb);
+                        const char* ep = cg_reg(); const char* evm = llvm_mem_ty(el); const char* ev = cg_reg();
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 %s", ep, evm, arr, idx);
+                        cg_emit("%s = load %s, ptr %s", ev, evm, ep);
+                        const char* evr = cg_mem_to_reg(ev, el);
+                        Type* fr = args[0]->ty->func_ret;
+                        const char* cv = cg_reg();
+                        cg_emit("%s = call %s %s(%s %s)", cv, llvm_reg_ty(fr), fv, llvm_reg_ty(el), evr);
+                        if (is_map) {
+                            const char* mv = cg_coerce(cv, fr, ty->elem);
+                            cg_emit("call void @_%s_append(ptr %s, %s %s)", ty->mangled, res, llvm_mem_ty(ty->elem), cg_reg_to_mem(mv, ty->elem));
+                        } else {
+                            const char* keep = cg_truthy(cv, fr);
+                            const char* lk = cg_lbl("fl_k"); const char* ln = cg_lbl("fl_n");
+                            cg_cond_br(keep, lk, ln); cg_label(lk);
+                            cg_emit("call void @_%s_append(ptr %s, %s %s)", ty->mangled, res, evm, ev);
+                            cg_br(ln); cg_label(ln);
+                        }
+                        const char* in = cg_reg(); cg_emit("%s = add i32 %s, 1", in, idx); cg_emit("store i32 %s, ptr %s", in, i_p);
+                        cg_br(ll); cg_label(ld);
+                    }
                     return res;
                 }
                 if (strcmp(cname, "list") == 0 || strcmp(cname, "iter") == 0 || strcmp(cname, "tuple") == 0) {
@@ -8037,90 +8578,151 @@ static const char* cg_expr(Expr* e, Type* hint) {
     return "0";
 }
 
-static bool expr_escapes_var(Expr* e, const char* vname, bool allowed_pos) {
+static bool stmts_escape_var_d(Stmt** stmts, int count, const char* vname, int depth);
+
+static bool expr_escapes_var_d(Expr* e, const char* vname, bool allowed_pos, int depth) {
     if (!e) return false;
     switch (e->kind) {
         case EXPR_VAR:
             if (strcmp(e->var.name, vname) == 0 && !allowed_pos) return true;
             return false;
         case EXPR_INDEX:
-            return expr_escapes_var(e->index.obj, vname, true) || expr_escapes_var(e->index.index, vname, false);
+            return expr_escapes_var_d(e->index.obj, vname, true, depth) || expr_escapes_var_d(e->index.index, vname, false, depth);
         case EXPR_CALL:
             if (e->call.callee->kind == EXPR_ATTR && e->call.callee->attr.obj->kind == EXPR_VAR &&
                 strcmp(e->call.callee->attr.obj->var.name, vname) == 0) {
                 const char* mn = e->call.callee->attr.attr;
+                Expr* obj_e = e->call.callee->attr.obj;
                 if (strcmp(mn, "append") == 0 || strcmp(mn, "clear") == 0 || strcmp(mn, "pop") == 0) {
                     for (int i = 0; i < e->call.arg_count; i++) {
-                        if (expr_escapes_var(e->call.args[i], vname, false)) return true;
+                        if (expr_escapes_var_d(e->call.args[i], vname, false, depth)) return true;
                     }
                     return false;
                 }
+                if (depth < 3 && obj_e->ty && obj_e->ty->kind == TY_CLASS && !obj_e->ty->cls->has_subclasses) {
+                    FuncInfo* m = find_method_in_class(obj_e->ty->cls, mn);
+                    if (m && m->ast && m->param_count > 0 &&
+                        !stmts_escape_var_d(m->ast->def_s.body, m->ast->def_s.body_count, m->param_names[0], depth + 1)) {
+                        for (int i = 0; i < e->call.arg_count; i++) {
+                            if (expr_escapes_var_d(e->call.args[i], vname, false, depth)) return true;
+                        }
+                        return false;
+                    }
+                }
             }
             if (e->call.callee->kind == EXPR_VAR && strcmp(e->call.callee->var.name, "len") == 0 && e->call.arg_count == 1) {
-                return expr_escapes_var(e->call.args[0], vname, true);
+                return expr_escapes_var_d(e->call.args[0], vname, true, depth);
             }
-            if (expr_escapes_var(e->call.callee, vname, false)) return true;
+            if (expr_escapes_var_d(e->call.callee, vname, false, depth)) return true;
             for (int i = 0; i < e->call.arg_count; i++) {
-                if (expr_escapes_var(e->call.args[i], vname, false)) return true;
+                if (expr_escapes_var_d(e->call.args[i], vname, false, depth)) return true;
             }
             return false;
         case EXPR_BINOP:
-            return expr_escapes_var(e->binop.left, vname, false) || expr_escapes_var(e->binop.right, vname, false);
+            return expr_escapes_var_d(e->binop.left, vname, false, depth) || expr_escapes_var_d(e->binop.right, vname, false, depth);
         case EXPR_UNOP:
-            return expr_escapes_var(e->unop.operand, vname, false);
+            return expr_escapes_var_d(e->unop.operand, vname, false, depth);
         case EXPR_TERNARY:
-            return expr_escapes_var(e->ternary.cond, vname, false) || expr_escapes_var(e->ternary.then_e, vname, false) ||
-                   expr_escapes_var(e->ternary.else_e, vname, false);
+            return expr_escapes_var_d(e->ternary.cond, vname, false, depth) ||
+                   expr_escapes_var_d(e->ternary.then_e, vname, false, depth) ||
+                   expr_escapes_var_d(e->ternary.else_e, vname, false, depth);
         case EXPR_LIST: case EXPR_TUPLE: case EXPR_SET:
-            for (int i = 0; i < e->seq.count; i++) if (expr_escapes_var(e->seq.items[i], vname, false)) return true;
+            for (int i = 0; i < e->seq.count; i++) if (expr_escapes_var_d(e->seq.items[i], vname, false, depth)) return true;
+            return false;
+        case EXPR_DICT:
+            for (int i = 0; i < e->dict.count; i++) {
+                if (expr_escapes_var_d(e->dict.keys[i], vname, false, depth) ||
+                    expr_escapes_var_d(e->dict.vals[i], vname, false, depth)) return true;
+            }
+            return false;
+        case EXPR_SLICE:
+            return expr_escapes_var_d(e->slice.obj, vname, true, depth) ||
+                   expr_escapes_var_d(e->slice.start, vname, false, depth) ||
+                   expr_escapes_var_d(e->slice.stop, vname, false, depth);
+        case EXPR_LAMBDA: {
+            for (int i = 0; i < e->lambda.param_count; i++) {
+                if (strcmp(e->lambda.params[i], vname) == 0) return false;
+            }
+            return expr_escapes_var_d(e->lambda.body, vname, false, depth);
+        }
+        case EXPR_LISTCOMP: case EXPR_SETCOMP: case EXPR_DICTCOMP: case EXPR_GENEXPR:
+            if (expr_escapes_var_d(e->comp.elt, vname, false, depth) ||
+                expr_escapes_var_d(e->comp.val, vname, false, depth)) return true;
+            for (int i = 0; i < e->comp.gen_count; i++) {
+                if (expr_escapes_var_d(e->comp.gens[i].iter, vname, true, depth)) return true;
+                for (int f = 0; f < e->comp.gens[i].if_count; f++) {
+                    if (expr_escapes_var_d(e->comp.gens[i].ifs[f], vname, false, depth)) return true;
+                }
+            }
             return false;
         case EXPR_ATTR:
-            return expr_escapes_var(e->attr.obj, vname, false);
+            return expr_escapes_var_d(e->attr.obj, vname, true, depth);
+        case EXPR_INT: case EXPR_FLOAT: case EXPR_BOOL: case EXPR_STR: case EXPR_NONE: case EXPR_BYTES:
+            return false;
+        case EXPR_FSTRING:
+            for (int i = 0; i < e->fstr.count; i++) {
+                if (e->fstr.parts[i].is_expr && expr_escapes_var_d(e->fstr.parts[i].expr, vname, false, depth)) return true;
+            }
+            return false;
         default:
             return true;
     }
 }
 
-static bool stmts_escape_var(Stmt** stmts, int count, const char* vname) {
+static bool stmts_escape_var_d(Stmt** stmts, int count, const char* vname, int depth) {
     for (int i = 0; i < count; i++) {
         Stmt* s = stmts[i];
         switch (s->kind) {
             case STMT_RETURN:
-                if (expr_escapes_var(s->ret.expr, vname, false)) return true;
+                if (expr_escapes_var_d(s->ret.expr, vname, false, depth)) return true;
                 break;
             case STMT_YIELD: case STMT_YIELD_FROM: case STMT_EXPR:
-                if (expr_escapes_var(s->expr_s.expr, vname, false)) return true;
+                if (expr_escapes_var_d(s->expr_s.expr, vname, false, depth)) return true;
                 break;
             case STMT_ASSIGN:
-                if (s->assign.target->kind == EXPR_VAR && strcmp(s->assign.target->var.name, vname) == 0 &&
-                    s->assign.value && s->assign.value->kind == EXPR_LIST && s->assign.value->seq.count == 0) {
-                    break;
-                }
                 if (s->assign.target->kind == EXPR_VAR && strcmp(s->assign.target->var.name, vname) == 0) {
+                    if (s->assign.value && ((s->assign.value->kind == EXPR_LIST && s->assign.value->seq.count <= 64) ||
+                        s->assign.value->kind == EXPR_CALL)) {
+                        for (int k = 0; s->assign.value->kind == EXPR_LIST && k < s->assign.value->seq.count; k++) {
+                            if (expr_escapes_var_d(s->assign.value->seq.items[k], vname, false, depth)) return true;
+                        }
+                        if (s->assign.value->kind == EXPR_CALL) {
+                            for (int k = 0; k < s->assign.value->call.arg_count; k++) {
+                                if (expr_escapes_var_d(s->assign.value->call.args[k], vname, false, depth)) return true;
+                            }
+                        }
+                        break;
+                    }
                     return true;
                 }
-                if ((s->assign.target->kind == EXPR_INDEX && expr_escapes_var(s->assign.target, vname, true)) ||
-                    expr_escapes_var(s->assign.value, vname, false)) return true;
+                if (((s->assign.target->kind == EXPR_INDEX || s->assign.target->kind == EXPR_ATTR) &&
+                     expr_escapes_var_d(s->assign.target, vname, true, depth)) ||
+                    expr_escapes_var_d(s->assign.value, vname, false, depth)) return true;
                 break;
             case STMT_AUG_ASSIGN:
-                if (expr_escapes_var(s->aug_assign.target, vname, false) || expr_escapes_var(s->aug_assign.value, vname, false)) return true;
+                if (expr_escapes_var_d(s->aug_assign.target, vname, false, depth) ||
+                    expr_escapes_var_d(s->aug_assign.value, vname, false, depth)) return true;
                 break;
             case STMT_IF:
                 for (int b = 0; b < s->if_s.branch_count; b++) {
-                    if (expr_escapes_var(s->if_s.conds[b], vname, false)) return true;
-                    if (stmts_escape_var(s->if_s.bodies[b], s->if_s.body_counts[b], vname)) return true;
+                    if (expr_escapes_var_d(s->if_s.conds[b], vname, false, depth)) return true;
+                    if (stmts_escape_var_d(s->if_s.bodies[b], s->if_s.body_counts[b], vname, depth)) return true;
                 }
-                if (stmts_escape_var(s->if_s.else_body, s->if_s.else_count, vname)) return true;
+                if (stmts_escape_var_d(s->if_s.else_body, s->if_s.else_count, vname, depth)) return true;
                 break;
             case STMT_WHILE:
-                if (expr_escapes_var(s->while_s.cond, vname, false)) return true;
-                if (stmts_escape_var(s->while_s.body, s->while_s.body_count, vname)) return true;
-                if (stmts_escape_var(s->while_s.else_body, s->while_s.else_count, vname)) return true;
+                if (expr_escapes_var_d(s->while_s.cond, vname, false, depth)) return true;
+                if (stmts_escape_var_d(s->while_s.body, s->while_s.body_count, vname, depth)) return true;
+                if (stmts_escape_var_d(s->while_s.else_body, s->while_s.else_count, vname, depth)) return true;
                 break;
             case STMT_FOR:
-                if (expr_escapes_var(s->for_s.iter, vname, true)) return true;
-                if (stmts_escape_var(s->for_s.body, s->for_s.body_count, vname)) return true;
-                if (stmts_escape_var(s->for_s.else_body, s->for_s.else_count, vname)) return true;
+                if (expr_escapes_var_d(s->for_s.iter, vname, true, depth)) return true;
+                if (stmts_escape_var_d(s->for_s.body, s->for_s.body_count, vname, depth)) return true;
+                if (stmts_escape_var_d(s->for_s.else_body, s->for_s.else_count, vname, depth)) return true;
+                break;
+            case STMT_ASSERT:
+                if (expr_escapes_var_d(s->assert_s.cond, vname, false, depth) ||
+                    expr_escapes_var_d(s->assert_s.msg, vname, false, depth)) return true;
                 break;
             case STMT_DEF:
                 return true;
@@ -8129,6 +8731,30 @@ static bool stmts_escape_var(Stmt** stmts, int count, const char* vname) {
         }
     }
     return false;
+}
+
+static bool stmts_escape_var(Stmt** stmts, int count, const char* vname) {
+    return stmts_escape_var_d(stmts, count, vname, 0);
+}
+
+static int stmts_count_var_assigns(Stmt** stmts, int count, const char* vname) {
+    int c = 0;
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        if (s->kind == STMT_ASSIGN && s->assign.target->kind == EXPR_VAR &&
+            strcmp(s->assign.target->var.name, vname) == 0) c++;
+        else if (s->kind == STMT_IF) {
+            for (int b = 0; b < s->if_s.branch_count; b++) c += stmts_count_var_assigns(s->if_s.bodies[b], s->if_s.body_counts[b], vname);
+            c += stmts_count_var_assigns(s->if_s.else_body, s->if_s.else_count, vname);
+        } else if (s->kind == STMT_WHILE) {
+            c += stmts_count_var_assigns(s->while_s.body, s->while_s.body_count, vname);
+            c += stmts_count_var_assigns(s->while_s.else_body, s->while_s.else_count, vname);
+        } else if (s->kind == STMT_FOR) {
+            c += stmts_count_var_assigns(s->for_s.body, s->for_s.body_count, vname);
+            c += stmts_count_var_assigns(s->for_s.else_body, s->for_s.else_count, vname);
+        }
+    }
+    return c;
 }
 
 static void cg_stmts(Stmt** stmts, int count) {
@@ -8159,6 +8785,8 @@ static void cg_stmts(Stmt** stmts, int count) {
             case STMT_RETURN:
                 if (g_cg.cur_fn->ret_type->kind == TY_VOID) {
                     cg_emit("ret void");
+                } else if (!s->ret.expr) {
+                    cg_emit("ret %s %s", llvm_reg_ty(g_cg.cur_fn->ret_type), llvm_zero(g_cg.cur_fn->ret_type));
                 } else {
                     const char* rv = cg_coerce(cg_expr(s->ret.expr, g_cg.cur_fn->ret_type), s->ret.expr->ty, g_cg.cur_fn->ret_type);
                     cg_emit("ret %s %s", llvm_reg_ty(g_cg.cur_fn->ret_type), rv);
@@ -8192,22 +8820,47 @@ static void cg_stmts(Stmt** stmts, int count) {
                     Type* vt = NULL;
                     const char* vp = cg_var_ptr(tgt->var.name, &vt);
                     if (g_cg.cur_fn && g_cg.cur_fn->ast && s->assign.value->kind == EXPR_LIST &&
-                        s->assign.value->seq.count == 0 && vt->kind == TY_LIST &&
-                        !stmts_escape_var(g_cg.cur_fn->ast->def_s.body, g_cg.cur_fn->ast->def_s.body_count, tgt->var.name)) {
+                        s->assign.value->seq.count <= 64 && vt->kind == TY_LIST &&
+                        !stmts_escape_var(g_cg.cur_fn->ast->def_s.body, g_cg.cur_fn->ast->def_s.body_count, tgt->var.name) &&
+                        stmts_count_var_assigns(g_cg.cur_fn->ast->def_s.body, g_cg.cur_fn->ast->def_s.body_count, tgt->var.name) == 1) {
                         const char* sty = arena_sprintf("%%%s", vt->mangled);
                         const char* mty = llvm_mem_ty(vt->elem);
                         const char* sl = cg_reg(); const char* sb = cg_reg();
                         cg_entry("%s = alloca %s", sl, sty);
                         cg_entry("%s = alloca [64 x %s]", sb, mty);
+                        int n = s->assign.value->seq.count;
+                        for (int k = 0; k < n; k++) {
+                            const char* iv = cg_coerce(cg_expr(s->assign.value->seq.items[k], vt->elem), s->assign.value->seq.items[k]->ty, vt->elem);
+                            const char* sp = cg_reg();
+                            cg_emit("%s = getelementptr [64 x %s], ptr %s, i32 0, i32 %d", sp, mty, sb, k);
+                            cg_emit("store %s %s, ptr %s", mty, cg_reg_to_mem(iv, vt->elem), sp);
+                        }
                         const char* p0 = cg_reg(); const char* p1 = cg_reg(); const char* p2 = cg_reg();
                         cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 0", p0, sty, sl);
-                        cg_emit("store i32 0, ptr %s", p0);
+                        cg_emit("store i32 %d, ptr %s", n, p0);
                         cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 1", p1, sty, sl);
                         cg_emit("store i32 -64, ptr %s", p1);
                         cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 2", p2, sty, sl);
                         cg_emit("store ptr %s, ptr %s", sb, p2);
                         cg_emit("store ptr %s, ptr %s", sl, vp);
                         break;
+                    }
+                    if (g_cg.cur_fn && g_cg.cur_fn->ast && s->assign.value->kind == EXPR_CALL &&
+                        s->assign.value->call.callee->kind == EXPR_VAR && vt->kind == TY_CLASS &&
+                        !vt->cls->is_value_type && !vt->cls->has_unimpl_abstract &&
+                        find_class_in_mod(g_cg.cur_mod, s->assign.value->call.callee->var.name) == vt->cls &&
+                        !stmts_escape_var(g_cg.cur_fn->ast->def_s.body, g_cg.cur_fn->ast->def_s.body_count, tgt->var.name) &&
+                        stmts_count_var_assigns(g_cg.cur_fn->ast->def_s.body, g_cg.cur_fn->ast->def_s.body_count, tgt->var.name) == 1) {
+                        FuncInfo* init_fn = find_method_in_class(vt->cls, "__init__");
+                        bool init_safe = (!init_fn || (init_fn->ast && init_fn->param_count > 0 &&
+                                           !stmts_escape_var_d(init_fn->ast->def_s.body, init_fn->ast->def_s.body_count, init_fn->param_names[0], 1)));
+                        if (init_safe) {
+                            const char* stk_obj = cg_reg();
+                            cg_entry("%s = alloca %s", stk_obj, vt->cls->llvm_name);
+                            const char* obj_v = cg_construct_class_at(vt->cls, s->assign.value->call.args, s->assign.value->call.arg_count, stk_obj);
+                            cg_emit("store ptr %s, ptr %s", obj_v, vp);
+                            break;
+                        }
                     }
                     const char* v = cg_coerce(cg_expr(s->assign.value, vt), s->assign.value->ty, vt);
                     cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(v, vt), vp);
@@ -8250,7 +8903,8 @@ static void cg_stmts(Stmt** stmts, int count) {
                     if (ot->kind == TY_LIST) {
                         const char* iv = cg_coerce(cg_expr(tgt->index.index, g_ty_i64), tgt->index.index->ty, g_ty_i64);
                         const char* vv = cg_coerce(cg_expr(s->assign.value, ot->elem), s->assign.value->ty, ot->elem);
-                        cg_emit("call void @_%s_set(ptr %s, i64 %s, %s %s)", ot->mangled, ov, iv, llvm_mem_ty(ot->elem), cg_reg_to_mem(vv, ot->elem));
+                        cg_emit("call void @_%s_%s(ptr %s, i64 %s, %s %s)", ot->mangled,
+                                tgt->index.index->is_nonneg ? "set_nn" : "set", ov, iv, llvm_mem_ty(ot->elem), cg_reg_to_mem(vv, ot->elem));
                     } else if (ot->kind == TY_DICT) {
                         const char* kv = cg_coerce(cg_expr(tgt->index.index, ot->key), tgt->index.index->ty, ot->key);
                         const char* vv = cg_coerce(cg_expr(s->assign.value, ot->val), s->assign.value->ty, ot->val);

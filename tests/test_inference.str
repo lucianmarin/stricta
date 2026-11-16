@@ -1,0 +1,131 @@
+class Vec:
+    x: int
+    y: int
+
+    def __init__(self, x = 0, y = 0):
+        self.x = x
+        self.y = y
+
+class Shape:
+    kind: str
+
+    def __init__(self, kind = "shape"):
+        self.kind = kind
+
+class Circle(Shape):
+    radius: int
+
+    def __init__(self, radius: int):
+        self.kind = "circle"
+        self.radius = radius
+
+    def diameter(self):
+        return self.radius * 2
+
+class Box:
+    v: int
+
+    def __init__(self, v: int):
+        self.v = v
+
+    def doubled(self):
+        return self.v * 2
+
+# 1. Return type inference (including recursive, optional, generator, nested)
+def square(x: int):
+    return x * x
+
+def fact(n: int):
+    if n <= 1:
+        return 1
+    return n * fact(n - 1)
+
+def maybe_pos(x: int):
+    if x <= 0:
+        return None
+    return x
+
+def gen_nums(n: int):
+    for i in range(n):
+        yield i
+
+def outer(a: int):
+    def inner(b: int):
+        return a + b
+    return inner(10)
+
+# 6. General module-global inference
+ORIGIN = Vec(3, 4)
+PRIMES = [2, 3, 5, 7]
+COMPUTED = square(6)
+
+def apply_fn(fn: Callable[[int], int], x: int):
+    return fn(x)
+
+def test_all():
+    assert square(5) == 25
+    assert fact(5) == 120
+    assert COMPUTED == 36
+    assert ORIGIN.x + ORIGIN.y == 7
+    assert outer(5) == 15
+
+    r1 = maybe_pos(7)
+    r2 = maybe_pos(-3)
+    assert r1 is not None
+    assert r2 is None
+    if r1 is not None:
+        assert r1 == 7
+
+    g = gen_nums(4)
+    assert g == [0, 1, 2, 3]
+
+    # 2. Deferred empty-container inference
+    nums = []
+    nums.append(10)
+    nums.append(20)
+    assert nums == [10, 20]
+
+    tags = set()
+    tags.add("a")
+    tags.add("b")
+    assert "a" in tags and len(tags) == 2
+
+    scores = {}
+    scores["alice"] = 99
+    assert scores["alice"] == 99
+
+    # 3. Optional auto-promotion
+    best = None
+    if square(2) == 4:
+        best = 42
+    assert best is not None
+    if best is not None:
+        assert best == 42
+
+    # 4. Bidirectional lambda inference
+    doubled = map(lambda x: x * 2, [1, 2, 3])
+    assert doubled == [2, 4, 6]
+    evens = filter(lambda x: x % 2 == 0, [1, 2, 3, 4])
+    assert evens == [2, 4]
+    vecs = sorted([Vec(3, 0), Vec(1, 0), Vec(2, 0)], key=lambda v: v.x)
+    assert vecs[0].x == 1 and vecs[1].x == 2 and vecs[2].x == 3
+    assert apply_fn(lambda x: x + 1, 41) == 42
+
+    # 5. isinstance() flow narrowing
+    s: Shape = Circle(9)
+    if isinstance(s, Circle):
+        assert s.radius == 9
+        assert s.diameter() == 18
+
+    # 7. Non-escaping local list & class + nonneg range indexing
+    local_list = [1, 2, 3, 4]
+    total = 0
+    for i in range(len(local_list)):
+        total = total + local_list[i]
+    assert total == 10
+
+    box = Box(21)
+    assert box.doubled() == 42
+
+test_all()
+print("inference tests passed")

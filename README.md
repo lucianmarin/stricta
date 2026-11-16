@@ -1,12 +1,12 @@
-# Stricta: A Superstrict Compiled Version of Python
+# Stricta: A Strict Compiled Version of Python
 
-Stricta is a **superstrict compiled version of Python** (`.str` extension)—a strictly statically typed, ahead-of-time language with Python syntax that compiles directly to native machine code via a single-file C11 compiler (`stricta.c`), LLVM IR (`.ll`), and `clang -O2`, with **zero dynamic fallback or NaN-boxing**.
+Stricta is a **strict compiled version of Python** (`.str` extension)—an ahead-of-time statically typed language with Python syntax that compiles directly to native machine code via a single-file C11 compiler (`stricta.c`), LLVM IR (`.ll`), and `clang -O2`, with **zero dynamic fallback or NaN-boxing**.
 
 ---
 
 ## ⚡ Philosophy & Architecture
 
-* **Superstrict Static Typing**: Unlike standard Python (which treats type hints as optional runtime-ignored metadata) or gradual compilers (which fall back to dynamic objects), Stricta enforces static types at compile time on every parameter, class field, container, and binding (`int`/`i64`, `i8`–`i64`, `u8`–`u64`, `float`/`f64`, `f32`, `bool`, `str`, `bytes`, `bigint`, `list[T]`, `set[T]`, `dict[K, V]`, `tuple[...]`, `T | None`, `Callable`, `@dataclass`, `class`, `ABC`), with deterministic local initialization inference, flow-sensitive `is None` / `is not None` narrowing, and immediate `file:line:col` errors on untyped or mismatched code.
+* **Strict Static Typing**: Unlike standard Python (which treats type hints as optional runtime-ignored metadata) or gradual compilers (which fall back to dynamic objects), Stricta enforces static types at compile time on every parameter, class field, container, and binding (`int`/`i64`, `i8`–`i64`, `u8`–`u64`, `float`/`f64`, `f32`, `bool`, `str`, `bytes`, `bigint`, `list[T]`, `set[T]`, `dict[K, V]`, `tuple[...]`, `T | None`, `Callable`, `@dataclass`, `class`, `ABC`), with deterministic local initialization inference, flow-sensitive `is None` / `is not None` narrowing, and immediate `file:line:col` errors on untyped or mismatched code.
 * **Zero-Overhead Data Structures & OOP**:
   * Classes lower to flat LLVM structs with direct `getelementptr` field offsets (zero string-keyed attribute dicts).
   * Non-recursive `@dataclass`es use value semantics passed/returned directly in registers.
