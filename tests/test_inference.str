@@ -127,5 +127,159 @@ def test_all():
     box = Box(21)
     assert box.doubled() == 42
 
+# 8. Call-site monomorphization (top-level, recursive, default args, nested, non-vtable method)
+def first_elem(xs):
+    return xs[0]
+
+def add_pair(a, b):
+    return a + b
+
+def scale_val(x, factor=2):
+    return x * factor
+
+class Helper:
+    tag: str
+
+    def __init__(self, tag: str):
+        self.tag = tag
+
+    def identity(self, x):
+        return x
+
+# 9. Cross-method class field inference (self.x = None & self.items = [])
+class TreeNode:
+    def __init__(self, val: int):
+        self.val = val
+        self.left = None
+        self.right = None
+
+    def attach(self, l: TreeNode, r: TreeNode):
+        self.left = l
+        self.right = r
+
+class Bag:
+    def __init__(self):
+        self.items = []
+
+    def add(self, x: int):
+        self.items.append(x)
+
+# 10. Bidirectional hints + return-path checking
+def make_empty_ints() -> list[int]:
+    return []
+
+def sum_ints(xs: list[int]) -> int:
+    s = 0
+    for x in xs:
+        s = s + x
+    return s
+
+def check_both_non_none(a: int | None, b: int | None) -> int:
+    if a is None or b is None:
+        return -1
+    return a + b
+
+def match_opt_int(v: int | None) -> int:
+    match v:
+        case None:
+            return 0
+        case x:
+            return x * 10
+
+def test_extended_inference():
+    # Bounds-check elimination
+    arr = [10, 20, 30, 40]
+    for i in range(len(arr)):
+        arr[i] = arr[i] + 1
+    assert arr == [11, 21, 31, 41]
+
+    idx = 2
+    if 0 <= idx < len(arr):
+        assert arr[idx] == 31
+    if idx < len(arr) and idx >= 0:
+        assert arr[idx] == 31
+    assert 0 <= idx < len(arr)
+    assert arr[idx] == 31
+
+    # Call-site monomorphization
+    assert first_elem([7, 8]) == 7
+    assert first_elem(["hi", "yo"]) == "hi"
+    assert first_elem([Vec(5, 6)]).x == 5
+    assert add_pair(3, 4) == 7
+    assert add_pair(1.5, 2.5) == 4.0
+    assert add_pair("a", "b") == "ab"
+    assert scale_val(5) == 10
+    assert scale_val(2.5) == 5.0
+
+    def local_id(v):
+        return v
+    assert local_id(99) == 99
+    assert local_id("ok") == "ok"
+
+    h = Helper("h")
+    assert h.identity(123) == 123
+    assert h.identity("abc") == "abc"
+
+    # Richer flow narrowing
+    ov: Vec | None = Vec(4, 5)
+    if ov is not None and ov.x > 0:
+        assert ov.x + ov.y == 9
+    if ov is None or ov.x == 4:
+        assert True
+    else:
+        assert False
+
+    ov2: Vec | None = Vec(2, 3)
+    if ov2 is None:
+        assert False
+    elif ov2.y == 3:
+        assert ov2.x == 2
+
+    sh: Shape = Circle(7)
+    assert isinstance(sh, Circle)
+    assert sh.radius == 7 and sh.diameter() == 14
+
+    assert check_both_non_none(3, 4) == 7
+    assert check_both_non_none(None, 4) == -1
+    assert match_opt_int(None) == 0
+    assert match_opt_int(5) == 50
+
+    # Deeper bidirectional hints
+    assert make_empty_ints() == []
+    indirect = []
+    assert sum_ints(indirect) == 0
+    tern_l = [] if True else [1, 2]
+    assert tern_l == []
+    tern_o = None if False else 9
+    if tern_o is not None:
+        assert tern_o == 9
+    mixed = [None, 10, 20]
+    assert len(mixed) == 3
+    nones: list[int | None] = [None for _ in range(3)]
+    assert len(nones) == 3
+
+    # Cross-method class fields
+    root = TreeNode(1)
+    left = TreeNode(2)
+    right = TreeNode(3)
+    root.attach(left, right)
+    rl = root.left
+    rr = root.right
+    if rl is not None and rr is not None:
+        assert rl.val + rr.val == 5
+
+    bag = Bag()
+    bag.add(11)
+    bag.add(22)
+    assert bag.items == [11, 22]
+
+    # Stack-allocated listcomp + fused any/all
+    sq = [k * k for k in range(5)]
+    assert sq == [0, 1, 4, 9, 16]
+    assert any(x > 10 for x in sq)
+    assert all(x >= 0 for x in sq)
+    assert not all(x > 0 for x in sq)
+
 test_all()
+test_extended_inference()
 print("inference tests passed")

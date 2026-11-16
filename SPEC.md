@@ -27,18 +27,18 @@ Stricta enforces strict static types on all bindings, parameters, fields, and co
 - `Callable[[ArgTypes...], RetType]`: Typed function pointer.
 
 ### 1.3 Strict Typing & Inference Rules
-- Function parameters (except `self`, `cls`, and parameters with a concrete default value like `def f(x = 0)`) require explicit type annotations: `def add(a: int, b: int) -> int:`. Parameters with default `None`, `[]`, `{}`, or `set()` still require an explicit annotation (`x: T | None = None`).
-- Functions with an explicit `-> RetType` enforce it strictly; functions omitting `-> RetType` infer their static return type (`T`, `T | None`, `list[T]` for generators, or `None` when returning nothing) from their `return` / `yield` statements.
-- Local variables and module globals infer their static type deterministically from initializers (`x = 10` → `int`, `ORIGIN = Vec2D(0, 0)` → `Vec2D`), or from deferred first-use operations on empty containers (`items = []; items.append(1)` → `list[int]`, `counts = {}; counts["a"] = 1` → `dict[str, int]`, `seen = set(); seen.add("x")` → `set[str]`), or optional auto-promotion (`best = None; best = node` → `Node | None`).
+- Function parameters support explicit annotations (`def add(a: int, b: int) -> int:`), default-value inference (`def f(x = 0)`), and **call-site monomorphization** for unannotated parameters (`def first(xs): return xs[0]`), which specializes a typed LLVM function per distinct call-site argument signature. Parameters with default `None`, `[]`, `{}`, or `set()` still require an explicit annotation (`x: T | None = None`).
+- Functions with an explicit `-> RetType` enforce it strictly (including **definite-return checking** on all control-flow paths); functions omitting `-> RetType` infer their static return type (`T`, `T | None`, `list[T]` for generators, or `None` when returning nothing) from their `return` / `yield` statements.
+- Local variables and module globals infer their static type deterministically from initializers (`x = 10` → `int`, `ORIGIN = Vec2D(0, 0)` → `Vec2D`), from deferred first-use operations, calls, or returns on empty containers (`items = []; items.append(1)` → `list[int]`, `counts = {}; counts["a"] = 1` → `dict[str, int]`, `seen = set(); seen.add("x")` → `set[str]`), or optional auto-promotion (`best = None; best = node` → `Node | None`, `[None, 10]` → `list[int | None]`).
 - Unpopulated empty `[]`, `{}`, `set()`, and bare `None` never promoted in scope are rejected at compile time with `file:line:col: error: ...`.
-- Flow-sensitive narrowing refines `T | None` to `T` via `is None` / `is not None`, and refines `Base` to `Sub` inside `if isinstance(x, Sub):` blocks.
-- Bidirectional inference propagates `Callable` and `map`/`filter`/`sorted(..., key=...)` parameter and return types into `lambda` expressions, while escape and range analysis stack-allocate non-escaping locals/classes and elide negative-index checks on non-negative loop indices.
+- Flow-sensitive narrowing refines `T | None` to `T` and `Base` to `Sub` across `is None` / `is not None`, `isinstance(x, Sub)`, `and` / `or` / `not` compound guards, `elif` chains, `assert` statements, early-return guards, and `match` / `case None:` arms.
+- Bidirectional inference propagates expected types (including `Callable`, `T | None`, ternaries, comprehensions, and `map`/`filter`/`sorted(..., key=...)`) top-down, while escape and range analysis stack-allocate non-escaping locals, comprehensions, and classes and emit direct bounds-check-free `getelementptr` indexing when `0 <= i < len(arr)` is statically proved.
 
 ---
 
 ## 2. Classes, Dataclasses, and OOP
 
-- **Class Structs**: Fields are declared at class scope (`key: int`, `left: BSTNode | None = None`) or inferred from typed assignments to `self.field` in `__init__`. Fields map to fixed LLVM struct offsets.
+- **Class Structs**: Fields are declared at class scope (`key: int`, `left: BSTNode | None = None`) or inferred from assignments to `self.field` across `__init__` and class methods (including `T | None` auto-promotion and empty-container field inference). Fields map to fixed LLVM struct offsets.
 - **`@dataclass`**: Automatically supports positional/default field construction and structural equality (`==`). Non-recursive `@dataclass` types compile as unboxed by-value structs in registers.
 - **Inheritance & Mixins**: Supports single and multiple inheritance with C3 MRO linearization, `ABC` / `@abstractmethod` enforcement, cooperative `super().method(...)` dispatch, `@property`, `@staticmethod`, `@classmethod`, operator overloading (`__add__`, `__eq__`, `__str__`, `__repr__`, etc.), and bitmask `isinstance(obj, Class)`.
 
@@ -47,7 +47,7 @@ Stricta enforces strict static types on all bindings, parameters, fields, and co
 ## 3. Control Flow, Comprehensions, and Modules
 
 - **Statements**: `if`/`elif`/`else`, `while`/`else`, `for`/`else`, `match`/`case`, `try`/`except [Type [as e]]`/`else`/`finally`, `raise`, `assert`, `with ... as ...:`, `del`, `global`, `nonlocal`, `yield`/`yield from` (eager `list[T]`), `lambda`, custom `@decorator`.
-- **Comprehensions**: `[expr for ...]`, `{expr for ...}`, `{k: v for ...}`, `(expr for ...)` (fused directly into zero-allocation loops for `sum(...)`).
+- **Comprehensions**: `[expr for ...]`, `{expr for ...}`, `{k: v for ...}`, `(expr for ...)` (fused directly into zero-allocation loops for `sum(...)`, `any(...)`, and `all(...)`, and stack-allocated when non-escaping).
 - **Modules & Packages**: `import mod [as alias]`, `from mod import name [as alias]` resolving `.str` modules and `pkg/__init__.str` packages, plus `sys.argv`, `abc`, `dataclasses`, and `typing`.
 
 ---
@@ -58,6 +58,6 @@ Stricta enforces strict static types on all bindings, parameters, fields, and co
 - **`runtime.h` / `runtime.c`**: Lean C11 runtime providing UTF-8 string operations, `bytes`, `bigint`, `File` I/O, `setjmp`/`longjmp` exception stack, CLI `sys.argv`, and typed print helpers—with zero NaN-boxing or dynamic attribute lookup.
 - **Build & Test**:
   ```bash
-  make        # builds ./stricta from stricta.c
-  ./build.sh  # runs test.str and all tests/*.str
+  make       # builds ./stricta from stricta.c
+  make test  # runs test.str and all tests/*.str
   ```
