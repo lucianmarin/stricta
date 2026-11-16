@@ -1,19 +1,19 @@
-# 🏎️ Turbo: Strictly Typed Pythonic Native Compiler
+# Stricta: A Superstrict Compiled Version of Python
 
-Turbo is a strictly statically typed ahead-of-time programming language (`.turbo` extension) with Pythonic syntax that compiles directly to native machine code via a single-file C11 compiler (`turbo.c`), LLVM IR (`.ll`), and `clang -O2`—with **zero dynamic `TurboVal` NaN-boxing fallback**.
+Stricta is a **superstrict compiled version of Python** (`.str` extension)—a strictly statically typed, ahead-of-time language with Python syntax that compiles directly to native machine code via a single-file C11 compiler (`stricta.c`), LLVM IR (`.ll`), and `clang -O2`, with **zero dynamic fallback or NaN-boxing**.
 
 ---
 
 ## ⚡ Philosophy & Architecture
 
-* **Strict Static Typing**: Every parameter, field, and container type is statically resolved at compile time (`int`/`i64`, `i8`–`i64`, `u8`–`u64`, `float`/`f64`, `f32`, `bool`, `str`, `bytes`, `bigint`, `list[T]`, `set[T]`, `dict[K, V]`, `tuple[...]`, `T | None`, `Callable`, `@dataclass`, `class`, `ABC`), with deterministic local initialization inference and flow-sensitive `is None` / `is not None` narrowing.
+* **Superstrict Static Typing**: Unlike standard Python (which treats type hints as optional runtime-ignored metadata) or gradual compilers (which fall back to dynamic objects), Stricta enforces static types at compile time on every parameter, class field, container, and binding (`int`/`i64`, `i8`–`i64`, `u8`–`u64`, `float`/`f64`, `f32`, `bool`, `str`, `bytes`, `bigint`, `list[T]`, `set[T]`, `dict[K, V]`, `tuple[...]`, `T | None`, `Callable`, `@dataclass`, `class`, `ABC`), with deterministic local initialization inference, flow-sensitive `is None` / `is not None` narrowing, and immediate `file:line:col` errors on untyped or mismatched code.
 * **Zero-Overhead Data Structures & OOP**:
   * Classes lower to flat LLVM structs with direct `getelementptr` field offsets (zero string-keyed attribute dicts).
   * Non-recursive `@dataclass`es use value semantics passed/returned directly in registers.
   * `list[T]`, `set[T]`, and `dict[K, V]` are monomorphized in LLVM IR with unboxed element storage, inline open-addressing hash tables, and stack-backed non-escaping local lists.
   * Polymorphic hierarchies and cooperative diamond `super()` dispatch via `type_id` switches, with `O(1)` bitmask `isinstance()` checks.
   * `range()` loops, `dict.items()`/`values()` loops, comprehensions, and `sum(genexpr)` / matrix multiplication lower directly to native loops.
-* **Single-File C11 Compiler**: `turbo.c` compiles in milliseconds with zero external dependencies and emits LLVM IR linked against a lean typed C runtime (`runtime.h` / `runtime.c`).
+* **Single-File C11 Compiler**: `stricta.c` compiles in milliseconds with zero external dependencies and emits LLVM IR linked against a lean typed C runtime (`runtime.h` / `runtime.c`).
 
 ---
 
@@ -29,26 +29,26 @@ make
 ./build.sh
 ```
 
-### Compile a `.turbo` Program
+### Compile a `.str` Program
 
 Compile directly to a native executable:
 ```bash
-./turbo hello.turbo -o hello
+./stricta hello.str -o hello
 ./hello
 ```
 
 Or emit LLVM IR (`.ll`):
 ```bash
-./turbo hello.turbo -o hello.ll
+./stricta hello.str -o hello.ll
 ```
 
 ---
 
-## 📊 Performance: Turbo vs Python 3 vs C (`clang -O2`)
+## 📊 Performance: Stricta vs Python 3 vs C (`clang -O2`)
 
-Benchmark suite (`perf/*.turbo`) comparing Python 3.14, Turbo (`turbo.c` → LLVM IR → `clang -O2`), and hand-written C (`perf/*.c` with `clang -O2`).
+Benchmark suite (`perf/*.str`) comparing Python 3.14, Stricta (`stricta.c` → LLVM IR → `clang -O2`), and hand-written C (`perf/*.c` with `clang -O2`).
 
-| Benchmark | Python 3 (ms) | Turbo (ms) | C `clang -O2` (ms) | Turbo vs Python | Turbo vs C |
+| Benchmark | Python 3 (ms) | Stricta (ms) | C `clang -O2` (ms) | Stricta vs Python | Stricta vs C |
 |---|---:|---:|---:|---:|---:|
 | `ackermann` | 2,856.49 | **18.74** | 16.51 | **152.4×** | 0.88× |
 | `class_hierarchy` | 122.45 | **18.28** | 17.25 | **6.7×** | 0.94× |
@@ -63,4 +63,4 @@ Benchmark suite (`perf/*.turbo`) comparing Python 3.14, Turbo (`turbo.c` → LLV
 | `sieve` | 269.43 | **19.81** | 19.87 | **13.6×** | **1.00×** |
 | `tree_structures` | 281.98 | **25.96** | 18.63 | **10.9×** | 0.72× |
 
-*\*Note: `perf/matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (`10.66 ms`). Turbo executes the full loop-interchanged 512×512 multiplication in `47.19 ms` (216.4× faster than Python 3).*
+*\*Note: `perf/matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (`10.66 ms`). Stricta executes the full loop-interchanged 512×512 multiplication in `47.19 ms` (216.4× faster than Python 3).*

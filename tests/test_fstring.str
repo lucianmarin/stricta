@@ -1,4 +1,4 @@
-name: str = "Turbo"
+name: str = "Stricta"
 version: int = 42
 msg: str = f"hello {name}, version {version}"
 print("fstr1:", msg)

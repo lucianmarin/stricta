@@ -1,24 +1,24 @@
 #!/bin/bash
 set -e
 
-echo "=== Building turbo compiler ==="
-clang -std=c11 -O2 -Wall -Wextra -Werror turbo.c -o turbo
+echo "=== Building stricta compiler ==="
+clang -std=c11 -O2 -Wall -Wextra -Werror stricta.c -o stricta
 
-echo "=== Running test.turbo ==="
-./turbo test.turbo -o /tmp/turbo_test_bin
-/tmp/turbo_test_bin > /dev/null
-rm -f /tmp/turbo_test_bin
+echo "=== Running test.str ==="
+./stricta test.str -o /tmp/stricta_test_bin
+/tmp/stricta_test_bin > /dev/null
+rm -f /tmp/stricta_test_bin
 
-echo "=== Running tests/*.turbo ==="
+echo "=== Running tests/*.str ==="
 count=0
-for f in tests/test_*.turbo; do
-    name=$(basename "$f" .turbo)
-    ./turbo "$f" -o "/tmp/turbo_$name"
-    "/tmp/turbo_$name" > /dev/null
-    rm -f "/tmp/turbo_$name"
+for f in tests/test_*.str; do
+    name=$(basename "$f" .str)
+    ./stricta "$f" -o "/tmp/stricta_$name"
+    "/tmp/stricta_$name" > /dev/null
+    rm -f "/tmp/stricta_$name"
     count=$((count + 1))
 done
 
-echo "=== All $count test suites + test.turbo passed! ==="
+echo "=== All $count test suites + test.str passed! ==="
 
 

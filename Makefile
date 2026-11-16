@@ -1,13 +1,13 @@
 CC      ?= clang
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror
-TARGET   = turbo
+TARGET   = stricta
 
 .PHONY: all clean test
 
 all: $(TARGET)
 
-$(TARGET): turbo.c
-	$(CC) $(CFLAGS) turbo.c -o $(TARGET)
+$(TARGET): stricta.c
+	$(CC) $(CFLAGS) stricta.c -o $(TARGET)
 
 test: $(TARGET)
 	./build.sh

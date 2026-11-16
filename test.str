@@ -1,4 +1,4 @@
-# Turbo Test Program
+# Stricta Test Program
 
 def test_arithmetic() -> None:
     x: int = 10
@@ -65,7 +65,7 @@ class Greeter:
 def test_classes() -> None:
     print("Classes:")
     g = Greeter("Hello")
-    g.greet("Turbo")
+    g.greet("Stricta")
     print("g.prefix attribute access:", g.prefix)
 
 def test_bigint() -> None:

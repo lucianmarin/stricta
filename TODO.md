@@ -1,6 +1,6 @@
-# Turbo TODO
+# Stricta TODO
 
-Features from Python not yet implemented in Turbo.
+Features from Python not yet implemented in Stricta.
 
 ## Types
 
@@ -14,7 +14,7 @@ Features from Python not yet implemented in Turbo.
 ## Control Flow
 
 - [x] `try` / `except` / `else` / `finally` — implemented with setjmp/longjmp; supports bare `except:`, typed `except ExcType:`, `except ExcType as e:`, `else`, and `finally`
-- [x] `raise` — raises a catchable exception via `turbo_raise()`; prints "Unhandled exception" and exits if no matching handler
+- [x] `raise` — raises a catchable exception via `stricta_raise()`; prints "Unhandled exception" and exits if no matching handler
 - [x] `assert` — parsed, codegen checks truthiness and calls `exit(1)` on failure; assertion message is evaluated and printed when present
 - [x] `with` — parsed, codegen assigns context manager to variable and wraps body in bare block; no `__enter__` / `__exit__` calls
   - [x] calls `__enter__()` and binds result to `as` variable
@@ -24,11 +24,11 @@ Features from Python not yet implemented in Turbo.
 - [x] `async` / `await` — parsed and codegen produces sync C code; `async def/for/with` are handled; `await` evaluates the expression synchronously
 - [x] `match` / `case` — pattern matching implemented via if/elif chain; supports literal, capture, and wildcard (`_`) patterns
 - [x] `for` / `else`, `while` / `else` — else clauses on loops
-- [x] `del` — removes list elements and dict keys via `turbo_delitem`; variables set to `turbo_none`
+- [x] `del` — removes list elements and dict keys via `stricta_delitem`; variables set to `stricta_none`
 - [x] `global` / `nonlocal` — names excluded from local variable declarations; `global` resolves to module-level globals; `nonlocal` prevents local shadowing (full closure support not yet implemented)
 - [x] `yield` / `yield from` — implemented via eager list collection: generator functions collect yielded values into a list and return it at the end; `yield from` iterates the sub-iterator and appends each value
 - [x] `lambda` — codegen generates a proper C function and returns `make_func(...)`
-- [x] `@decorator` — parsed and applied in codegen via `turbo_call`; supports stacking and class decorators
+- [x] `@decorator` — parsed and applied in codegen via `stricta_call`; supports stacking and class decorators
 - [x] Ternary conditional: `x if cond else y`
 - [x] Walrus operator: `:=`
 

@@ -4352,14 +4352,14 @@ static ModuleInfo* load_module_by_name(const char* mod_name, const char* from_di
     for (int i = 0; rel[i]; i++) if (rel[i] == '.') rel[i] = '/';
 
     char path[1024];
-    snprintf(path, sizeof(path), "%s/%s.turbo", from_dir, rel);
+    snprintf(path, sizeof(path), "%s/%s.str", from_dir, rel);
     size_t len = 0;
     char* src = read_entire_file(path, &len);
     if (!src) {
-        snprintf(path, sizeof(path), "%s/%s/__init__.turbo", from_dir, rel);
+        snprintf(path, sizeof(path), "%s/%s/__init__.str", from_dir, rel);
         src = read_entire_file(path, &len);
     }
-    if (!src) error_at(loc, "cannot find module '%s' (looked for .turbo)", mod_name);
+    if (!src) error_at(loc, "cannot find module '%s' (looked for .str)", mod_name);
 
     ModuleInfo* mod = (ModuleInfo*)arena_alloc(sizeof(ModuleInfo));
     mod->name = arena_strdup(mod_name);
@@ -4669,7 +4669,7 @@ static const char* cg_truthy(const char* val, Type* t) {
         const char* lptr = cg_reg();
         const char* len = cg_reg();
         cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", lptr,
-                t->kind == TY_STR ? "%TurboStr" : t->kind == TY_BYTES ? "%TurboBytes" :
+                t->kind == TY_STR ? "%StrictaStr" : t->kind == TY_BYTES ? "%StrictaBytes" :
                 t->kind == TY_LIST ? arena_sprintf("%%%s", t->mangled) :
                 t->kind == TY_SET ? arena_sprintf("%%%s", t->mangled) : arena_sprintf("%%%s", t->mangled),
                 val,
@@ -4734,12 +4734,12 @@ static uint32_t c_fnv1a(const char* s, size_t len) {
     return h ? h : 1u;
 }
 
-static const char* cg_turbostr_lit(const char* s, size_t len) {
+static const char* cg_strictastr_lit(const char* s, size_t len) {
     const char* csym = cg_cstr_lit(s, len);
     int id = ++g_cg.str_id;
     const char* tsym = arena_sprintf("@.tstr.%d", id);
     uint32_t h = c_fnv1a(s, len);
-    sb_printf(&g_cg.strs, "%s = private constant %%TurboStr { i32 %zu, i32 %u, ptr %s }\n",
+    sb_printf(&g_cg.strs, "%s = private constant %%StrictaStr { i32 %zu, i32 %u, ptr %s }\n",
               tsym, len, h, csym);
     return tsym;
 }
@@ -4787,7 +4787,7 @@ static void emit_hash_eq_for_type(Type* t) {
         sb_append(b, "  %s1 = lshr i64 %v64, 30\n  %x1 = xor i64 %v64, %s1\n"
                      "  %m1 = mul i64 %x1, -4658895280553007687\n  %h = xor i64 %m1, 0\n  ret i64 %h\n}\n\n");
     } else if (t->kind == TY_STR) {
-        sb_append(b, "  %h = call i64 @turbo_str_hash(ptr %v)\n  ret i64 %h\n}\n\n");
+        sb_append(b, "  %h = call i64 @stricta_str_hash(ptr %v)\n  ret i64 %h\n}\n\n");
     } else if (t->kind == TY_TUPLE) {
         sb_append(b, "  %acc0 = add i64 0, 1469598103934665603\n");
         for (int i = 0; i < t->tuple_count; i++) {
@@ -4818,11 +4818,11 @@ static void emit_hash_eq_for_type(Type* t) {
     } else if (type_is_float(t)) {
         sb_printf(b, "  %%r = fcmp oeq %s %%a, %%b\n  ret i1 %%r\n}\n\n", mty);
     } else if (t->kind == TY_STR) {
-        sb_append(b, "  %r32 = call i32 @turbo_str_eq(ptr %a, ptr %b)\n  %r = icmp ne i32 %r32, 0\n  ret i1 %r\n}\n\n");
+        sb_append(b, "  %r32 = call i32 @stricta_str_eq(ptr %a, ptr %b)\n  %r = icmp ne i32 %r32, 0\n  ret i1 %r\n}\n\n");
     } else if (t->kind == TY_BYTES) {
-        sb_append(b, "  %r32 = call i32 @turbo_bytes_eq(ptr %a, ptr %b)\n  %r = icmp ne i32 %r32, 0\n  ret i1 %r\n}\n\n");
+        sb_append(b, "  %r32 = call i32 @stricta_bytes_eq(ptr %a, ptr %b)\n  %r = icmp ne i32 %r32, 0\n  ret i1 %r\n}\n\n");
     } else if (t->kind == TY_BIGINT) {
-        sb_append(b, "  %c = call i32 @turbo_bigint_cmp(ptr %a, ptr %b)\n  %r = icmp eq i32 %c, 0\n  ret i1 %r\n}\n\n");
+        sb_append(b, "  %c = call i32 @stricta_bigint_cmp(ptr %a, ptr %b)\n  %r = icmp eq i32 %c, 0\n  ret i1 %r\n}\n\n");
     } else if (t->kind == TY_LIST) {
         sb_printf(b, "  %%r = call i1 @_%s_eq(ptr %%a, ptr %%b)\n  ret i1 %%r\n}\n\n", m);
     } else if (t->kind == TY_TUPLE) {
@@ -5030,7 +5030,7 @@ static void emit_mono_list(Type* lt) {
     } else if (type_is_float(el)) {
         sb_printf(b, "  %%gt = fcmp ogt %s %%vj, %%key\n", mty);
     } else if (el->kind == TY_STR) {
-        sb_append(b, "  %sc = call i32 @turbo_str_cmp(ptr %vj, ptr %key)\n  %gt = icmp sgt i32 %sc, 0\n");
+        sb_append(b, "  %sc = call i32 @stricta_str_cmp(ptr %vj, ptr %key)\n  %gt = icmp sgt i32 %sc, 0\n");
     } else {
         sb_append(b, "  %gt = icmp sgt i32 0, 1\n");
     }
@@ -5065,13 +5065,13 @@ static void emit_mono_set(Type* st) {
 
     /* %Set_T = type { ptr items, ptr buckets, i32 len, i32 cap, i32 ht_cap } */
     sb_printf(b, "define internal ptr @_%s_new(i32 %%init_cap) {\nentry:\n", m);
-    sb_printf(b, "  %%sz = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64\n  %%s = call ptr @turbo_alloc(i64 %%sz)\n", sty);
+    sb_printf(b, "  %%sz = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64\n  %%s = call ptr @stricta_alloc(i64 %%sz)\n", sty);
     sb_append(b, "  %cap = call i32 @llvm.smax.i32(i32 %init_cap, i32 8)\n");
     sb_append(b, "  br label %hloop\nhloop:\n  %hc = phi i32 [ 16, %entry ], [ %hc2, %hstep ]\n  %need = mul i32 %cap, 2\n");
     sb_append(b, "  %lt = icmp slt i32 %hc, %need\n  br i1 %lt, label %hstep, label %hdone\nhstep:\n  %hc2 = mul i32 %hc, 2\n  br label %hloop\nhdone:\n");
     sb_append(b, "  %cap64 = sext i32 %cap to i64\n");
-    sb_printf(b, "  %%ib = mul i64 %%cap64, %s\n  %%items = call ptr @turbo_alloc(i64 %%ib)\n", esz);
-    sb_append(b, "  %hc64 = sext i32 %hc to i64\n  %bb = mul i64 %hc64, 4\n  %buckets = call ptr @turbo_alloc(i64 %bb)\n");
+    sb_printf(b, "  %%ib = mul i64 %%cap64, %s\n  %%items = call ptr @stricta_alloc(i64 %%ib)\n", esz);
+    sb_append(b, "  %hc64 = sext i32 %hc to i64\n  %bb = mul i64 %hc64, 4\n  %buckets = call ptr @stricta_alloc(i64 %bb)\n");
     sb_append(b, "  br label %iloop\niloop:\n  %i = phi i32 [ 0, %hdone ], [ %in, %istep ]\n  %ic = icmp slt i32 %i, %hc\n  br i1 %ic, label %istep, label %idone\nistep:\n");
     sb_append(b, "  %bp = getelementptr i32, ptr %buckets, i32 %i\n  store i32 -1, ptr %bp\n  %in = add i32 %i, 1\n  br label %iloop\nidone:\n");
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%s, i32 0, i32 0\n  store ptr %%items, ptr %%p0\n", sty);
@@ -5082,9 +5082,9 @@ static void emit_mono_set(Type* st) {
 
     /* rebuild */
     sb_printf(b, "define internal void @_%s_rebuild(ptr %%s, i32 %%ncap) {\nentry:\n", m);
-    sb_printf(b, "  %%p1 = getelementptr %s, ptr %%s, i32 0, i32 1\n  %%oldb = load ptr, ptr %%p1\n  call void @turbo_free(ptr %%oldb)\n", sty);
+    sb_printf(b, "  %%p1 = getelementptr %s, ptr %%s, i32 0, i32 1\n  %%oldb = load ptr, ptr %%p1\n  call void @stricta_free(ptr %%oldb)\n", sty);
     sb_printf(b, "  %%p4 = getelementptr %s, ptr %%s, i32 0, i32 4\n  store i32 %%ncap, ptr %%p4\n", sty);
-    sb_append(b, "  %nc64 = sext i32 %ncap to i64\n  %bb = mul i64 %nc64, 4\n  %nb = call ptr @turbo_alloc(i64 %bb)\n  store ptr %nb, ptr %p1\n");
+    sb_append(b, "  %nc64 = sext i32 %ncap to i64\n  %bb = mul i64 %nc64, 4\n  %nb = call ptr @stricta_alloc(i64 %bb)\n  store ptr %nb, ptr %p1\n");
     sb_append(b, "  br label %zloop\nzloop:\n  %z = phi i32 [ 0, %entry ], [ %zn, %zstep ]\n  %zc = icmp slt i32 %z, %ncap\n  br i1 %zc, label %zstep, label %zdone\nzstep:\n");
     sb_append(b, "  %zp = getelementptr i32, ptr %nb, i32 %z\n  store i32 -1, ptr %zp\n  %zn = add i32 %z, 1\n  br label %zloop\nzdone:\n");
     sb_printf(b, "  %%p2 = getelementptr %s, ptr %%s, i32 0, i32 2\n  %%len = load i32, ptr %%p2\n", sty);
@@ -5120,7 +5120,7 @@ static void emit_mono_set(Type* st) {
     sb_printf(b, "  %%p3 = getelementptr %s, ptr %%s, i32 0, i32 3\n  %%cap = load i32, ptr %%p3\n", sty);
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%s, i32 0, i32 0\n  %%full = icmp sge i32 %%len, %%cap\n  br i1 %%full, label %%grow, label %%put\ngrow:\n", sty);
     sb_append(b, "  %ncap = mul i32 %cap, 2\n  store i32 %ncap, ptr %p3\n  %nc64 = sext i32 %ncap to i64\n");
-    sb_printf(b, "  %%nb = mul i64 %%nc64, %s\n  %%oldi = load ptr, ptr %%p0\n  %%newi = call ptr @turbo_realloc(ptr %%oldi, i64 %%nb)\n  store ptr %%newi, ptr %%p0\n  br label %%put\nput:\n", esz);
+    sb_printf(b, "  %%nb = mul i64 %%nc64, %s\n  %%oldi = load ptr, ptr %%p0\n  %%newi = call ptr @stricta_realloc(ptr %%oldi, i64 %%nb)\n  store ptr %%newi, ptr %%p0\n  br label %%put\nput:\n", esz);
     sb_printf(b, "  %%items = load ptr, ptr %%p0\n  %%ip = getelementptr %s, ptr %%items, i32 %%len\n  store %s %%val, ptr %%ip\n", mty, mty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%s, i32 0, i32 1\n  %%buckets = load ptr, ptr %%p1\n  %%slot = load i32, ptr %%slot_p\n", sty);
     sb_append(b, "  %bp = getelementptr i32, ptr %buckets, i32 %slot\n  store i32 %len, ptr %bp\n  store i32 %l1, ptr %p2\n  br label %done\ndone:\n  ret void\n}\n\n");
@@ -5161,17 +5161,17 @@ static void emit_mono_set(Type* st) {
 
     /* copy */
     sb_printf(b, "define internal ptr @_%s_copy(ptr %%s) {\nentry:\n", m);
-    sb_printf(b, "  %%sz = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64\n  %%c = call ptr @turbo_alloc(i64 %%sz)\n", sty);
+    sb_printf(b, "  %%sz = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64\n  %%c = call ptr @stricta_alloc(i64 %%sz)\n", sty);
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%s, i32 0, i32 0\n  %%items = load ptr, ptr %%p0\n", sty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%s, i32 0, i32 1\n  %%buckets = load ptr, ptr %%p1\n", sty);
     sb_printf(b, "  %%p2 = getelementptr %s, ptr %%s, i32 0, i32 2\n  %%len = load i32, ptr %%p2\n", sty);
     sb_printf(b, "  %%p3 = getelementptr %s, ptr %%s, i32 0, i32 3\n  %%cap = load i32, ptr %%p3\n", sty);
     sb_printf(b, "  %%p4 = getelementptr %s, ptr %%s, i32 0, i32 4\n  %%hc = load i32, ptr %%p4\n", sty);
     sb_append(b, "  %cap64 = sext i32 %cap to i64\n");
-    sb_printf(b, "  %%ib = mul i64 %%cap64, %s\n  %%ni = call ptr @turbo_alloc(i64 %%ib)\n", esz);
+    sb_printf(b, "  %%ib = mul i64 %%cap64, %s\n  %%ni = call ptr @stricta_alloc(i64 %%ib)\n", esz);
     sb_append(b, "  %len64 = sext i32 %len to i64\n");
     sb_printf(b, "  %%lb = mul i64 %%len64, %s\n  call void @llvm.memcpy.p0.p0.i64(ptr %%ni, ptr %%items, i64 %%lb, i1 false)\n", esz);
-    sb_append(b, "  %hc64 = sext i32 %hc to i64\n  %bb = mul i64 %hc64, 4\n  %nb = call ptr @turbo_alloc(i64 %bb)\n");
+    sb_append(b, "  %hc64 = sext i32 %hc to i64\n  %bb = mul i64 %hc64, 4\n  %nb = call ptr @stricta_alloc(i64 %bb)\n");
     sb_append(b, "  call void @llvm.memcpy.p0.p0.i64(ptr %nb, ptr %buckets, i64 %bb, i1 false)\n");
     sb_printf(b, "  %%c0 = getelementptr %s, ptr %%c, i32 0, i32 0\n  store ptr %%ni, ptr %%c0\n", sty);
     sb_printf(b, "  %%c1 = getelementptr %s, ptr %%c, i32 0, i32 1\n  store ptr %%nb, ptr %%c1\n", sty);
@@ -5365,7 +5365,7 @@ static void emit_mono_dict(Type* dt) {
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%d, %s %%key, ptr null)\n  %%ok = icmp sge i32 %%idx, 0\n  br i1 %%ok, label %%hit, label %%miss\nhit:\n", m, kmty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n", sty);
     sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%idx\n  %%v = load %s, ptr %%vp\n  ret %s %%v\nmiss:\n", vmty, vmty, vmty);
-    sb_printf(b, "  call void @turbo_raise(i32 6, ptr null, ptr null)\n  unreachable\n}\n\n");
+    sb_printf(b, "  call void @stricta_raise(i32 6, ptr null, ptr null)\n  unreachable\n}\n\n");
 
     sb_printf(b, "define internal %s @_%s_setdefault(ptr %%d, %s %%key, %s %%def) alwaysinline {\nentry:\n", vmty, m, kmty, vmty);
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%d, %s %%key, ptr null)\n  %%ok = icmp sge i32 %%idx, 0\n  br i1 %%ok, label %%hit, label %%ins\nhit:\n", m, kmty);
@@ -5380,7 +5380,7 @@ static void emit_mono_dict(Type* dt) {
     sb_printf(b, "define internal %s @_%s_pop(ptr %%d, %s %%key) {\nentry:\n", vmty, m, kmty);
     sb_append(b, "  %slot_p = alloca i32\n");
     sb_printf(b, "  %%idx = call i32 @_%s_find(ptr %%d, %s %%key, ptr %%slot_p)\n  %%miss = icmp slt i32 %%idx, 0\n  br i1 %%miss, label %%err, label %%rem\nerr:\n", m, kmty);
-    sb_append(b, "  call void @turbo_raise(i32 6, ptr null, ptr null)\n  unreachable\nrem:\n");
+    sb_append(b, "  call void @stricta_raise(i32 6, ptr null, ptr null)\n  unreachable\nrem:\n");
     sb_printf(b, "  %%p0 = getelementptr %s, ptr %%d, i32 0, i32 0\n  %%keys = load ptr, ptr %%p0\n", sty);
     sb_printf(b, "  %%p1 = getelementptr %s, ptr %%d, i32 0, i32 1\n  %%vals = load ptr, ptr %%p1\n", sty);
     sb_printf(b, "  %%vp = getelementptr %s, ptr %%vals, i32 %%idx\n  %%retv = load %s, ptr %%vp\n", vmty, vmty);
@@ -5533,37 +5533,37 @@ static const char* cg_expr(Expr* e, Type* hint);
 static void cg_stmts(Stmt** stmts, int count);
 
 static const char* cg_to_str(const char* val, Type* t) {
-    if (!t) return cg_turbostr_lit("None", 4);
+    if (!t) return cg_strictastr_lit("None", 4);
     if (t->kind == TY_STR) return val;
-    if (t->kind == TY_NONE_LIT || t->kind == TY_VOID) return cg_turbostr_lit("None", 4);
+    if (t->kind == TY_NONE_LIT || t->kind == TY_VOID) return cg_strictastr_lit("None", 4);
     if (t->kind == TY_BOOL) {
         const char* z = cg_reg();
         const char* r = cg_reg();
         cg_emit("%s = zext i1 %s to i32", z, val);
-        cg_emit("%s = call ptr @turbo_bool_to_str(i32 %s)", r, z);
+        cg_emit("%s = call ptr @stricta_bool_to_str(i32 %s)", r, z);
         return r;
     }
     if (type_is_signed_int(t)) {
         const char* v64 = cg_coerce(val, t, g_ty_i64);
         const char* r = cg_reg();
-        cg_emit("%s = call ptr @turbo_int_to_str(i64 %s)", r, v64);
+        cg_emit("%s = call ptr @stricta_int_to_str(i64 %s)", r, v64);
         return r;
     }
     if (type_is_unsigned_int(t)) {
         const char* v64 = cg_coerce(val, t, g_ty_u64);
         const char* r = cg_reg();
-        cg_emit("%s = call ptr @turbo_uint_to_str(i64 %s)", r, v64);
+        cg_emit("%s = call ptr @stricta_uint_to_str(i64 %s)", r, v64);
         return r;
     }
     if (type_is_float(t)) {
         const char* v64 = cg_coerce(val, t, g_ty_f64);
         const char* r = cg_reg();
-        cg_emit("%s = call ptr @turbo_float_to_str(double %s)", r, v64);
+        cg_emit("%s = call ptr @stricta_float_to_str(double %s)", r, v64);
         return r;
     }
     if (t->kind == TY_BIGINT) {
         const char* r = cg_reg();
-        cg_emit("%s = call ptr @turbo_bigint_to_str(ptr %s)", r, val);
+        cg_emit("%s = call ptr @stricta_bigint_to_str(ptr %s)", r, val);
         return r;
     }
     if (t->kind == TY_OPTIONAL) {
@@ -5580,7 +5580,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         }
         cg_cond_br(is_none, l_none, l_some);
         cg_label(l_none);
-        const char* ns = cg_turbostr_lit("None", 4);
+        const char* ns = cg_strictastr_lit("None", 4);
         cg_br(l_end);
         cg_label(l_some);
         const char* inner = val;
@@ -5604,7 +5604,7 @@ static const char* cg_to_str(const char* val, Type* t) {
             cg_emit("%s = call ptr %s(%s %s)", r, sm->llvm_name, llvm_reg_ty(t), val);
             return r;
         }
-        return cg_turbostr_lit(arena_sprintf("<%s object>", t->cls->name), strlen(t->cls->name) + 10);
+        return cg_strictastr_lit(arena_sprintf("<%s object>", t->cls->name), strlen(t->cls->name) + 10);
     }
     if (t->kind == TY_LIST) {
         const char* sty = arena_sprintf("%%%s", t->mangled);
@@ -5617,7 +5617,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_emit("%s = load ptr, ptr %s", arr, ip);
         const char* acc_p = cg_reg();
         cg_entry("%s = alloca ptr", acc_p);
-        cg_emit("store ptr %s, ptr %s", cg_turbostr_lit("[", 1), acc_p);
+        cg_emit("store ptr %s, ptr %s", cg_strictastr_lit("[", 1), acc_p);
         const char* i_p = cg_reg();
         cg_entry("%s = alloca i32", i_p);
         cg_emit("store i32 0, ptr %s", i_p);
@@ -5639,7 +5639,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_label(l_sep);
         const char* a1 = cg_reg(); const char* a2 = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a1, acc_p);
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", a2, a1, cg_turbostr_lit(", ", 2));
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a2, a1, cg_strictastr_lit(", ", 2));
         cg_emit("store ptr %s, ptr %s", a2, acc_p);
         cg_br(l_item);
         cg_label(l_item);
@@ -5648,13 +5648,13 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_emit("%s = load %s, ptr %s", evm, mty, ep);
         const char* ev = cg_mem_to_reg(evm, t->elem);
         const char* es = (t->elem->kind == TY_STR)
-            ? ({ const char* q = cg_turbostr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
-                 cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", q1, q, ev);
-                 cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", q2, q1, q); q2; })
+            ? ({ const char* q = cg_strictastr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
+                 cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q1, q, ev);
+                 cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q2, q1, q); q2; })
             : cg_to_str(ev, t->elem);
         const char* a3 = cg_reg(); const char* a4 = cg_reg(); const char* in = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a3, acc_p);
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", a4, a3, es);
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a4, a3, es);
         cg_emit("store ptr %s, ptr %s", a4, acc_p);
         cg_emit("%s = add i32 %s, 1", in, iv);
         cg_emit("store i32 %s, ptr %s", in, i_p);
@@ -5662,32 +5662,32 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_label(l_done);
         const char* af = cg_reg(); const char* res = cg_reg();
         cg_emit("%s = load ptr, ptr %s", af, acc_p);
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", res, af, cg_turbostr_lit("]", 1));
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", res, af, cg_strictastr_lit("]", 1));
         return res;
     }
     if (t->kind == TY_TUPLE) {
-        if (t->tuple_count == 0) return cg_turbostr_lit("()", 2);
-        const char* acc = cg_turbostr_lit("(", 1);
+        if (t->tuple_count == 0) return cg_strictastr_lit("()", 2);
+        const char* acc = cg_strictastr_lit("(", 1);
         for (int i = 0; i < t->tuple_count; i++) {
             if (i > 0) {
                 const char* n = cg_reg();
-                cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", n, acc, cg_turbostr_lit(", ", 2));
+                cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, cg_strictastr_lit(", ", 2));
                 acc = n;
             }
             const char* fm = cg_reg();
             cg_emit("%s = extractvalue %s %s, %d", fm, llvm_reg_ty(t), val, i);
             const char* fv = cg_mem_to_reg(fm, t->tuple_elems[i]);
             const char* fs = (t->tuple_elems[i]->kind == TY_STR)
-                ? ({ const char* q = cg_turbostr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
-                     cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", q1, q, fv);
-                     cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", q2, q1, q); q2; })
+                ? ({ const char* q = cg_strictastr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
+                     cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q1, q, fv);
+                     cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q2, q1, q); q2; })
                 : cg_to_str(fv, t->tuple_elems[i]);
             const char* n = cg_reg();
-            cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", n, acc, fs);
+            cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, fs);
             acc = n;
         }
         const char* res = cg_reg();
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", res, acc, cg_turbostr_lit(t->tuple_count == 1 ? ",)" : ")", t->tuple_count == 1 ? 2 : 1));
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", res, acc, cg_strictastr_lit(t->tuple_count == 1 ? ",)" : ")", t->tuple_count == 1 ? 2 : 1));
         return res;
     }
     if (t->kind == TY_SET) {
@@ -5701,7 +5701,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_emit("%s = icmp eq i32 %s, 0", is_emp, len);
         cg_cond_br(is_emp, l_emp, l_non);
         cg_label(l_emp);
-        const char* es = cg_turbostr_lit("set()", 5);
+        const char* es = cg_strictastr_lit("set()", 5);
         cg_br(l_end);
         cg_label(l_non);
         const char* ip = cg_reg(); const char* arr = cg_reg();
@@ -5709,7 +5709,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_emit("%s = load ptr, ptr %s", arr, ip);
         const char* acc_p = cg_reg(); const char* i_p = cg_reg();
         cg_entry("%s = alloca ptr", acc_p); cg_entry("%s = alloca i32", i_p);
-        cg_emit("store ptr %s, ptr %s", cg_turbostr_lit("{", 1), acc_p);
+        cg_emit("store ptr %s, ptr %s", cg_strictastr_lit("{", 1), acc_p);
         cg_emit("store i32 0, ptr %s", i_p);
         const char* l_loop = cg_lbl("sstr_loop"); const char* l_body = cg_lbl("sstr_body");
         const char* l_sep = cg_lbl("sstr_sep"); const char* l_item = cg_lbl("sstr_item"); const char* l_done = cg_lbl("sstr_done");
@@ -5726,7 +5726,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_label(l_sep);
         const char* a1 = cg_reg(); const char* a2 = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a1, acc_p);
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", a2, a1, cg_turbostr_lit(", ", 2));
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a2, a1, cg_strictastr_lit(", ", 2));
         cg_emit("store ptr %s, ptr %s", a2, acc_p);
         cg_br(l_item);
         cg_label(l_item);
@@ -5736,7 +5736,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         const char* evs = cg_to_str(cg_mem_to_reg(evm, t->elem), t->elem);
         const char* a3 = cg_reg(); const char* a4 = cg_reg(); const char* in = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a3, acc_p);
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", a4, a3, evs);
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a4, a3, evs);
         cg_emit("store ptr %s, ptr %s", a4, acc_p);
         cg_emit("%s = add i32 %s, 1", in, iv);
         cg_emit("store i32 %s, ptr %s", in, i_p);
@@ -5744,7 +5744,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_label(l_done);
         const char* af = cg_reg(); const char* ns = cg_reg();
         cg_emit("%s = load ptr, ptr %s", af, acc_p);
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", ns, af, cg_turbostr_lit("}", 1));
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", ns, af, cg_strictastr_lit("}", 1));
         cg_br(l_end);
         cg_label(l_end);
         const char* res = cg_reg();
@@ -5766,7 +5766,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_emit("%s = load ptr, ptr %s", vals, vp0);
         const char* acc_p = cg_reg(); const char* i_p = cg_reg();
         cg_entry("%s = alloca ptr", acc_p); cg_entry("%s = alloca i32", i_p);
-        cg_emit("store ptr %s, ptr %s", cg_turbostr_lit("{", 1), acc_p);
+        cg_emit("store ptr %s, ptr %s", cg_strictastr_lit("{", 1), acc_p);
         cg_emit("store i32 0, ptr %s", i_p);
         const char* l_loop = cg_lbl("dstr_loop"); const char* l_body = cg_lbl("dstr_body");
         const char* l_sep = cg_lbl("dstr_sep"); const char* l_item = cg_lbl("dstr_item"); const char* l_done = cg_lbl("dstr_done");
@@ -5783,7 +5783,7 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_label(l_sep);
         const char* a1 = cg_reg(); const char* a2 = cg_reg();
         cg_emit("%s = load ptr, ptr %s", a1, acc_p);
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", a2, a1, cg_turbostr_lit(", ", 2));
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a2, a1, cg_strictastr_lit(", ", 2));
         cg_emit("store ptr %s, ptr %s", a2, acc_p);
         cg_br(l_item);
         cg_label(l_item);
@@ -5796,16 +5796,16 @@ static const char* cg_to_str(const char* val, Type* t) {
         const char* ks = cg_to_str(cg_mem_to_reg(kvm, t->key), t->key);
         const char* vs = cg_to_str(cg_mem_to_reg(vvm, t->val), t->val);
         if (t->key->kind == TY_STR) {
-            const char* q = cg_turbostr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
-            cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", q1, q, ks);
-            cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", q2, q1, q);
+            const char* q = cg_strictastr_lit("'", 1); const char* q1 = cg_reg(); const char* q2 = cg_reg();
+            cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q1, q, ks);
+            cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", q2, q1, q);
             ks = q2;
         }
         const char* p1 = cg_reg(); const char* p2 = cg_reg(); const char* a3 = cg_reg(); const char* a4 = cg_reg();
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", p1, ks, cg_turbostr_lit(": ", 2));
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", p2, p1, vs);
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", p1, ks, cg_strictastr_lit(": ", 2));
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", p2, p1, vs);
         cg_emit("%s = load ptr, ptr %s", a3, acc_p);
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", a4, a3, p2);
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", a4, a3, p2);
         cg_emit("store ptr %s, ptr %s", a4, acc_p);
         const char* in = cg_reg();
         cg_emit("%s = add i32 %s, 1", in, iv);
@@ -5814,30 +5814,30 @@ static const char* cg_to_str(const char* val, Type* t) {
         cg_label(l_done);
         const char* af = cg_reg(); const char* res = cg_reg();
         cg_emit("%s = load ptr, ptr %s", af, acc_p);
-        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", res, af, cg_turbostr_lit("}", 1));
+        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", res, af, cg_strictastr_lit("}", 1));
         return res;
     }
-    return cg_turbostr_lit("<object>", 8);
+    return cg_strictastr_lit("<object>", 8);
 }
 
 static void cg_print_val(const char* val, Type* t) {
     if (!t || t->kind == TY_NONE_LIT || t->kind == TY_VOID) {
-        cg_emit("call void @turbo_print_cstr(ptr %s)", cg_cstr_lit("None", 4));
+        cg_emit("call void @stricta_print_cstr(ptr %s)", cg_cstr_lit("None", 4));
     } else if (t->kind == TY_BOOL) {
         const char* z = cg_reg();
         cg_emit("%s = zext i1 %s to i32", z, val);
-        cg_emit("call void @turbo_print_bool(i32 %s)", z);
+        cg_emit("call void @stricta_print_bool(i32 %s)", z);
     } else if (type_is_signed_int(t)) {
-        cg_emit("call void @turbo_print_i64(i64 %s)", cg_coerce(val, t, g_ty_i64));
+        cg_emit("call void @stricta_print_i64(i64 %s)", cg_coerce(val, t, g_ty_i64));
     } else if (type_is_unsigned_int(t)) {
-        cg_emit("call void @turbo_print_u64(i64 %s)", cg_coerce(val, t, g_ty_u64));
+        cg_emit("call void @stricta_print_u64(i64 %s)", cg_coerce(val, t, g_ty_u64));
     } else if (type_is_float(t)) {
-        cg_emit("call void @turbo_print_f64(double %s)", cg_coerce(val, t, g_ty_f64));
+        cg_emit("call void @stricta_print_f64(double %s)", cg_coerce(val, t, g_ty_f64));
     } else if (t->kind == TY_STR) {
-        cg_emit("call void @turbo_print_str(ptr %s)", val);
+        cg_emit("call void @stricta_print_str(ptr %s)", val);
     } else {
         const char* s = cg_to_str(val, t);
-        cg_emit("call void @turbo_print_str(ptr %s)", s);
+        cg_emit("call void @stricta_print_str(ptr %s)", s);
     }
 }
 
@@ -5897,7 +5897,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
         if (lt->kind == TY_STR && rt->kind == TY_STR) {
             const char* c = cg_reg();
             const char* r = cg_reg();
-            cg_emit("%s = call i32 @turbo_str_cmp(ptr %s, ptr %s)", c, lv, rv);
+            cg_emit("%s = call i32 @stricta_str_cmp(ptr %s, ptr %s)", c, lv, rv);
             const char* pred = strcmp(op, "==") == 0 ? "eq" : strcmp(op, "!=") == 0 ? "ne" :
                                strcmp(op, "<") == 0 ? "slt" : strcmp(op, "<=") == 0 ? "sle" :
                                strcmp(op, ">") == 0 ? "sgt" : "sge";
@@ -5906,7 +5906,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
         }
         if (lt->kind == TY_BIGINT && rt->kind == TY_BIGINT) {
             const char* c = cg_reg(); const char* r = cg_reg();
-            cg_emit("%s = call i32 @turbo_bigint_cmp(ptr %s, ptr %s)", c, lv, rv);
+            cg_emit("%s = call i32 @stricta_bigint_cmp(ptr %s, ptr %s)", c, lv, rv);
             const char* pred = strcmp(op, "==") == 0 ? "eq" : strcmp(op, "!=") == 0 ? "ne" :
                                strcmp(op, "<") == 0 ? "slt" : strcmp(op, "<=") == 0 ? "sle" :
                                strcmp(op, ">") == 0 ? "sgt" : "sge";
@@ -5982,7 +5982,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
             cg_emit("%s = call i1 @_%s_contains(ptr %s, %s %s)", hit, rt->mangled, rv, llvm_mem_ty(rt->elem), kv);
         } else if (rt->kind == TY_STR) {
             const char* c = cg_reg(); hit = cg_reg();
-            cg_emit("%s = call i32 @turbo_str_contains(ptr %s, ptr %s)", c, lv, rv);
+            cg_emit("%s = call i32 @stricta_str_contains(ptr %s, ptr %s)", c, lv, rv);
             cg_emit("%s = icmp ne i32 %s, 0", hit, c);
         } else {
             hit = "false";
@@ -6004,10 +6004,10 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
         }
     }
     if (lt->kind == TY_STR && rt->kind == TY_STR && strcmp(op, "+") == 0) {
-        const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", r, lv, rv); return r;
+        const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", r, lv, rv); return r;
     }
     if (lt->kind == TY_STR && type_is_int(rt) && strcmp(op, "*") == 0) {
-        const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_str_repeat(ptr %s, i64 %s)", r, lv, cg_coerce(rv, rt, g_ty_i64)); return r;
+        const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_repeat(ptr %s, i64 %s)", r, lv, cg_coerce(rv, rt, g_ty_i64)); return r;
     }
     if (lt->kind == TY_LIST && strcmp(op, "+") == 0) {
         const char* r = cg_reg(); cg_emit("%s = call ptr @_%s_concat(ptr %s, ptr %s)", r, lt->mangled, lv, rv); return r;
@@ -6038,7 +6038,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
         const char* fnm = strcmp(op, "+") == 0 ? "add" : strcmp(op, "-") == 0 ? "sub" :
                           strcmp(op, "*") == 0 ? "mul" : strcmp(op, "//") == 0 ? "div" :
                           strcmp(op, "%") == 0 ? "mod" : "pow";
-        const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_bigint_%s(ptr %s, ptr %s)", r, fnm, lv, rv); return r;
+        const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_bigint_%s(ptr %s, ptr %s)", r, fnm, lv, rv); return r;
     }
 
     /* Numeric arithmetic */
@@ -6109,7 +6109,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
         }
     } else if (strcmp(op, "**") == 0) {
         const char* p = cg_reg();
-        cg_emit("%s = call i64 @turbo_pow_i64(i64 %s, i64 %s)", p, cg_coerce(lc, ct, g_ty_i64), cg_coerce(rc, ct, g_ty_i64));
+        cg_emit("%s = call i64 @stricta_pow_i64(i64 %s, i64 %s)", p, cg_coerce(lc, ct, g_ty_i64), cg_coerce(rc, ct, g_ty_i64));
         return cg_coerce(p, g_ty_i64, ct);
     }
     return r;
@@ -6142,7 +6142,7 @@ static const char* cg_construct_class(ClassInfo* cls, Expr** args, int argc) {
     }
 
     if (cls->has_unimpl_abstract) {
-        cg_emit("call void @turbo_raise(i32 5, ptr null, ptr %s)", cg_cstr_lit("TypeError: cannot instantiate abstract class", 44));
+        cg_emit("call void @stricta_raise(i32 5, ptr null, ptr %s)", cg_cstr_lit("TypeError: cannot instantiate abstract class", 44));
         return "null";
     }
     const char* sz = cg_reg();
@@ -6364,7 +6364,7 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
         el_ty = it_ty->key;
     } else if (it_ty->kind == TY_STR) {
         const char* lp = cg_reg();
-        cg_emit("%s = getelementptr %%TurboStr, ptr %s, i32 0, i32 0", lp, iv_reg);
+        cg_emit("%s = getelementptr %%StrictaStr, ptr %s, i32 0, i32 0", lp, iv_reg);
         cg_emit("%s = load i32, ptr %s", len, lp);
         el_ty = g_ty_str;
     }
@@ -6384,7 +6384,7 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
     if (it_ty->kind == TY_STR) {
         const char* iv64 = cg_reg(); elem_v = cg_reg();
         cg_emit("%s = sext i32 %s to i64", iv64, iv);
-        cg_emit("%s = call ptr @turbo_str_char_at(ptr %s, i64 %s)", elem_v, iv_reg, iv64);
+        cg_emit("%s = call ptr @stricta_str_char_at(ptr %s, i64 %s)", elem_v, iv_reg, iv64);
     } else {
         const char* ep = cg_reg(); const char* em = cg_reg();
         cg_emit("%s = getelementptr %s, ptr %s, i32 %s", ep, llvm_mem_ty(el_ty), arr, iv);
@@ -6544,7 +6544,7 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
         el_ty = it_ty->elem;
     } else if (it_ty->kind == TY_STR) {
         const char* lp = cg_reg();
-        cg_emit("%s = getelementptr %%TurboStr, ptr %s, i32 0, i32 0", lp, iv_reg);
+        cg_emit("%s = getelementptr %%StrictaStr, ptr %s, i32 0, i32 0", lp, iv_reg);
         cg_emit("%s = load i32, ptr %s", len, lp);
         el_ty = g_ty_str;
     } else if (it_ty->kind == TY_TUPLE) {
@@ -6578,7 +6578,7 @@ static void cg_comp_loop_emit(CompGen* gens, int gidx, int gcount, void (*emit_l
     if (it_ty->kind == TY_STR) {
         const char* iv64 = cg_reg(); ev = cg_reg();
         cg_emit("%s = sext i32 %s to i64", iv64, iv);
-        cg_emit("%s = call ptr @turbo_str_char_at(ptr %s, i64 %s)", ev, iv_reg, iv64);
+        cg_emit("%s = call ptr @stricta_str_char_at(ptr %s, i64 %s)", ev, iv_reg, iv64);
     } else {
         const char* ep = cg_reg(); const char* em = cg_reg();
         cg_emit("%s = getelementptr %s, ptr %s, i32 %s", ep, llvm_mem_ty(el_ty), arr, iv);
@@ -6657,28 +6657,28 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
         const char* self_v = cg_expr(obj_e, NULL);
         if (strcmp(mname, "split") == 0) {
             const char* sep = (argc == 1) ? cg_expr(args[0], g_ty_str) : "null";
-            const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_str_split(ptr %s, ptr %s)", r, self_v, sep); return r;
+            const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_split(ptr %s, ptr %s)", r, self_v, sep); return r;
         }
         if (strcmp(mname, "join") == 0) {
             const char* lv = cg_expr(args[0], NULL);
-            const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_str_join(ptr %s, ptr %s)", r, self_v, lv); return r;
+            const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_join(ptr %s, ptr %s)", r, self_v, lv); return r;
         }
         if (strcmp(mname, "upper") == 0 || strcmp(mname, "lower") == 0 ||
             strcmp(mname, "strip") == 0 || strcmp(mname, "lstrip") == 0 || strcmp(mname, "rstrip") == 0) {
-            const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_str_%s(ptr %s)", r, mname, self_v); return r;
+            const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_%s(ptr %s)", r, mname, self_v); return r;
         }
         if (strcmp(mname, "replace") == 0) {
             const char* a0 = cg_expr(args[0], g_ty_str); const char* a1 = cg_expr(args[1], g_ty_str);
-            const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_str_replace(ptr %s, ptr %s, ptr %s)", r, self_v, a0, a1); return r;
+            const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_replace(ptr %s, ptr %s, ptr %s)", r, self_v, a0, a1); return r;
         }
         if (strcmp(mname, "find") == 0 || strcmp(mname, "index") == 0 || strcmp(mname, "count") == 0) {
             const char* a0 = cg_expr(args[0], g_ty_str);
-            const char* r = cg_reg(); cg_emit("%s = call i64 @turbo_str_%s(ptr %s, ptr %s)", r, mname, self_v, a0); return r;
+            const char* r = cg_reg(); cg_emit("%s = call i64 @stricta_str_%s(ptr %s, ptr %s)", r, mname, self_v, a0); return r;
         }
         if (strcmp(mname, "startswith") == 0 || strcmp(mname, "endswith") == 0) {
             const char* a0 = cg_expr(args[0], g_ty_str);
             const char* r32 = cg_reg(); const char* r = cg_reg();
-            cg_emit("%s = call i32 @turbo_str_%s(ptr %s, ptr %s)", r32, mname, self_v, a0);
+            cg_emit("%s = call i32 @stricta_str_%s(ptr %s, ptr %s)", r32, mname, self_v, a0);
             cg_emit("%s = icmp ne i32 %s, 0", r, r32);
             return r;
         }
@@ -6690,7 +6690,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
                 /* Wait to evaluate until needed, or evaluate once here */
                 arg_strs[i] = cg_expr(args[i], NULL);
             }
-            const char* acc = cg_turbostr_lit("", 0);
+            const char* acc = cg_strictastr_lit("", 0);
             int auto_idx = 0;
             size_t p = 0;
             StrBuf lit; sb_init(&lit);
@@ -6700,7 +6700,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
                 if (fmt[p] == '{') {
                     if (lit.len > 0) {
                         const char* n = cg_reg();
-                        cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", n, acc, cg_turbostr_lit(lit.data, lit.len));
+                        cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, cg_strictastr_lit(lit.data, lit.len));
                         acc = n; lit.len = 0; lit.data[0] = '\0';
                     }
                     p++;
@@ -6723,15 +6723,15 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
                             int prec = dot ? atoi(dot + 1) : 6;
                             const char* fv = cg_coerce(arg_strs[aidx], args[aidx]->ty, g_ty_f64);
                             part = cg_reg();
-                            cg_emit("%s = call ptr @turbo_float_fmt(double %s, i32 %d)", part, fv, prec);
+                            cg_emit("%s = call ptr @stricta_float_fmt(double %s, i32 %d)", part, fv, prec);
                         } else {
                             part = cg_to_str(arg_strs[aidx], args[aidx]->ty);
                         }
                     } else {
-                        part = cg_turbostr_lit("", 0);
+                        part = cg_strictastr_lit("", 0);
                     }
                     const char* n = cg_reg();
-                    cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", n, acc, part);
+                    cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, part);
                     acc = n;
                 } else {
                     sb_append_n(&lit, &fmt[p], 1);
@@ -6740,26 +6740,26 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
             }
             if (lit.len > 0) {
                 const char* n = cg_reg();
-                cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", n, acc, cg_turbostr_lit(lit.data, lit.len));
+                cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, cg_strictastr_lit(lit.data, lit.len));
                 acc = n;
             }
             free(lit.data);
             return acc;
         }
-        return cg_turbostr_lit("", 0);
+        return cg_strictastr_lit("", 0);
     }
 
     if (obj_ty->kind == TY_FILE) {
         const char* fv = cg_expr(obj_e, NULL);
         if (strcmp(mname, "read") == 0) {
-            const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_file_read(ptr %s)", r, fv); return r;
+            const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_file_read(ptr %s)", r, fv); return r;
         }
         if (strcmp(mname, "write") == 0) {
             const char* sv = cg_expr(args[0], g_ty_str);
-            cg_emit("call void @turbo_file_write(ptr %s, ptr %s)", fv, sv); return "0";
+            cg_emit("call void @stricta_file_write(ptr %s, ptr %s)", fv, sv); return "0";
         }
         if (strcmp(mname, "close") == 0) {
-            cg_emit("call void @turbo_file_close(ptr %s)", fv); return "0";
+            cg_emit("call void @stricta_file_close(ptr %s)", fv); return "0";
         }
     }
 
@@ -7123,7 +7123,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
         case EXPR_INT: {
             if (ty->kind == TY_BIGINT) {
                 const char* r = cg_reg();
-                cg_emit("%s = call ptr @turbo_bigint_from_str(ptr %s)", r, cg_cstr_lit(e->int_lit.raw, strlen(e->int_lit.raw)));
+                cg_emit("%s = call ptr @stricta_bigint_from_str(ptr %s)", r, cg_cstr_lit(e->int_lit.raw, strlen(e->int_lit.raw)));
                 return r;
             }
             if (type_is_float(ty)) {
@@ -7147,33 +7147,33 @@ static const char* cg_expr(Expr* e, Type* hint) {
         case EXPR_NONE:
             return llvm_zero(ty);
         case EXPR_STR:
-            return cg_turbostr_lit(e->str_lit.text, e->str_lit.len);
+            return cg_strictastr_lit(e->str_lit.text, e->str_lit.len);
         case EXPR_BYTES: {
             const char* cs = cg_cstr_lit(e->str_lit.text, e->str_lit.len);
             const char* r = cg_reg();
-            cg_emit("%s = call ptr @turbo_bytes_new(ptr %s, i32 %zu)", r, cs, e->str_lit.len);
+            cg_emit("%s = call ptr @stricta_bytes_new(ptr %s, i32 %zu)", r, cs, e->str_lit.len);
             return r;
         }
         case EXPR_FSTRING: {
-            const char* acc = cg_turbostr_lit("", 0);
+            const char* acc = cg_strictastr_lit("", 0);
             for (int i = 0; i < e->fstr.count; i++) {
                 FStrPart* fp = &e->fstr.parts[i];
                 const char* ps = NULL;
                 if (!fp->is_expr) {
-                    ps = cg_turbostr_lit(fp->text, strlen(fp->text));
+                    ps = cg_strictastr_lit(fp->text, strlen(fp->text));
                 } else {
                     const char* ev = cg_expr(fp->expr, NULL);
                     if (fp->fmt_spec && strchr(fp->fmt_spec, 'f')) {
                         const char* dot = strchr(fp->fmt_spec, '.');
                         int prec = dot ? atoi(dot + 1) : 6;
                         ps = cg_reg();
-                        cg_emit("%s = call ptr @turbo_float_fmt(double %s, i32 %d)", ps, cg_coerce(ev, fp->expr->ty, g_ty_f64), prec);
+                        cg_emit("%s = call ptr @stricta_float_fmt(double %s, i32 %d)", ps, cg_coerce(ev, fp->expr->ty, g_ty_f64), prec);
                     } else {
                         ps = cg_to_str(ev, fp->expr->ty);
                     }
                 }
                 const char* n = cg_reg();
-                cg_emit("%s = call ptr @turbo_str_concat(ptr %s, ptr %s)", n, acc, ps);
+                cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", n, acc, ps);
                 acc = n;
             }
             return acc;
@@ -7218,7 +7218,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
             if (strcmp(op, "+") == 0) return cg_coerce(ov, ot, ty);
             if (strcmp(op, "-") == 0) {
                 if (ty->kind == TY_BIGINT) {
-                    const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_bigint_neg(ptr %s)", r, ov); return r;
+                    const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_bigint_neg(ptr %s)", r, ov); return r;
                 }
                 const char* cv = cg_coerce(ov, ot, ty);
                 const char* r = cg_reg();
@@ -7375,13 +7375,13 @@ static const char* cg_expr(Expr* e, Type* hint) {
             if (ot->kind == TY_STR) {
                 const char* i64 = cg_coerce(iv, e->index.index->ty, g_ty_i64);
                 const char* r = cg_reg();
-                cg_emit("%s = call ptr @turbo_str_char_at(ptr %s, i64 %s)", r, ov, i64);
+                cg_emit("%s = call ptr @stricta_str_char_at(ptr %s, i64 %s)", r, ov, i64);
                 return r;
             }
             if (ot->kind == TY_BYTES) {
                 const char* dp = cg_reg(); const char* data = cg_reg(); const char* bp = cg_reg();
                 const char* b = cg_reg(); const char* r = cg_reg();
-                cg_emit("%s = getelementptr %%TurboBytes, ptr %s, i32 0, i32 2", dp, ov);
+                cg_emit("%s = getelementptr %%StrictaBytes, ptr %s, i32 0, i32 2", dp, ov);
                 cg_emit("%s = load ptr, ptr %s", data, dp);
                 cg_emit("%s = getelementptr i8, ptr %s, i64 %s", bp, data, cg_coerce(iv, e->index.index->ty, g_ty_i64));
                 cg_emit("%s = load i8, ptr %s", b, bp);
@@ -7396,7 +7396,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
             const char* st = e->slice.start ? cg_coerce(cg_expr(e->slice.start, g_ty_i64), e->slice.start->ty, g_ty_i64) : "0";
             const char* sp = e->slice.stop ? cg_coerce(cg_expr(e->slice.stop, g_ty_i64), e->slice.stop->ty, g_ty_i64) : "9223372036854775807";
             const char* r = cg_reg();
-            if (ot->kind == TY_STR) cg_emit("%s = call ptr @turbo_str_slice(ptr %s, i64 %s, i64 %s)", r, ov, st, sp);
+            if (ot->kind == TY_STR) cg_emit("%s = call ptr @stricta_str_slice(ptr %s, i64 %s, i64 %s)", r, ov, st, sp);
             else cg_emit("%s = call ptr @_%s_slice(ptr %s, i64 %s, i64 %s)", r, ot->mangled, ov, st, sp);
             return r;
         }
@@ -7406,7 +7406,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                 ModuleInfo* mm = e->attr.obj->ty->mod;
                 if (strcmp(mm->name, "sys") == 0 && strcmp(an, "argv") == 0) {
                     const char* r = cg_reg();
-                    cg_emit("%s = load ptr, ptr @turbo_sys_argv", r);
+                    cg_emit("%s = load ptr, ptr @stricta_sys_argv", r);
                     return r;
                 }
                 VarSym* gv = find_global_in_mod(mm, an);
@@ -7473,11 +7473,11 @@ static const char* cg_expr(Expr* e, Type* hint) {
                 const char* cname = callee->var.name;
                 if (strcmp(cname, "print") == 0) {
                     for (int i = 0; i < argc; i++) {
-                        if (i > 0) cg_emit("call void @turbo_print_space()");
+                        if (i > 0) cg_emit("call void @stricta_print_space()");
                         const char* av = cg_expr(args[i], NULL);
                         cg_print_val(av, args[i]->ty);
                     }
-                    cg_emit("call void @turbo_print_newline()");
+                    cg_emit("call void @stricta_print_newline()");
                     return "0";
                 }
                 if (strcmp(cname, "len") == 0) {
@@ -7485,7 +7485,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                     Type* at = args[0]->ty;
                     if (at->kind == TY_TUPLE) return arena_sprintf("%d", at->tuple_count);
                     const char* lp = cg_reg(); const char* l32 = cg_reg(); const char* r = cg_reg();
-                    const char* sty = (at->kind == TY_STR) ? "%TurboStr" : (at->kind == TY_BYTES) ? "%TurboBytes" : arena_sprintf("%%%s", at->mangled);
+                    const char* sty = (at->kind == TY_STR) ? "%StrictaStr" : (at->kind == TY_BYTES) ? "%StrictaBytes" : arena_sprintf("%%%s", at->mangled);
                     int fld = (at->kind == TY_SET) ? 2 : (at->kind == TY_DICT) ? 3 : 0;
                     cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", lp, sty, av, fld);
                     cg_emit("%s = load i32, ptr %s", l32, lp);
@@ -7509,7 +7509,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                     strcmp(cname, "u32") == 0 || strcmp(cname, "u16") == 0 || strcmp(cname, "u8") == 0) {
                     const char* av = cg_expr(args[0], NULL);
                     if (args[0]->ty->kind == TY_STR) {
-                        const char* r = cg_reg(); cg_emit("%s = call i64 @turbo_str_to_int(ptr %s)", r, av);
+                        const char* r = cg_reg(); cg_emit("%s = call i64 @stricta_str_to_int(ptr %s)", r, av);
                         return cg_coerce(r, g_ty_i64, ty);
                     }
                     return cg_coerce(av, args[0]->ty, ty);
@@ -7517,7 +7517,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                 if (strcmp(cname, "float") == 0 || strcmp(cname, "f64") == 0 || strcmp(cname, "f32") == 0) {
                     const char* av = cg_expr(args[0], NULL);
                     if (args[0]->ty->kind == TY_STR) {
-                        const char* r = cg_reg(); cg_emit("%s = call double @turbo_str_to_float(ptr %s)", r, av);
+                        const char* r = cg_reg(); cg_emit("%s = call double @stricta_str_to_float(ptr %s)", r, av);
                         return cg_coerce(r, g_ty_f64, ty);
                     }
                     return cg_coerce(av, args[0]->ty, ty);
@@ -7531,26 +7531,26 @@ static const char* cg_expr(Expr* e, Type* hint) {
                     const char* r = cg_reg();
                     if (args[0]->ty->kind == TY_STR) {
                         const char* sp = cg_reg(); const char* chars = cg_reg();
-                        cg_emit("%s = getelementptr %%TurboStr, ptr %s, i32 0, i32 2", sp, av);
+                        cg_emit("%s = getelementptr %%StrictaStr, ptr %s, i32 0, i32 2", sp, av);
                         cg_emit("%s = load ptr, ptr %s", chars, sp);
-                        cg_emit("%s = call ptr @turbo_bigint_from_str(ptr %s)", r, chars);
+                        cg_emit("%s = call ptr @stricta_bigint_from_str(ptr %s)", r, chars);
                     } else {
-                        cg_emit("%s = call ptr @turbo_bigint_from_i64(i64 %s)", r, cg_coerce(av, args[0]->ty, g_ty_i64));
+                        cg_emit("%s = call ptr @stricta_bigint_from_i64(i64 %s)", r, cg_coerce(av, args[0]->ty, g_ty_i64));
                     }
                     return r;
                 }
                 if (strcmp(cname, "ord") == 0) {
-                    const char* r = cg_reg(); cg_emit("%s = call i64 @turbo_ord(ptr %s)", r, cg_expr(args[0], g_ty_str)); return r;
+                    const char* r = cg_reg(); cg_emit("%s = call i64 @stricta_ord(ptr %s)", r, cg_expr(args[0], g_ty_str)); return r;
                 }
                 if (strcmp(cname, "chr") == 0) {
-                    const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_chr(i64 %s)", r, cg_coerce(cg_expr(args[0], g_ty_i64), args[0]->ty, g_ty_i64)); return r;
+                    const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_chr(i64 %s)", r, cg_coerce(cg_expr(args[0], g_ty_i64), args[0]->ty, g_ty_i64)); return r;
                 }
                 if (strcmp(cname, "hex") == 0 || strcmp(cname, "bin") == 0 || strcmp(cname, "oct") == 0) {
-                    const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_%s(i64 %s)", r, cname, cg_coerce(cg_expr(args[0], g_ty_i64), args[0]->ty, g_ty_i64)); return r;
+                    const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_%s(i64 %s)", r, cname, cg_coerce(cg_expr(args[0], g_ty_i64), args[0]->ty, g_ty_i64)); return r;
                 }
                 if (strcmp(cname, "abs") == 0) {
                     const char* av = cg_expr(args[0], ty);
-                    if (ty->kind == TY_BIGINT) { const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_bigint_abs(ptr %s)", r, av); return r; }
+                    if (ty->kind == TY_BIGINT) { const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_bigint_abs(ptr %s)", r, av); return r; }
                     if (type_is_float(ty)) {
                         const char* r = cg_reg();
                         cg_emit("%s = call %s @llvm.fabs.%s(%s %s)", r, llvm_reg_ty(ty), ty->kind == TY_F32 ? "f32" : "f64", llvm_reg_ty(ty), av);
@@ -7774,7 +7774,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         cg_br(ll); cg_label(ld);
                     } else if (at->kind == TY_STR) {
                         const char* lp = cg_reg(); const char* len = cg_reg();
-                        cg_emit("%s = getelementptr %%TurboStr, ptr %s, i32 0, i32 0", lp, av);
+                        cg_emit("%s = getelementptr %%StrictaStr, ptr %s, i32 0, i32 0", lp, av);
                         cg_emit("%s = load i32, ptr %s", len, lp);
                         const char* i_p = cg_reg(); cg_entry("%s = alloca i32", i_p); cg_emit("store i32 0, ptr %s", i_p);
                         const char* ll = cg_lbl("lstr_l"); const char* lb = cg_lbl("lstr_b"); const char* ld = cg_lbl("lstr_d");
@@ -7784,7 +7784,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         cg_cond_br(c, lb, ld); cg_label(lb);
                         const char* iv64 = cg_reg(); const char* ch = cg_reg();
                         cg_emit("%s = sext i32 %s to i64", iv64, iv);
-                        cg_emit("%s = call ptr @turbo_str_char_at(ptr %s, i64 %s)", ch, av, iv64);
+                        cg_emit("%s = call ptr @stricta_str_char_at(ptr %s, i64 %s)", ch, av, iv64);
                         cg_emit("call void @_%s_append(ptr %s, ptr %s)", ty->mangled, res, ch);
                         const char* in = cg_reg(); cg_emit("%s = add i32 %s, 1", in, iv); cg_emit("store i32 %s, ptr %s", in, i_p);
                         cg_br(ll); cg_label(ld);
@@ -7827,7 +7827,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         cg_br(ll); cg_label(ld);
                     } else if (at->kind == TY_STR) {
                         const char* lp = cg_reg(); const char* len = cg_reg();
-                        cg_emit("%s = getelementptr %%TurboStr, ptr %s, i32 0, i32 0", lp, av);
+                        cg_emit("%s = getelementptr %%StrictaStr, ptr %s, i32 0, i32 0", lp, av);
                         cg_emit("%s = load i32, ptr %s", len, lp);
                         const char* i_p = cg_reg(); cg_entry("%s = alloca i32", i_p); cg_emit("store i32 0, ptr %s", i_p);
                         const char* ll = cg_lbl("ss_l"); const char* lb = cg_lbl("ss_b"); const char* ld = cg_lbl("ss_d");
@@ -7837,7 +7837,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                         cg_cond_br(c, lb, ld); cg_label(lb);
                         const char* iv64 = cg_reg(); const char* ch = cg_reg();
                         cg_emit("%s = sext i32 %s to i64", iv64, iv);
-                        cg_emit("%s = call ptr @turbo_str_char_at(ptr %s, i64 %s)", ch, av, iv64);
+                        cg_emit("%s = call ptr @stricta_str_char_at(ptr %s, i64 %s)", ch, av, iv64);
                         cg_emit("call void @_%s_add(ptr %s, ptr %s)", ty->mangled, res, ch);
                         const char* in = cg_reg(); cg_emit("%s = add i32 %s, 1", in, iv); cg_emit("store i32 %s, ptr %s", in, i_p);
                         cg_br(ll); cg_label(ld);
@@ -7867,7 +7867,7 @@ static const char* cg_expr(Expr* e, Type* hint) {
                     cg_label(le);
                     const char* defv = (argc == 2) ? cg_coerce(cg_expr(args[1], lt->elem), args[1]->ty, lt->elem) : llvm_zero(lt->elem);
                     if (argc < 2) {
-                        cg_emit("call void @turbo_raise(i32 7, ptr null, ptr %s)", cg_cstr_lit("StopIteration", 13));
+                        cg_emit("call void @stricta_raise(i32 7, ptr null, ptr %s)", cg_cstr_lit("StopIteration", 13));
                     }
                     const char* lee = cg_lbl("nx_ee"); cg_br(lee); cg_label(lee); cg_br(ld);
                     cg_label(lo);
@@ -7904,12 +7904,12 @@ static const char* cg_expr(Expr* e, Type* hint) {
                 }
                 if (strcmp(cname, "open") == 0) {
                     const char* p = cg_expr(args[0], g_ty_str);
-                    const char* m = (argc == 2) ? cg_expr(args[1], g_ty_str) : cg_turbostr_lit("r", 1);
-                    const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_open(ptr %s, ptr %s)", r, p, m); return r;
+                    const char* m = (argc == 2) ? cg_expr(args[1], g_ty_str) : cg_strictastr_lit("r", 1);
+                    const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_open(ptr %s, ptr %s)", r, p, m); return r;
                 }
                 if (strcmp(cname, "input") == 0) {
                     const char* p = (argc == 1) ? cg_expr(args[0], g_ty_str) : "null";
-                    const char* r = cg_reg(); cg_emit("%s = call ptr @turbo_input(ptr %s)", r, p); return r;
+                    const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_input(ptr %s)", r, p); return r;
                 }
                 if (strcmp(cname, "isinstance") == 0) {
                     const char* ov = cg_expr(args[0], NULL);
@@ -8457,10 +8457,10 @@ static void cg_stmts(Stmt** stmts, int count) {
                 if (s->assert_s.msg) {
                     const char* ms = cg_to_str(cg_expr(s->assert_s.msg, NULL), s->assert_s.msg->ty);
                     const char* sp = cg_reg(); mp = cg_reg();
-                    cg_emit("%s = getelementptr %%TurboStr, ptr %s, i32 0, i32 2", sp, ms);
+                    cg_emit("%s = getelementptr %%StrictaStr, ptr %s, i32 0, i32 2", sp, ms);
                     cg_emit("%s = load ptr, ptr %s", mp, sp);
                 }
-                cg_emit("call void @turbo_assert_fail(ptr %s, ptr %s, i32 %d)", mp,
+                cg_emit("call void @stricta_assert_fail(ptr %s, ptr %s, i32 %d)", mp,
                         cg_cstr_lit(s->loc.file ? s->loc.file : "", s->loc.file ? strlen(s->loc.file) : 0), s->loc.line);
                 cg_emit("unreachable");
                 cg_label(l_ok);
@@ -8468,7 +8468,7 @@ static void cg_stmts(Stmt** stmts, int count) {
             }
             case STMT_RAISE: {
                 if (!s->raise_s.exc) {
-                    cg_emit("call void @turbo_reraise()");
+                    cg_emit("call void @stricta_reraise()");
                     cg_emit("unreachable");
                     g_cg.block_terminated = true;
                     break;
@@ -8476,13 +8476,13 @@ static void cg_stmts(Stmt** stmts, int count) {
                 const char* ev = cg_expr(s->raise_s.exc, NULL);
                 Type* et = s->raise_s.exc->ty;
                 if (et->kind == TY_CLASS) {
-                    cg_emit("call void @turbo_raise(i32 %d, ptr %s, ptr null)", et->cls->type_id, ev);
+                    cg_emit("call void @stricta_raise(i32 %d, ptr %s, ptr null)", et->cls->type_id, ev);
                 } else {
                     const char* es = cg_to_str(ev, et);
                     const char* sp = cg_reg(); const char* cp = cg_reg();
-                    cg_emit("%s = getelementptr %%TurboStr, ptr %s, i32 0, i32 2", sp, es);
+                    cg_emit("%s = getelementptr %%StrictaStr, ptr %s, i32 0, i32 2", sp, es);
                     cg_emit("%s = load ptr, ptr %s", cp, sp);
-                    cg_emit("call void @turbo_raise(i32 1, ptr null, ptr %s)", cp);
+                    cg_emit("call void @stricta_raise(i32 1, ptr null, ptr %s)", cp);
                 }
                 cg_emit("unreachable");
                 g_cg.block_terminated = true;
@@ -8494,14 +8494,14 @@ static void cg_stmts(Stmt** stmts, int count) {
                 const char* l_else = s->try_s.else_count > 0 ? cg_lbl("try_e") : NULL;
                 const char* l_fin = s->try_s.finally_count > 0 ? cg_lbl("try_f") : NULL;
                 const char* l_end = cg_lbl("try_end");
-                cg_emit("%s = call ptr @turbo_try_push()", jbuf);
+                cg_emit("%s = call ptr @stricta_try_push()", jbuf);
                 cg_emit("%s = call i32 @setjmp(ptr %s) returns_twice", sj, jbuf);
                 cg_emit("%s = icmp eq i32 %s, 0", is_ok, sj);
                 cg_cond_br(is_ok, l_try, l_catch);
 
                 cg_label(l_try);
                 cg_stmts(s->try_s.try_body, s->try_s.try_count);
-                cg_emit("call void @turbo_try_pop()");
+                cg_emit("call void @stricta_try_pop()");
                 cg_br(l_else ? l_else : (l_fin ? l_fin : l_end));
 
                 if (l_else) {
@@ -8511,17 +8511,17 @@ static void cg_stmts(Stmt** stmts, int count) {
                 }
 
                 cg_label(l_catch);
-                cg_emit("call void @turbo_try_pop()");
+                cg_emit("call void @stricta_try_pop()");
                 if (s->try_s.handler_count == 0) {
                     if (l_fin) {
                         cg_stmts(s->try_s.finally_body, s->try_s.finally_count);
                     }
-                    cg_emit("call void @turbo_reraise()");
+                    cg_emit("call void @stricta_reraise()");
                     cg_emit("unreachable");
                     g_cg.block_terminated = true;
                 } else {
                     const char* tid = cg_reg();
-                    cg_emit("%s = call i32 @turbo_exc_type_id()", tid);
+                    cg_emit("%s = call i32 @stricta_exc_type_id()", tid);
                     for (int h = 0; h < s->try_s.handler_count; h++) {
                         ExceptHandler* eh = &s->try_s.handlers[h];
                         const char* l_h = cg_lbl("eh_b");
@@ -8542,8 +8542,8 @@ static void cg_stmts(Stmt** stmts, int count) {
                         if (eh->as_name) {
                             Type* vt = NULL; const char* vp = cg_var_ptr(eh->as_name, &vt);
                             const char* ev = cg_reg();
-                            if (vt->kind == TY_CLASS) cg_emit("%s = call ptr @turbo_exc_obj()", ev);
-                            else cg_emit("%s = call ptr @turbo_exc_msg()", ev);
+                            if (vt->kind == TY_CLASS) cg_emit("%s = call ptr @stricta_exc_obj()", ev);
+                            else cg_emit("%s = call ptr @stricta_exc_msg()", ev);
                             cg_emit("store ptr %s, ptr %s", ev, vp);
                         }
                         cg_stmts(eh->body, eh->body_count);
@@ -8551,7 +8551,7 @@ static void cg_stmts(Stmt** stmts, int count) {
                         cg_label(l_nxt);
                     }
                     if (l_fin) cg_stmts(s->try_s.finally_body, s->try_s.finally_count);
-                    cg_emit("call void @turbo_reraise()");
+                    cg_emit("call void @stricta_reraise()");
                     cg_emit("unreachable");
                     g_cg.block_terminated = true;
                 }
@@ -8581,15 +8581,15 @@ static void cg_stmts(Stmt** stmts, int count) {
                 }
                 const char* jbuf = cg_reg(); const char* sj = cg_reg(); const char* ok = cg_reg();
                 const char* l_ok = cg_lbl("w_ok"); const char* l_ex = cg_lbl("w_ex"); const char* l_end = cg_lbl("w_end");
-                cg_emit("%s = call ptr @turbo_try_push()", jbuf);
+                cg_emit("%s = call ptr @stricta_try_push()", jbuf);
                 cg_emit("%s = call i32 @setjmp(ptr %s) returns_twice", sj, jbuf);
                 cg_emit("%s = icmp eq i32 %s, 0", ok, sj);
                 cg_cond_br(ok, l_ok, l_ex);
                 cg_label(l_ok);
                 cg_stmts(s->with_s.body, s->with_s.body_count);
-                cg_emit("call void @turbo_try_pop()");
+                cg_emit("call void @stricta_try_pop()");
                 if (ct->kind == TY_FILE) {
-                    cg_emit("call void @turbo_file_close(ptr %s)", cv);
+                    cg_emit("call void @stricta_file_close(ptr %s)", cv);
                 } else if (ct->kind == TY_CLASS) {
                     FuncInfo* ex = find_method_in_class(ct->cls, "__exit__");
                     if (ex) {
@@ -8603,10 +8603,10 @@ static void cg_stmts(Stmt** stmts, int count) {
                 }
                 cg_br(l_end);
                 cg_label(l_ex);
-                cg_emit("call void @turbo_try_pop()");
+                cg_emit("call void @stricta_try_pop()");
                 if (ct->kind == TY_FILE) {
-                    cg_emit("call void @turbo_file_close(ptr %s)", cv);
-                    cg_emit("call void @turbo_reraise()");
+                    cg_emit("call void @stricta_file_close(ptr %s)", cv);
+                    cg_emit("call void @stricta_reraise()");
                     cg_emit("unreachable");
                 } else if (ct->kind == TY_CLASS) {
                     FuncInfo* ex = find_method_in_class(ct->cls, "__exit__");
@@ -8621,7 +8621,7 @@ static void cg_stmts(Stmt** stmts, int count) {
                         cg_cond_br(sup, l_end, l_rr);
                         cg_label(l_rr);
                     }
-                    cg_emit("call void @turbo_reraise()");
+                    cg_emit("call void @stricta_reraise()");
                     cg_emit("unreachable");
                 }
                 cg_label(l_end);
@@ -8759,90 +8759,90 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
     cg_init();
 
     /* Header: external runtime declarations & core structs */
-    sb_append(&g_cg.hdr, "; Turbo Static LLVM IR Compiler Output\n\n");
-    sb_append(&g_cg.hdr, "%TurboStr = type { i32, i32, ptr }\n");
-    sb_append(&g_cg.hdr, "%TurboBytes = type { i32, i32, ptr }\n");
-    sb_append(&g_cg.hdr, "@turbo_sys_argv = external global ptr\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_init_args(i32, ptr)\n");
+    sb_append(&g_cg.hdr, "; Stricta Static LLVM IR Compiler Output\n\n");
+    sb_append(&g_cg.hdr, "%StrictaStr = type { i32, i32, ptr }\n");
+    sb_append(&g_cg.hdr, "%StrictaBytes = type { i32, i32, ptr }\n");
+    sb_append(&g_cg.hdr, "@stricta_sys_argv = external global ptr\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_init_args(i32, ptr)\n");
     sb_append(&g_cg.hdr, "declare noalias ptr @malloc(i64)\n");
     sb_append(&g_cg.hdr, "declare noalias ptr @calloc(i64, i64)\n");
     sb_append(&g_cg.hdr, "declare ptr @realloc(ptr, i64)\n");
     sb_append(&g_cg.hdr, "declare void @free(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_alloc(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_calloc(i64, i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_realloc(ptr, i64)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_free(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_try_push()\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_try_pop()\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_alloc(i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_calloc(i64, i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_realloc(ptr, i64)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_free(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_try_push()\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_try_pop()\n");
     sb_append(&g_cg.hdr, "declare i32 @setjmp(ptr) returns_twice\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_raise(i32, ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_reraise()\n");
-    sb_append(&g_cg.hdr, "declare i32 @turbo_exc_type_id()\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_exc_obj()\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_exc_msg()\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_assert_fail(ptr, ptr, i32)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_concat(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_repeat(ptr, i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_slice(ptr, i64, i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_char_at(ptr, i64)\n");
-    sb_append(&g_cg.hdr, "declare i32 @turbo_str_eq(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @turbo_str_cmp(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @turbo_str_hash(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @turbo_str_contains(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_split(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_join(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_upper(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_lower(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_replace(ptr, ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @turbo_str_find(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @turbo_str_index(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_strip(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_lstrip(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_str_rstrip(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @turbo_str_startswith(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @turbo_str_endswith(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @turbo_str_count(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_int_to_str(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_uint_to_str(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_float_to_str(double)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_float_fmt(double, i32)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bool_to_str(i32)\n");
-    sb_append(&g_cg.hdr, "declare i64 @turbo_str_to_int(ptr)\n");
-    sb_append(&g_cg.hdr, "declare double @turbo_str_to_float(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @turbo_ord(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_chr(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_hex(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bin(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_oct(i64)\n");
-    sb_append(&g_cg.hdr, "declare i64 @turbo_pow_i64(i64, i64)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_raise(i32, ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_reraise()\n");
+    sb_append(&g_cg.hdr, "declare i32 @stricta_exc_type_id()\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_exc_obj()\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_exc_msg()\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_assert_fail(ptr, ptr, i32)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_concat(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_repeat(ptr, i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_slice(ptr, i64, i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_char_at(ptr, i64)\n");
+    sb_append(&g_cg.hdr, "declare i32 @stricta_str_eq(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare i32 @stricta_str_cmp(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare i64 @stricta_str_hash(ptr)\n");
+    sb_append(&g_cg.hdr, "declare i32 @stricta_str_contains(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_split(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_join(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_upper(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_lower(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_replace(ptr, ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare i64 @stricta_str_find(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare i64 @stricta_str_index(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_strip(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_lstrip(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_str_rstrip(ptr)\n");
+    sb_append(&g_cg.hdr, "declare i32 @stricta_str_startswith(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare i32 @stricta_str_endswith(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare i64 @stricta_str_count(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_int_to_str(i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_uint_to_str(i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_float_to_str(double)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_float_fmt(double, i32)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bool_to_str(i32)\n");
+    sb_append(&g_cg.hdr, "declare i64 @stricta_str_to_int(ptr)\n");
+    sb_append(&g_cg.hdr, "declare double @stricta_str_to_float(ptr)\n");
+    sb_append(&g_cg.hdr, "declare i64 @stricta_ord(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_chr(i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_hex(i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bin(i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_oct(i64)\n");
+    sb_append(&g_cg.hdr, "declare i64 @stricta_pow_i64(i64, i64)\n");
     sb_append(&g_cg.hdr, "declare double @pow(double, double)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bytes_new(ptr, i32)\n");
-    sb_append(&g_cg.hdr, "declare i32 @turbo_bytes_eq(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_from_str(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_from_i64(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_add(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_sub(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_mul(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_div(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_mod(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_pow(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_neg(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_abs(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @turbo_bigint_cmp(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_bigint_to_str(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_open(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_file_read(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_file_write(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_file_close(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_print_i64(i64)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_print_u64(i64)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_print_f64(double)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_print_bool(i32)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_print_str(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_print_cstr(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_print_space()\n");
-    sb_append(&g_cg.hdr, "declare void @turbo_print_newline()\n");
-    sb_append(&g_cg.hdr, "declare ptr @turbo_input(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bytes_new(ptr, i32)\n");
+    sb_append(&g_cg.hdr, "declare i32 @stricta_bytes_eq(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_from_str(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_from_i64(i64)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_add(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_sub(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_mul(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_div(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_mod(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_pow(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_neg(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_abs(ptr)\n");
+    sb_append(&g_cg.hdr, "declare i32 @stricta_bigint_cmp(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_to_str(ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_open(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_file_read(ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_file_write(ptr, ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_file_close(ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_print_i64(i64)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_print_u64(i64)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_print_f64(double)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_print_bool(i32)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_print_str(ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_print_cstr(ptr)\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_print_space()\n");
+    sb_append(&g_cg.hdr, "declare void @stricta_print_newline()\n");
+    sb_append(&g_cg.hdr, "declare ptr @stricta_input(ptr)\n");
     sb_append(&g_cg.hdr, "declare i32 @llvm.smax.i32(i32, i32)\n");
     sb_append(&g_cg.hdr, "declare i32 @llvm.smin.i32(i32, i32)\n");
     sb_append(&g_cg.hdr, "declare i64 @llvm.smax.i64(i64, i64)\n");
@@ -8948,7 +8948,7 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
         sb_append(&g_cg.funcs, "  ret void\n}\n\n");
     }
 
-    /* Emit @turbo_main for main_mod */
+    /* Emit @stricta_main for main_mod */
     g_cg.cur_fn = NULL;
     g_cg.cur_mod = main_mod;
     g_cg.in_func = false;
@@ -8990,14 +8990,14 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
         }
     }
     cg_stmts(main_mod->stmts, main_mod->stmt_count);
-    sb_append(&g_cg.funcs, "define void @turbo_main() {\nentry:\n");
+    sb_append(&g_cg.funcs, "define void @stricta_main() {\nentry:\n");
     sb_append_n(&g_cg.funcs, g_cg.cur_entry.data, g_cg.cur_entry.len);
     sb_append_n(&g_cg.funcs, g_cg.cur_body.data, g_cg.cur_body.len);
     sb_append(&g_cg.funcs, "  ret void\n}\n\n");
 
     sb_append(&g_cg.funcs, "define i32 @main(i32 %argc, ptr %argv) {\nentry:\n");
-    sb_append(&g_cg.funcs, "  call void @turbo_init_args(i32 %argc, ptr %argv)\n");
-    sb_append(&g_cg.funcs, "  call void @turbo_main()\n");
+    sb_append(&g_cg.funcs, "  call void @stricta_init_args(i32 %argc, ptr %argv)\n");
+    sb_append(&g_cg.funcs, "  call void @stricta_main()\n");
     sb_append(&g_cg.funcs, "  ret i32 0\n}\n");
 
     /* Now emit all registered monomorphized container struct types & helper functions (after all codegen discoveries!) */
@@ -9087,7 +9087,7 @@ static bool find_runtime_c(const char* argv0, char* out_buf, size_t cap) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <input.turbo> [-o <output>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input.str> [-o <output>]\n", argv[0]);
         return 1;
     }
     const char* input_file = argv[1];
@@ -9101,7 +9101,7 @@ int main(int argc, char** argv) {
         static char def_out[1024];
         snprintf(def_out, sizeof(def_out), "%s", input_file);
         char* dot = strrchr(def_out, '.');
-        if (dot && strcmp(dot, ".turbo") == 0) *dot = '\0';
+        if (dot && strcmp(dot, ".str") == 0) *dot = '\0';
         else strcat(def_out, ".out");
         output_file = def_out;
     }
@@ -9148,7 +9148,7 @@ int main(int argc, char** argv) {
     }
 
     char tmp_ll[1024];
-    snprintf(tmp_ll, sizeof(tmp_ll), "/tmp/turbo_%d.ll", (int)getpid());
+    snprintf(tmp_ll, sizeof(tmp_ll), "/tmp/stricta_%d.ll", (int)getpid());
     FILE* f = fopen(tmp_ll, "wb");
     if (!f) { fprintf(stderr, "error: cannot write temp '%s'\n", tmp_ll); return 1; }
     fwrite(ir.data, 1, ir.len, f);
