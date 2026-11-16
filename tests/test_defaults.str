@@ -1,0 +1,43 @@
+BASE = 10
+
+def add_offset(x: int, offset = BASE) -> int:
+    return x + offset
+
+def greet(name = "Stricta", times = 2) -> str:
+    def helper(prefix = "hi ") -> str:
+        return prefix + name
+    res = ""
+    for i in range(times):
+        res = res + helper()
+        if i + 1 < times:
+            res = res + ", "
+    return res
+
+class Counter:
+    value: int
+
+    def __init__(self, start = 5):
+        self.value = start
+
+    def inc(self, step = 1) -> int:
+        self.value = self.value + step
+        return self.value
+
+    @staticmethod
+    def scale(n = 3, factor = 2.5) -> float:
+        return float(n) * factor
+
+assert add_offset(5) == 15
+assert add_offset(5, 20) == 25
+assert greet() == "hi Stricta, hi Stricta"
+assert greet("World", 1) == "hi World"
+
+c1 = Counter()
+assert c1.value == 5
+assert c1.inc() == 6
+assert c1.inc(4) == 10
+
+c2 = Counter(100)
+assert c2.value == 100
+assert Counter.scale() == 7.5
+assert Counter.scale(4, 1.5) == 6.0

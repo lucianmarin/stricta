@@ -64,3 +64,5 @@ Benchmark suite (`perf/*.str`) comparing Python 3.14, Stricta (`stricta.c` → L
 | `tree_structures` | 281.98 | **25.96** | 18.63 | **10.9×** | 0.72× |
 
 *\*Note: `perf/matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (`10.66 ms`). Stricta executes the full loop-interchanged 512×512 multiplication in `47.19 ms` (216.4× faster than Python 3).*
+
+See [SPEC.md](SPEC.md) for the full language specification.

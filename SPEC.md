@@ -27,7 +27,7 @@ Stricta enforces strict static types on all bindings, parameters, fields, and co
 - `Callable[[ArgTypes...], RetType]`: Typed function pointer.
 
 ### 1.3 Strict Typing & Inference Rules
-- Function parameters (except `self` and `cls`) require explicit type annotations: `def add(a: int, b: int) -> int:`.
+- Function parameters (except `self`, `cls`, and parameters with a concrete default value like `def f(x = 0) -> int:`) require explicit type annotations: `def add(a: int, b: int) -> int:`. Parameters with default `None`, `[]`, `{}`, or `set()` still require an explicit annotation (`x: T | None = None`).
 - Functions without `-> RetType` default to `-> None`; returning a value from a `-> None` function is a compile-time error.
 - Local variables infer their static type deterministically from non-ambiguous initializers (`x = 10` → `int`, `v = Vec2D(1, 2)` → `Vec2D`), or use explicit annotations (`x: list[int] = []`, `root: BSTNode | None = None`).
 - Empty `[]`, `{}`, `set()`, and bare `None` without an explicit annotation or contextual target type are rejected at compile time with `file:line:col: error: ...`.

@@ -3670,6 +3670,30 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
     return res;
 }
 
+static Type* resolve_param_type(ModuleInfo* mod, FuncInfo* ctx_fn, Param* pr, const char* fn_desc) {
+    if (pr->type_ann) {
+        Type* pt = resolve_type_expr(mod, pr->type_ann);
+        if (pr->default_val) {
+            Type* dt = check_expr(mod, ctx_fn, pr->default_val, pt);
+            if (!type_assignable(pt, dt)) {
+                error_at(pr->loc, "default value for parameter '%s' of %s has type '%s', expected '%s'",
+                         pr->name, fn_desc, type_str(dt), type_str(pt));
+            }
+        }
+        return pt;
+    }
+    if (pr->default_val) {
+        Type* dt = check_expr(mod, ctx_fn, pr->default_val, NULL);
+        if (!dt || dt->kind == TY_NONE_LIT) {
+            error_at(pr->loc, "parameter '%s' of %s with default None requires a type annotation (e.g. '%s: T | None = None')",
+                     pr->name, fn_desc, pr->name);
+        }
+        return dt;
+    }
+    error_at(pr->loc, "parameter '%s' of %s requires a type annotation or default value", pr->name, fn_desc);
+    return NULL;
+}
+
 static void register_nested_func(ModuleInfo* mod, FuncInfo* parent, Stmt* s) {
     FuncInfo* nf = (FuncInfo*)arena_alloc(sizeof(FuncInfo));
     nf->name = s->def_s.name;
@@ -3681,11 +3705,11 @@ static void register_nested_func(ModuleInfo* mod, FuncInfo* parent, Stmt* s) {
     nf->param_names = nf->param_count ? (const char**)arena_alloc(sizeof(char*) * (size_t)nf->param_count) : NULL;
     nf->param_types = nf->param_count ? (Type**)arena_alloc(sizeof(Type*) * (size_t)nf->param_count) : NULL;
     nf->param_defaults = nf->param_count ? (Expr**)arena_alloc(sizeof(Expr*) * (size_t)nf->param_count) : NULL;
+    const char* fdesc = arena_sprintf("'%s'", nf->name);
     for (int i = 0; i < nf->param_count; i++) {
         Param* p = &s->def_s.params[i];
-        if (!p->type_ann) error_at(p->loc, "parameter '%s' of '%s' requires a type annotation", p->name, nf->name);
         nf->param_names[i] = p->name;
-        nf->param_types[i] = resolve_type_expr(mod, p->type_ann);
+        nf->param_types[i] = resolve_param_type(mod, parent, p, fdesc);
         nf->param_defaults[i] = p->default_val;
         add_local_in_fn(nf, p->name, nf->param_types[i], true, p->loc);
     }
@@ -4190,6 +4214,7 @@ static void analyze_module(ModuleInfo* mod) {
                 mf->param_names = mf->param_count ? (const char**)arena_alloc(sizeof(char*) * (size_t)mf->param_count) : NULL;
                 mf->param_types = mf->param_count ? (Type**)arena_alloc(sizeof(Type*) * (size_t)mf->param_count) : NULL;
                 mf->param_defaults = mf->param_count ? (Expr**)arena_alloc(sizeof(Expr*) * (size_t)mf->param_count) : NULL;
+                const char* mdesc = arena_sprintf("'%s.%s'", cls->name, mf->name);
                 for (int p = 0; p < mf->param_count; p++) {
                     Param* pr = &bs->def_s.params[p];
                     mf->param_names[p] = pr->name;
@@ -4197,8 +4222,7 @@ static void analyze_module(ModuleInfo* mod) {
                     if (p == 0 && !mf->is_static) {
                         mf->param_types[p] = cls->type;
                     } else {
-                        if (!pr->type_ann) error_at(pr->loc, "parameter '%s' of '%s.%s' requires type annotation", pr->name, cls->name, mf->name);
-                        mf->param_types[p] = resolve_type_expr(mod, pr->type_ann);
+                        mf->param_types[p] = resolve_param_type(mod, NULL, pr, mdesc);
                     }
                     add_local_in_fn(mf, pr->name, mf->param_types[p], true, pr->loc);
                 }
@@ -4283,36 +4307,6 @@ static void analyze_module(ModuleInfo* mod) {
 
     for (int i = 0; i < mod->stmt_count; i++) {
         Stmt* s = mod->stmts[i];
-        if (s->kind == STMT_DEF) {
-            FuncInfo* fn = (FuncInfo*)arena_alloc(sizeof(FuncInfo));
-            fn->name = s->def_s.name;
-            fn->llvm_name = arena_sprintf("@%s%s", mod->prefix, fn->name);
-            fn->mod = mod;
-            fn->ast = s;
-            fn->param_count = s->def_s.param_count;
-            fn->param_names = fn->param_count ? (const char**)arena_alloc(sizeof(char*) * (size_t)fn->param_count) : NULL;
-            fn->param_types = fn->param_count ? (Type**)arena_alloc(sizeof(Type*) * (size_t)fn->param_count) : NULL;
-            fn->param_defaults = fn->param_count ? (Expr**)arena_alloc(sizeof(Expr*) * (size_t)fn->param_count) : NULL;
-            for (int p = 0; p < fn->param_count; p++) {
-                Param* pr = &s->def_s.params[p];
-                if (!pr->type_ann) error_at(pr->loc, "parameter '%s' of '%s()' requires a type annotation", pr->name, fn->name);
-                fn->param_names[p] = pr->name;
-                fn->param_types[p] = resolve_type_expr(mod, pr->type_ann);
-                fn->param_defaults[p] = pr->default_val;
-                add_local_in_fn(fn, pr->name, fn->param_types[p], true, pr->loc);
-            }
-            fn->ret_type = s->def_s.ret_type ? resolve_type_expr(mod, s->def_s.ret_type) : g_ty_void;
-            fn->type = make_func_type(fn->param_types, fn->param_count, fn->ret_type);
-            fn->is_generator = stmt_has_yield(s->def_s.body, s->def_s.body_count);
-            mod->funcs = (FuncInfo**)realloc(mod->funcs, sizeof(FuncInfo*) * (size_t)(mod->func_count + 1));
-            mod->funcs[mod->func_count++] = fn;
-            g_all_funcs = (FuncInfo**)realloc(g_all_funcs, sizeof(FuncInfo*) * (size_t)(g_all_func_count + 1));
-            g_all_funcs[g_all_func_count++] = fn;
-        }
-    }
-
-    for (int i = 0; i < mod->stmt_count; i++) {
-        Stmt* s = mod->stmts[i];
         if (s->kind == STMT_ASSIGN && s->assign.target->kind == EXPR_VAR) {
             if (s->assign.type_ann) {
                 Type* gt = resolve_type_expr(mod, s->assign.type_ann);
@@ -4323,6 +4317,42 @@ static void analyze_module(ModuleInfo* mod) {
                 add_global_in_mod(mod, s->assign.target->var.name, gt, s->loc);
             }
         }
+    }
+
+    int mod_fn_start = mod->func_count;
+    for (int i = 0; i < mod->stmt_count; i++) {
+        Stmt* s = mod->stmts[i];
+        if (s->kind == STMT_DEF) {
+            FuncInfo* fn = (FuncInfo*)arena_alloc(sizeof(FuncInfo));
+            fn->name = s->def_s.name;
+            fn->llvm_name = arena_sprintf("@%s%s", mod->prefix, fn->name);
+            fn->mod = mod;
+            fn->ast = s;
+            fn->param_count = s->def_s.param_count;
+            fn->param_names = fn->param_count ? (const char**)arena_alloc(sizeof(char*) * (size_t)fn->param_count) : NULL;
+            fn->param_types = fn->param_count ? (Type**)arena_alloc(sizeof(Type*) * (size_t)fn->param_count) : NULL;
+            fn->param_defaults = fn->param_count ? (Expr**)arena_alloc(sizeof(Expr*) * (size_t)fn->param_count) : NULL;
+            fn->ret_type = s->def_s.ret_type ? resolve_type_expr(mod, s->def_s.ret_type) : g_ty_void;
+            fn->is_generator = stmt_has_yield(s->def_s.body, s->def_s.body_count);
+            mod->funcs = (FuncInfo**)realloc(mod->funcs, sizeof(FuncInfo*) * (size_t)(mod->func_count + 1));
+            mod->funcs[mod->func_count++] = fn;
+            g_all_funcs = (FuncInfo**)realloc(g_all_funcs, sizeof(FuncInfo*) * (size_t)(g_all_func_count + 1));
+            g_all_funcs[g_all_func_count++] = fn;
+        }
+    }
+
+    for (int i = mod_fn_start; i < mod->func_count; i++) {
+        FuncInfo* fn = mod->funcs[i];
+        Stmt* s = fn->ast;
+        const char* fdesc = arena_sprintf("'%s()'", fn->name);
+        for (int p = 0; p < fn->param_count; p++) {
+            Param* pr = &s->def_s.params[p];
+            fn->param_names[p] = pr->name;
+            fn->param_types[p] = resolve_param_type(mod, NULL, pr, fdesc);
+            fn->param_defaults[p] = pr->default_val;
+            add_local_in_fn(fn, pr->name, fn->param_types[p], true, pr->loc);
+        }
+        fn->type = make_func_type(fn->param_types, fn->param_count, fn->ret_type);
     }
 
     for (int i = 0; i < mod->class_count; i++) {
