@@ -1,6 +1,6 @@
 # Stricta Language Specification
 
-Stricta is a **superstrict compiled version of Python** (`.str` file extension). It uses Python syntax while enforcing strict ahead-of-time static typing with zero dynamic fallback. The single-file C11 compiler (`stricta.c`) lexes, parses, type-checks, and lowers `.str` programs directly to LLVM IR (`.ll`), which `clang -O2` compiles and links with the lean C runtime (`runtime.c`) into native executables.
+Stricta is a **strict, safe, compiled version of Python** (`.str` file extension). It uses Python syntax while enforcing strict ahead-of-time static typing and compile-time memory safety with zero dynamic fallback. The single-file C11 compiler (`stricta.c`) lexes, parses, type-checks, and lowers `.str` programs directly to LLVM IR (`.ll`), which `clang -O2` compiles and links with the lean C runtime (`runtime.c`) into native executables.
 
 ---
 
