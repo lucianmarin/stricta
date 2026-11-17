@@ -14,6 +14,7 @@ Implementation status of Python features in Stricta (`stricta.c` + `runtime.c`).
 - [ ] `frozenset` — immutable hash sets
 - [x] `bigint` — arbitrary-precision integers
 - [x] `T | None` (`Optional[T]`) & `Callable[[...], Ret]`
+- [x] `ref[T]`, `mut_ref[T]` / `ref[mut T]`, `addr[T]` — safe references and raw pointers with `.ref`, `.mut_ref`, `.addr`, `val()`, unified `.` access, and borrow-checker enforcement
 
 ## Control Flow
 
@@ -68,7 +69,7 @@ Implementation status of Python features in Stricta (`stricta.c` + `runtime.c`).
 
 ## Built-in Functions
 
-- [x] `print`, `len`, `str`, `repr`, `int` (`i8`–`i64`, `u8`–`u64`), `float` (`f32`, `f64`), `bool`, `bigint`
+- [x] `print`, `len`, `str`, `repr`, `int` (`i8`–`i64`, `u8`–`u64`), `float` (`f32`, `f64`), `bool`, `bigint`, `val`
 - [x] `ord`, `chr`, `hex`, `bin`, `oct`, `abs`, `round`, `pow`
 - [x] `sum`, `min`, `max`, `all`, `any`, `sorted(..., key=...)`, `reversed`
 - [x] `map`, `filter`, `enumerate`, `zip` (2 iterables), `range`

@@ -555,6 +555,7 @@ struct Expr {
     bool is_nonneg;
     bool is_inbounds;
     bool is_move;
+    bool is_ptr_take;
     union {
         struct { const char* raw; int64_t ival; uint64_t uval; bool is_big; } int_lit;
         struct { double fval; } float_lit;
@@ -733,6 +734,15 @@ static TypeExpr* parse_type_atom(Parser* ps) {
         name = arena_sprintf("%s.%s", name, sub->text);
     }
     if (p_match(ps, TOK_LBRACK)) {
+        if ((strcmp(name, "ref") == 0 || strcmp(name, "addr") == 0) &&
+            p_check(ps, TOK_NAME) &&
+            (strcmp(p_peek(ps)->text, "mut") == 0 || strcmp(p_peek(ps)->text, "const") == 0)) {
+            TokKind nk = (ps->pos + 1 < ps->count) ? ps->toks[ps->pos + 1].kind : TOK_EOF;
+            if (nk != TOK_RBRACK && nk != TOK_COMMA && nk != TOK_PIPE) {
+                Token* mod_tok = p_consume(ps, TOK_NAME);
+                if (strcmp(name, "ref") == 0 && strcmp(mod_tok->text, "mut") == 0) name = "mut_ref";
+            }
+        }
         te->kind = TEXPR_GENERIC;
         te->name = name;
         TypeExpr** arr = NULL; int cnt = 0, cap = 0;
@@ -1959,6 +1969,9 @@ typedef enum {
     TY_DICT,
     TY_TUPLE,
     TY_TASK,
+    TY_REF,
+    TY_MUT_REF,
+    TY_ADDR,
     TY_CLASS,
     TY_FUNC,
     TY_MODULE
@@ -2217,10 +2230,48 @@ static bool type_is_unsigned_int(Type* t) { return t && (t->kind >= TY_U8 && t->
 static bool type_is_int(Type* t) { return type_is_signed_int(t) || type_is_unsigned_int(t); }
 static bool type_is_float(Type* t) { return t && (t->kind == TY_F32 || t->kind == TY_F64); }
 static bool type_is_numeric(Type* t) { return type_is_int(t) || type_is_float(t); }
+static bool type_is_ptr(Type* t) {
+    return t && (t->kind == TY_REF || t->kind == TY_MUT_REF || t->kind == TY_ADDR);
+}
+
+static Type* type_deref_all(Type* t) {
+    while (type_is_ptr(t)) t = t->elem;
+    return t;
+}
+
+static bool type_ptr_is_const(Type* t) {
+    while (type_is_ptr(t)) {
+        if (t->kind == TY_REF) return true;
+        t = t->elem;
+    }
+    return false;
+}
+
+static bool type_has_ref_d(Type* t, int depth) {
+    if (!t || depth > 16) return false;
+    if (t->kind == TY_REF || t->kind == TY_MUT_REF) return true;
+    if (t->kind == TY_OPTIONAL || t->kind == TY_LIST || t->kind == TY_SET ||
+        t->kind == TY_TASK || t->kind == TY_ADDR) {
+        return type_has_ref_d(t->elem, depth + 1);
+    }
+    if (t->kind == TY_DICT) return type_has_ref_d(t->key, depth + 1) || type_has_ref_d(t->val, depth + 1);
+    if (t->kind == TY_TUPLE) {
+        for (int i = 0; i < t->tuple_count; i++) {
+            if (type_has_ref_d(t->tuple_elems[i], depth + 1)) return true;
+        }
+    }
+    return false;
+}
+
+static bool type_has_ref(Type* t) {
+    return type_has_ref_d(t, 0);
+}
+
 static bool type_is_heap_ref(Type* t) {
     if (!t) return false;
     if (t->kind == TY_STR || t->kind == TY_BYTES || t->kind == TY_BIGINT || t->kind == TY_FILE ||
         t->kind == TY_LIST || t->kind == TY_SET || t->kind == TY_DICT || t->kind == TY_TASK ||
+        t->kind == TY_REF || t->kind == TY_MUT_REF || t->kind == TY_ADDR ||
         t->kind == TY_FUNC) return true;
     if (t->kind == TY_CLASS) return !t->cls->is_value_type;
     if (t->kind == TY_OPTIONAL) return type_is_heap_ref(t->elem);
@@ -2263,6 +2314,9 @@ static bool type_eq(Type* a, Type* b) {
         case TY_LIST:
         case TY_SET:
         case TY_TASK:
+        case TY_REF:
+        case TY_MUT_REF:
+        case TY_ADDR:
             return type_eq(a->elem, b->elem);
         case TY_DICT:
             return type_eq(a->key, b->key) && type_eq(a->val, b->val);
@@ -2311,6 +2365,9 @@ static const char* type_str(Type* t) {
         case TY_LIST: return arena_sprintf("list[%s]", type_str(t->elem));
         case TY_SET: return arena_sprintf("set[%s]", type_str(t->elem));
         case TY_TASK: return arena_sprintf("Task[%s]", type_str(t->elem));
+        case TY_REF: return arena_sprintf("ref[%s]", type_str(t->elem));
+        case TY_MUT_REF: return arena_sprintf("mut_ref[%s]", type_str(t->elem));
+        case TY_ADDR: return arena_sprintf("addr[%s]", type_str(t->elem));
         case TY_DICT: return arena_sprintf("dict[%s, %s]", type_str(t->key), type_str(t->val));
         case TY_TUPLE: {
             StrBuf sb; sb_init(&sb);
@@ -2393,6 +2450,30 @@ static Type* make_task_type(Type* elem) {
     return intern_type(t);
 }
 
+static Type* make_ref_type(Type* elem) {
+    Type* t = (Type*)arena_alloc(sizeof(Type));
+    t->kind = TY_REF;
+    t->elem = elem;
+    t->mangled = arena_sprintf("Ref_%s", elem->mangled);
+    return intern_type(t);
+}
+
+static Type* make_mut_ref_type(Type* elem) {
+    Type* t = (Type*)arena_alloc(sizeof(Type));
+    t->kind = TY_MUT_REF;
+    t->elem = elem;
+    t->mangled = arena_sprintf("MutRef_%s", elem->mangled);
+    return intern_type(t);
+}
+
+static Type* make_addr_type(Type* elem) {
+    Type* t = (Type*)arena_alloc(sizeof(Type));
+    t->kind = TY_ADDR;
+    t->elem = elem;
+    t->mangled = arena_sprintf("Addr_%s", elem->mangled);
+    return intern_type(t);
+}
+
 static Type* make_dict_type(Type* key, Type* val) {
     Type* t = (Type*)arena_alloc(sizeof(Type));
     t->kind = TY_DICT;
@@ -2449,6 +2530,9 @@ static bool type_assignable(Type* dst, Type* src) {
         if (src->kind == TY_NONE_LIT || src->kind == TY_VOID) return true;
         return type_assignable(dst->elem, src);
     }
+    if (dst->kind == TY_REF && src->kind == TY_MUT_REF && type_eq(dst->elem, src->elem)) return true;
+    if (dst->kind == TY_ADDR && (src->kind == TY_REF || src->kind == TY_MUT_REF || src->kind == TY_ADDR) &&
+        type_eq(dst->elem, src->elem)) return true;
     if (dst->kind == TY_CLASS && src->kind == TY_CLASS) {
         return class_is_subclass(src->cls, dst->cls);
     }
@@ -2626,19 +2710,38 @@ static Type* resolve_type_expr(ModuleInfo* mod, TypeExpr* te) {
         const char* n = te->name;
         if (strcmp(n, "list") == 0 || strcmp(n, "List") == 0) {
             if (te->arg_count != 1) error_at(te->loc, "list[...] requires 1 type argument");
-            return make_list_type(resolve_type_expr(mod, te->args[0]));
+            Type* el = resolve_type_expr(mod, te->args[0]);
+            if (type_has_ref(el)) error_at(te->loc, "cannot store borrowed reference '%s' in list; use 'addr[...]' for raw pointers", type_str(el));
+            return make_list_type(el);
         }
         if (strcmp(n, "set") == 0 || strcmp(n, "Set") == 0) {
             if (te->arg_count != 1) error_at(te->loc, "set[...] requires 1 type argument");
-            return make_set_type(resolve_type_expr(mod, te->args[0]));
+            Type* el = resolve_type_expr(mod, te->args[0]);
+            if (type_has_ref(el)) error_at(te->loc, "cannot store borrowed reference '%s' in set; use 'addr[...]' for raw pointers", type_str(el));
+            return make_set_type(el);
         }
         if (strcmp(n, "Task") == 0) {
             if (te->arg_count != 1) error_at(te->loc, "Task[...] requires 1 type argument");
             return make_task_type(resolve_type_expr(mod, te->args[0]));
         }
+        if (strcmp(n, "ref") == 0) {
+            if (te->arg_count != 1) error_at(te->loc, "ref[T] requires 1 type argument");
+            return make_ref_type(resolve_type_expr(mod, te->args[0]));
+        }
+        if (strcmp(n, "mut_ref") == 0) {
+            if (te->arg_count != 1) error_at(te->loc, "mut_ref[T] requires 1 type argument");
+            return make_mut_ref_type(resolve_type_expr(mod, te->args[0]));
+        }
+        if (strcmp(n, "addr") == 0) {
+            if (te->arg_count != 1) error_at(te->loc, "addr[T] requires 1 type argument");
+            return make_addr_type(resolve_type_expr(mod, te->args[0]));
+        }
         if (strcmp(n, "dict") == 0 || strcmp(n, "Dict") == 0) {
             if (te->arg_count != 2) error_at(te->loc, "dict[K, V] requires 2 type arguments");
-            return make_dict_type(resolve_type_expr(mod, te->args[0]), resolve_type_expr(mod, te->args[1]));
+            Type* kt = resolve_type_expr(mod, te->args[0]);
+            Type* vt = resolve_type_expr(mod, te->args[1]);
+            if (type_has_ref(kt) || type_has_ref(vt)) error_at(te->loc, "cannot store borrowed reference in dict; use 'addr[...]' for raw pointers");
+            return make_dict_type(kt, vt);
         }
         if (strcmp(n, "Optional") == 0) {
             if (te->arg_count != 1) error_at(te->loc, "Optional[T] requires 1 type argument");
@@ -3207,7 +3310,7 @@ static bool is_builtin_fn_name(const char* n) {
         "abs", "round", "pow", "hex", "bin", "oct", "min", "max", "sum",
         "all", "any", "sorted", "reversed", "enumerate", "zip", "range",
         "open", "input", "isinstance", "list", "set", "dict", "tuple",
-        "iter", "next", "super", "map", "filter", "bigint",
+        "iter", "next", "super", "map", "filter", "bigint", "val",
         "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
         NULL
     };
@@ -3215,6 +3318,93 @@ static bool is_builtin_fn_name(const char* n) {
         if (strcmp(n, builtins[i]) == 0) return true;
     }
     return false;
+}
+
+static bool expr_is_ptr_attr(const char* an) {
+    return an && (strcmp(an, "ref") == 0 || strcmp(an, "mut_ref") == 0 || strcmp(an, "addr") == 0);
+}
+
+static bool is_val_builtin_call(ModuleInfo* mod, FuncInfo* fn, Expr* e) {
+    if (!e || e->kind != EXPR_CALL || !e->call.callee || e->call.callee->kind != EXPR_VAR) return false;
+    if (strcmp(e->call.callee->var.name, "val") != 0) return false;
+    if (fn) {
+        for (int i = 0; i < g_all_func_count; i++) {
+            if (g_all_funcs[i]->parent_fn == fn && strcmp(g_all_funcs[i]->name, "val") == 0) return false;
+        }
+    }
+    if (mod && find_func_in_mod(mod, "val")) return false;
+    return true;
+}
+
+static bool expr_is_addressable(ModuleInfo* mod, FuncInfo* fn, Expr* e) {
+    if (!e) return false;
+    if (e->kind == EXPR_VAR) {
+        if (resolve_var(mod, fn, e->var.name, NULL) != NULL) return true;
+        if (strcmp(e->var.name, "self") == 0 && fn && fn->owner_cls && !fn->is_static) return true;
+        return false;
+    }
+    if (e->kind == EXPR_ATTR) {
+        if (e->is_ptr_take) return false;
+        Type* ot = e->attr.obj ? e->attr.obj->ty : NULL;
+        if (!ot) return false;
+        if (ot->kind == TY_MODULE) return find_global_in_mod(ot->mod, e->attr.attr) != NULL;
+        Type* base = type_deref_all(ot);
+        if (base->kind == TY_CLASS) {
+            if (find_field_in_class(base->cls, e->attr.attr) != NULL) {
+                if (!type_is_ptr(ot) && base->cls->is_value_type) {
+                    return expr_is_addressable(mod, fn, e->attr.obj);
+                }
+                return true;
+            }
+            return find_class_attr(base->cls, e->attr.attr) != NULL;
+        }
+        return false;
+    }
+    if (e->kind == EXPR_INDEX) {
+        Type* ot = e->index.obj ? type_deref_all(e->index.obj->ty) : NULL;
+        return ot && ot->kind == TY_LIST;
+    }
+    if (e->kind == EXPR_CALL && (e->is_ptr_take || is_val_builtin_call(mod, fn, e))) {
+        return true;
+    }
+    return false;
+}
+
+static bool expr_is_mutable_place(ModuleInfo* mod, FuncInfo* fn, Expr* e) {
+    if (!e) return true;
+    if (e->kind == EXPR_VAR) {
+        VarSym* v = resolve_var(mod, fn, e->var.name, NULL);
+        if (v && v->type && type_ptr_is_const(v->type)) return false;
+        return true;
+    }
+    if (e->kind == EXPR_ATTR) {
+        if (e->is_ptr_take) return false;
+        Type* ot = e->attr.obj ? e->attr.obj->ty : NULL;
+        if (ot && type_ptr_is_const(ot)) return false;
+        if (ot && !type_is_ptr(ot) && ot->kind == TY_CLASS && ot->cls->is_value_type) {
+            return expr_is_mutable_place(mod, fn, e->attr.obj);
+        }
+        return true;
+    }
+    if (e->kind == EXPR_INDEX) {
+        Type* ot = e->index.obj ? e->index.obj->ty : NULL;
+        if (ot && type_ptr_is_const(ot)) return false;
+        return true;
+    }
+    if (e->kind == EXPR_CALL && (e->is_ptr_take || is_val_builtin_call(mod, fn, e))) {
+        int pidx = (e->call.arg_count == 2) ? 1 : 0;
+        if (pidx >= e->call.arg_count) return false;
+        Expr* pe = e->call.args[pidx];
+        Type* pt = pe->ty;
+        int lvl = (e->call.arg_count == 2 && e->call.args[0]->kind == EXPR_INT) ? (int)e->call.args[0]->int_lit.ival : 1;
+        for (int k = 0; k < lvl && pt; k++) {
+            if (pt->kind == TY_REF) return false;
+            if (!type_is_ptr(pt)) return false;
+            pt = pt->elem;
+        }
+        return true;
+    }
+    return true;
 }
 
 static Type* iter_element_type(Type* it, SrcLoc loc) {
@@ -3358,13 +3548,31 @@ static void normalize_dataclass_args(Expr* call, ClassInfo* ci) {
     normalize_call_args(call, fnames, fdefs, fc, 0, arena_sprintf("%s()", ci->name));
 }
 
+static bool is_mutating_container_method(Type* ot, const char* mname);
+
 static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* obj_e, const char* mname, Type* obj_ty, Type* hint) {
     (void)hint;
     int argc = call->call.arg_count;
     Expr** args = call->call.args;
 
+    bool recv_is_const_ptr = type_ptr_is_const(obj_ty);
+    if (type_is_ptr(obj_ty)) {
+        if (obj_ty->kind == TY_OPTIONAL) {
+            error_at(call->loc, "cannot call method '%s' on optional pointer '%s'; narrow with 'is not None' first", mname, type_str(obj_ty));
+        }
+        obj_ty = type_deref_all(obj_ty);
+        if (obj_ty->kind == TY_OPTIONAL) {
+            error_at(call->loc, "cannot call method '%s' on optional type '%s'; narrow with 'is not None' first", mname, type_str(obj_ty));
+        }
+    }
+
     if (obj_ty->kind != TY_CLASS && obj_ty->kind != TY_MODULE) {
         reject_unexpected_kwargs(call, arena_sprintf("%s.%s()", type_str(obj_ty), mname));
+    }
+    if (recv_is_const_ptr && (obj_ty->kind == TY_LIST || obj_ty->kind == TY_SET || obj_ty->kind == TY_DICT || obj_ty->kind == TY_FILE)) {
+        if (is_mutating_container_method(obj_ty, mname)) {
+            error_at(call->loc, "cannot call mutating method '%s.%s()' through immutable reference", type_str(obj_ty), mname);
+        }
     }
 
     if (obj_ty->kind == TY_STR) {
@@ -3979,6 +4187,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 }
             }
             if (first->kind == TY_NONE_LIT) error_at(e->loc, "cannot infer element type of list containing only None; add a type annotation");
+            if (type_has_ref(first)) error_at(e->loc, "cannot store borrowed reference '%s' in list; use 'addr[...]' for raw pointers", type_str(first));
             res = make_list_type(first);
             break;
         }
@@ -4000,6 +4209,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 Type* it = check_expr(mod, fn, e->seq.items[i], first);
                 if (!type_assignable(first, it)) error_at(e->seq.items[i]->loc, "set element type mismatch");
             }
+            if (type_has_ref(first)) error_at(e->loc, "cannot store borrowed reference '%s' in set; use 'addr[...]' for raw pointers", type_str(first));
             res = make_set_type(first);
             break;
         }
@@ -4023,6 +4233,7 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 else if (!type_assignable(vt, v2)) error_at(e->dict.vals[i]->loc, "dict value type mismatch");
             }
             if (vt->kind == TY_NONE_LIT) error_at(e->loc, "cannot infer dict value type from None; add a type annotation");
+            if (type_has_ref(kt) || type_has_ref(vt)) error_at(e->loc, "cannot store borrowed reference in dict; use 'addr[...]' for raw pointers");
             res = make_dict_type(kt, vt);
             break;
         }
@@ -4056,7 +4267,8 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
             break;
         }
         case EXPR_INDEX: {
-            Type* ot = check_expr(mod, fn, e->index.obj, NULL);
+            Type* raw_ot = check_expr(mod, fn, e->index.obj, NULL);
+            Type* ot = type_deref_all(raw_ot);
             if (ot->kind == TY_LIST) {
                 Type* it = check_expr(mod, fn, e->index.index, g_ty_i64);
                 if (!type_is_int(it)) error_at(e->index.index->loc, "list index must be int");
@@ -4086,12 +4298,12 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 if (idx < 0 || idx >= ot->tuple_count) error_at(e->index.index->loc, "tuple index out of range");
                 res = ot->tuple_elems[idx];
             } else {
-                error_at(e->loc, "type '%s' is not subscriptable", type_str(ot));
+                error_at(e->loc, "type '%s' is not subscriptable", type_str(raw_ot));
             }
             break;
         }
         case EXPR_SLICE: {
-            Type* ot = check_expr(mod, fn, e->slice.obj, NULL);
+            Type* ot = type_deref_all(check_expr(mod, fn, e->slice.obj, NULL));
             if (e->slice.start && !type_is_int(check_expr(mod, fn, e->slice.start, g_ty_i64))) {
                 error_at(e->slice.start->loc, "slice start must be int");
             }
@@ -4108,11 +4320,41 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
         case EXPR_ATTR: {
             Type* ot = check_expr(mod, fn, e->attr.obj, NULL);
             const char* an = e->attr.attr;
+            bool has_real_attr = false;
+            Type* base_ot = type_deref_all(ot);
+            if (base_ot->kind == TY_CLASS) {
+                ClassInfo* cls = base_ot->cls;
+                if (find_field_in_class(cls, an) || find_class_attr(cls, an)) has_real_attr = true;
+                else {
+                    FuncInfo* prop = find_method_in_class(cls, an);
+                    if (prop && prop->is_property) has_real_attr = true;
+                }
+            } else if (ot->kind == TY_MODULE) {
+                if (find_global_in_mod(ot->mod, an) || find_class_in_mod(ot->mod, an) || find_func_in_mod(ot->mod, an)) {
+                    has_real_attr = true;
+                }
+            }
+            if (!has_real_attr && expr_is_ptr_attr(an)) {
+                if (!expr_is_addressable(mod, fn, e->attr.obj)) {
+                    error_at(e->loc, "cannot take '.%s' of non-addressable expression", an);
+                }
+                if (strcmp(an, "mut_ref") == 0 && !expr_is_mutable_place(mod, fn, e->attr.obj)) {
+                    error_at(e->loc, "cannot take '.mut_ref' through immutable reference");
+                }
+                e->is_ptr_take = true;
+                if (strcmp(an, "ref") == 0) res = make_ref_type(ot);
+                else if (strcmp(an, "mut_ref") == 0) res = make_mut_ref_type(ot);
+                else res = make_addr_type(ot);
+                break;
+            }
             if (ot->kind == TY_OPTIONAL) {
                 error_at(e->loc, "cannot access attribute '%s' on optional type '%s'; narrow with 'is not None' or check", an, type_str(ot));
             }
-            if (ot->kind == TY_CLASS) {
-                ClassInfo* cls = ot->cls;
+            if (base_ot->kind == TY_OPTIONAL) {
+                error_at(e->loc, "cannot access attribute '%s' on optional type '%s'; narrow with 'is not None' or check", an, type_str(base_ot));
+            }
+            if (base_ot->kind == TY_CLASS) {
+                ClassInfo* cls = base_ot->cls;
                 FieldInfo* fi = find_field_in_class(cls, an);
                 if (fi) { res = fi->type; break; }
                 FieldInfo* ca = find_class_attr(cls, an);
@@ -4189,12 +4431,40 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 }
                 if (strcmp(cname, "len") == 0) {
                     if (argc != 1) error_at(e->loc, "len() takes 1 argument");
-                    Type* at = check_expr(mod, fn, args[0], NULL);
+                    Type* raw_at = check_expr(mod, fn, args[0], NULL);
+                    Type* at = type_deref_all(raw_at);
                     if (at->kind != TY_LIST && at->kind != TY_SET && at->kind != TY_DICT &&
                         at->kind != TY_STR && at->kind != TY_BYTES && at->kind != TY_TUPLE) {
-                        error_at(args[0]->loc, "len() unsupported for type '%s'", type_str(at));
+                        error_at(args[0]->loc, "len() unsupported for type '%s'", type_str(raw_at));
                     }
                     res = g_ty_i64; break;
+                }
+                if (is_val_builtin_call(mod, fn, e)) {
+                    reject_unexpected_kwargs(e, "val()");
+                    if (argc < 1 || argc > 2) error_at(e->loc, "val() takes 1 or 2 arguments");
+                    int lvl = 1;
+                    Expr* ptr_arg = args[0];
+                    if (argc == 2) {
+                        if (args[0]->kind != EXPR_INT || args[0]->int_lit.is_big || args[0]->int_lit.ival < 1) {
+                            error_at(args[0]->loc, "val() level must be a positive integer literal");
+                        }
+                        check_expr(mod, fn, args[0], g_ty_i64);
+                        lvl = (int)args[0]->int_lit.ival;
+                        ptr_arg = args[1];
+                    }
+                    Type* pt = check_expr(mod, fn, ptr_arg, NULL);
+                    for (int k = 0; k < lvl; k++) {
+                        if (pt->kind == TY_OPTIONAL) {
+                            error_at(ptr_arg->loc, "cannot dereference optional pointer '%s'; narrow with 'is not None' first", type_str(pt));
+                        }
+                        if (!type_is_ptr(pt)) {
+                            error_at(ptr_arg->loc, "cannot dereference non-pointer type '%s'", type_str(pt));
+                        }
+                        pt = pt->elem;
+                    }
+                    e->is_ptr_take = true;
+                    res = pt;
+                    break;
                 }
                 if (strcmp(cname, "str") == 0 || strcmp(cname, "repr") == 0) {
                     if (argc != 1) error_at(e->loc, "%s() takes 1 argument", cname);
@@ -4235,7 +4505,11 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                     res = g_ty_str; break;
                 }
                 if (strcmp(cname, "hex") == 0 || strcmp(cname, "bin") == 0 || strcmp(cname, "oct") == 0) {
-                    if (argc != 1 || !type_is_int(check_expr(mod, fn, args[0], g_ty_i64))) error_at(e->loc, "%s() expects int", cname);
+                    if (argc != 1) error_at(e->loc, "%s() takes 1 argument", cname);
+                    Type* at = check_expr(mod, fn, args[0], NULL);
+                    if (!type_is_int(at) && !(strcmp(cname, "hex") == 0 && type_is_ptr(at))) {
+                        error_at(args[0]->loc, "%s() expects int", cname);
+                    }
                     res = g_ty_str; break;
                 }
                 if (strcmp(cname, "abs") == 0) {
@@ -5253,9 +5527,25 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                     }
                     VarSym* bv = resolve_var(mod, fn, vname, NULL);
                     if (bv) bv->is_nonneg = expr_is_nonneg(mod, fn, s->assign.value);
+                } else if (is_val_builtin_call(mod, fn, tgt)) {
+                    Type* tt = check_expr(mod, fn, tgt, NULL);
+                    if (!expr_is_mutable_place(mod, fn, tgt)) {
+                        error_at(tgt->loc, "cannot assign through immutable reference");
+                    }
+                    Type* vt = check_expr(mod, fn, s->assign.value, tt);
+                    if (!type_assignable(tt, vt)) {
+                        error_at(s->loc, "cannot assign '%s' to dereferenced target of type '%s'", type_str(vt), type_str(tt));
+                    }
                 } else if (tgt->kind == EXPR_ATTR) {
-                    Type* ot = check_expr(mod, fn, tgt->attr.obj, NULL);
-                    if (ot->kind != TY_CLASS) error_at(tgt->loc, "cannot set attribute on type '%s'", type_str(ot));
+                    Type* raw_ot = check_expr(mod, fn, tgt->attr.obj, NULL);
+                    Type* ot = type_deref_all(raw_ot);
+                    if (ot->kind != TY_CLASS) error_at(tgt->loc, "cannot set attribute on type '%s'", type_str(raw_ot));
+                    if (!expr_is_mutable_place(mod, fn, tgt->attr.obj)) {
+                        error_at(tgt->loc, "cannot mutate field '%s' through immutable reference", tgt->attr.attr);
+                    }
+                    if (!type_is_ptr(raw_ot) && ot->cls->is_value_type && !expr_is_addressable(mod, fn, tgt->attr.obj)) {
+                        error_at(tgt->loc, "cannot mutate field '%s' on temporary value", tgt->attr.attr);
+                    }
                     FieldInfo* fi = find_field_in_class(ot->cls, tgt->attr.attr);
                     if (fi) {
                         Type* vt = check_expr(mod, fn, s->assign.value, fi->type);
@@ -5270,7 +5560,11 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                         if (!type_assignable(ca->type, vt)) error_at(s->loc, "class attribute type mismatch");
                     }
                 } else if (tgt->kind == EXPR_INDEX) {
-                    Type* ot = check_expr(mod, fn, tgt->index.obj, NULL);
+                    Type* raw_ot = check_expr(mod, fn, tgt->index.obj, NULL);
+                    if (!expr_is_mutable_place(mod, fn, tgt->index.obj)) {
+                        error_at(tgt->loc, "cannot mutate element through immutable reference");
+                    }
+                    Type* ot = type_deref_all(raw_ot);
                     if (ot->kind == TY_LIST) {
                         if (!type_is_int(check_expr(mod, fn, tgt->index.index, g_ty_i64))) error_at(tgt->index.index->loc, "list index must be int");
                         tgt->index.index->is_nonneg = expr_is_nonneg(mod, fn, tgt->index.index);
@@ -5289,7 +5583,7 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                         Type* vt = check_expr(mod, fn, s->assign.value, ot->val);
                         if (!type_assignable(ot->val, vt)) error_at(s->loc, "dict value assignment type mismatch");
                     } else {
-                        error_at(tgt->loc, "type '%s' does not support item assignment", type_str(ot));
+                        error_at(tgt->loc, "type '%s' does not support item assignment", type_str(raw_ot));
                     }
                 } else {
                     error_at(tgt->loc, "invalid assignment target");
@@ -5309,7 +5603,14 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                 break;
             }
             case STMT_AUG_ASSIGN: {
+                if (s->aug_assign.target->kind != EXPR_VAR && s->aug_assign.target->kind != EXPR_ATTR &&
+                    s->aug_assign.target->kind != EXPR_INDEX && !is_val_builtin_call(mod, fn, s->aug_assign.target)) {
+                    error_at(s->aug_assign.target->loc, "invalid augmented assignment target");
+                }
                 Type* tt = check_expr(mod, fn, s->aug_assign.target, NULL);
+                if (!expr_is_mutable_place(mod, fn, s->aug_assign.target)) {
+                    error_at(s->aug_assign.target->loc, "cannot mutate through immutable reference");
+                }
                 Type* vt = check_expr(mod, fn, s->aug_assign.value, tt);
                 if (s->aug_assign.target->kind == EXPR_VAR) {
                     VarSym* bv = resolve_var(mod, fn, s->aug_assign.target->var.name, NULL);
@@ -5513,6 +5814,10 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
 }
 
 static void add_field_to_class(ClassInfo* cls, const char* name, Type* type, Expr* def_e, SrcLoc loc) {
+    if (type_has_ref(type)) {
+        error_at(loc, "cannot store borrowed reference '%s' in class field '%s.%s'; use 'addr[...]' for raw pointers",
+                 type_str(type), cls->name, name);
+    }
     FieldInfo* existing = find_field_in_class(cls, name);
     if (existing) {
         if (!type_assignable(existing->type, type)) {
@@ -6321,17 +6626,24 @@ static const char* expr_root_var(Expr* e) {
 }
 
 static bool expr_is_borrow_source(Expr* e) {
-    if (!e || !e->ty || !type_is_owned(e->ty)) return false;
+    if (!e || !e->ty) return false;
+    if (e->kind == EXPR_ATTR && e->is_ptr_take &&
+        (strcmp(e->attr.attr, "ref") == 0 || strcmp(e->attr.attr, "mut_ref") == 0)) {
+        return true;
+    }
+    if (!type_is_owned(e->ty)) return false;
+    if (e->kind == EXPR_CALL && e->is_ptr_take) return true;
     if (e->kind == EXPR_ATTR) {
         if (!e->attr.obj->ty) return false;
         if (e->attr.obj->ty->kind == TY_MODULE) return true;
-        if (e->attr.obj->ty->kind != TY_CLASS) return false;
-        FuncInfo* prop = find_method_in_class(e->attr.obj->ty->cls, e->attr.attr);
+        Type* base = type_deref_all(e->attr.obj->ty);
+        if (base->kind != TY_CLASS) return false;
+        FuncInfo* prop = find_method_in_class(base->cls, e->attr.attr);
         if (prop && prop->is_property) return false;
         return true;
     }
     if (e->kind == EXPR_INDEX) {
-        Type* ot = e->index.obj->ty;
+        Type* ot = type_deref_all(e->index.obj->ty);
         return ot && (ot->kind == TY_LIST || ot->kind == TY_DICT || ot->kind == TY_TUPLE);
     }
     return false;
@@ -6546,12 +6858,12 @@ static void scan_expr_param_modes(FuncInfo* fn, Expr* e, bool moved_ctx, bool* c
         case EXPR_CALL: {
             Expr* ce = e->call.callee;
             if (ce->kind == EXPR_ATTR) {
-                Type* ot = ce->attr.obj->ty;
+                Type* ot = type_deref_all(ce->attr.obj->ty);
                 const char* mn = ce->attr.attr;
                 if (ot && (ot->kind == TY_LIST || ot->kind == TY_SET || ot->kind == TY_DICT || ot->kind == TY_FILE)) {
                     if (is_mutating_container_method(ot, mn)) {
                         const char* rv = expr_root_var(ce->attr.obj);
-                        if (rv) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
+                        if (rv && !type_is_ptr(ce->attr.obj->ty)) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
                     }
                     scan_expr_param_modes(fn, ce->attr.obj, false, changed);
                     bool arg_move = (ot->kind == TY_LIST && (strcmp(mn, "append") == 0 || strcmp(mn, "insert") == 0)) ||
@@ -6568,7 +6880,7 @@ static void scan_expr_param_modes(FuncInfo* fn, Expr* e, bool moved_ctx, bool* c
                     if (m && m->param_modes) {
                         int sp = m->is_static ? 0 : 1;
                         if (!m->is_static && !m->is_classmethod && m->param_count > 0) {
-                            if (ce->attr.obj->kind == EXPR_VAR) {
+                            if (ce->attr.obj->kind == EXPR_VAR && !type_is_ptr(ce->attr.obj->ty)) {
                                 int p = fn_param_index(fn, ce->attr.obj->var.name);
                                 if (p >= 0 && m->param_modes[0] != PM_BORROW) {
                                     raise_param_mode(fn, p, m->param_modes[0], changed);
@@ -6667,15 +6979,19 @@ static void scan_stmts_param_modes(FuncInfo* fn, Stmt** stmts, int count, bool* 
                                        find_local_in_fn(fn, tgt->var.name) == NULL;
                     bool is_borrow = expr_is_borrow_source(s->assign.value) && !is_global_t;
                     scan_expr_param_modes(fn, s->assign.value, !is_borrow, changed);
+                } else if (tgt->kind == EXPR_CALL && tgt->is_ptr_take) {
+                    for (int a = 0; a < tgt->call.arg_count; a++) scan_expr_param_modes(fn, tgt->call.args[a], false, changed);
+                    scan_expr_param_modes(fn, s->assign.value, true, changed);
                 } else if (tgt->kind == EXPR_ATTR) {
                     const char* rv = expr_root_var(tgt->attr.obj);
-                    if (rv) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
+                    if (rv && !type_is_ptr(tgt->attr.obj->ty)) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
                     scan_expr_param_modes(fn, s->assign.value, true, changed);
                 } else if (tgt->kind == EXPR_INDEX) {
                     const char* rv = expr_root_var(tgt->index.obj);
-                    if (rv) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
+                    if (rv && !type_is_ptr(tgt->index.obj->ty)) raise_param_mode(fn, fn_param_index(fn, rv), PM_MUT_BORROW, changed);
+                    Type* it_ot = type_deref_all(tgt->index.obj->ty);
                     scan_expr_param_modes(fn, tgt->index.index,
-                                          tgt->index.obj->ty && tgt->index.obj->ty->kind == TY_DICT, changed);
+                                          it_ot && it_ot->kind == TY_DICT, changed);
                     scan_expr_param_modes(fn, s->assign.value, true, changed);
                 }
                 break;
@@ -6805,6 +7121,7 @@ typedef struct {
     OwnState state;
     bool is_view;
     bool is_mut_borrow;
+    bool borrows_stack;
     const char* borrow_owner;
     bool is_global;
     int imm_borrows;
@@ -6843,10 +7160,18 @@ static void own_release_view(OwnCtx* ctx, int idx) {
     if (idx < 0 || !ctx->slots[idx].is_view || ctx->slots[idx].state != OWN_ALIVE) return;
     if (ctx->slots[idx].borrow_owner) {
         int oi = own_find(ctx, ctx->slots[idx].borrow_owner);
-        if (oi >= 0 && ctx->slots[oi].imm_borrows > 0) ctx->slots[oi].imm_borrows--;
+        if (oi >= 0) {
+            if (ctx->slots[idx].is_mut_borrow) {
+                if (ctx->slots[oi].mut_borrows > 0) ctx->slots[oi].mut_borrows--;
+            } else {
+                if (ctx->slots[oi].imm_borrows > 0) ctx->slots[oi].imm_borrows--;
+            }
+        }
     }
     ctx->slots[idx].state = OWN_UNINIT;
     ctx->slots[idx].is_view = false;
+    ctx->slots[idx].is_mut_borrow = false;
+    ctx->slots[idx].borrows_stack = false;
     ctx->slots[idx].borrow_owner = NULL;
 }
 
@@ -6888,6 +7213,68 @@ static void own_check_mutate_var(OwnCtx* ctx, const char* name, SrcLoc loc) {
     }
 }
 
+static bool var_is_fn_param(FuncInfo* fn, const char* name) {
+    if (!fn || !name) return false;
+    for (int i = 0; i < fn->param_count; i++) {
+        if (strcmp(fn->param_names[i], name) == 0) return true;
+    }
+    return false;
+}
+
+static bool expr_borrows_stack(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* obj) {
+    if (!obj) return false;
+    if (obj->kind == EXPR_VAR) {
+        bool is_glob = fn ? (find_global_in_mod(mod, obj->var.name) != NULL && find_local_in_fn(fn, obj->var.name) == NULL) : true;
+        return !is_glob;
+    }
+    const char* rv = expr_root_var(obj);
+    if (!rv) return false;
+    bool is_glob = fn ? (find_global_in_mod(mod, rv) != NULL && find_local_in_fn(fn, rv) == NULL) : true;
+    if (is_glob) return false;
+    if (obj->kind == EXPR_ATTR || obj->kind == EXPR_INDEX) {
+        Expr* root_e = obj;
+        while (root_e->kind == EXPR_ATTR || root_e->kind == EXPR_INDEX) {
+            root_e = (root_e->kind == EXPR_ATTR) ? root_e->attr.obj : root_e->index.obj;
+        }
+        if (root_e->ty && type_is_ptr(root_e->ty)) {
+            int ridx = own_find(ctx, rv);
+            if (ridx >= 0 && ctx->slots[ridx].is_view) return ctx->slots[ridx].borrows_stack;
+            return !var_is_fn_param(fn, rv);
+        }
+        if (var_is_fn_param(fn, rv) && root_e->ty &&
+            ((root_e->ty->kind == TY_CLASS && !root_e->ty->cls->is_value_type) ||
+             root_e->ty->kind == TY_LIST || root_e->ty->kind == TY_SET || root_e->ty->kind == TY_DICT)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void own_check_ret_ref(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, SrcLoc loc) {
+    if (!e || !e->ty) return;
+    if (e->kind == EXPR_TERNARY) {
+        own_check_ret_ref(mod, fn, ctx, e->ternary.then_e, loc);
+        own_check_ret_ref(mod, fn, ctx, e->ternary.else_e, loc);
+        return;
+    }
+    if (e->kind == EXPR_ATTR && e->is_ptr_take &&
+        (strcmp(e->attr.attr, "ref") == 0 || strcmp(e->attr.attr, "mut_ref") == 0)) {
+        if (expr_borrows_stack(mod, fn, ctx, e->attr.obj)) {
+            const char* rv = expr_root_var(e->attr.obj);
+            error_at(loc, "cannot return reference to local '%s'", rv ? rv : "<local>");
+        }
+        return;
+    }
+    if (e->kind == EXPR_VAR && (e->ty->kind == TY_REF || e->ty->kind == TY_MUT_REF ||
+        (e->ty->kind == TY_OPTIONAL && (e->ty->elem->kind == TY_REF || e->ty->elem->kind == TY_MUT_REF)))) {
+        int idx = own_find(ctx, e->var.name);
+        if (idx >= 0 && ctx->slots[idx].is_view && ctx->slots[idx].borrows_stack) {
+            error_at(loc, "cannot return reference '%s' to local '%s'",
+                     e->var.name, ctx->slots[idx].borrow_owner ? ctx->slots[idx].borrow_owner : "<local>");
+        }
+    }
+}
+
 static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, bool want_move) {
     if (!e) return;
     switch (e->kind) {
@@ -6900,21 +7287,28 @@ static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, 
                 }
                 return;
             }
-            if (!type_is_owned(ctx->slots[idx].type)) return;
+            Type* sty = ctx->slots[idx].type;
+            bool is_mut_ref_ty = (sty && (sty->kind == TY_MUT_REF || (sty->kind == TY_OPTIONAL && sty->elem->kind == TY_MUT_REF)));
+            if (!type_is_owned(sty) && !is_mut_ref_ty) {
+                if (ctx->slots[idx].mut_borrows > 0) {
+                    error_at(e->loc, "cannot borrow '%s' while it is mutably borrowed", e->var.name);
+                }
+                return;
+            }
             if (ctx->slots[idx].state == OWN_MOVED || ctx->slots[idx].state == OWN_MAYBE_MOVED) {
                 error_at(e->loc, "use of moved value '%s'", e->var.name);
             }
             if (want_move) {
-                if (ctx->slots[idx].is_global) {
+                if (ctx->slots[idx].is_global && !is_mut_ref_ty) {
                     error_at(e->loc, "cannot move out of global '%s'; use '.copy()' to clone", e->var.name);
                 }
-                if (ctx->slots[idx].is_view) {
+                if (ctx->slots[idx].is_view && !is_mut_ref_ty) {
                     error_at(e->loc, "cannot move out of borrowed value '%s'; use '.copy()' to clone", e->var.name);
                 }
                 if (ctx->slots[idx].imm_borrows > 0 || ctx->slots[idx].mut_borrows > 0) {
                     error_at(e->loc, "cannot move '%s' while it is borrowed", e->var.name);
                 }
-                e->is_move = true;
+                if (type_is_owned(sty)) e->is_move = true;
                 ctx->slots[idx].state = OWN_MOVED;
             } else {
                 if (ctx->slots[idx].mut_borrows > 0) {
@@ -6924,11 +7318,38 @@ static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, 
             break;
         }
         case EXPR_ATTR:
+            if (e->is_ptr_take) {
+                if (strcmp(e->attr.attr, "mut_ref") == 0) {
+                    const char* rv = expr_root_var(e->attr.obj);
+                    if (rv && !type_is_ptr(e->attr.obj->ty)) own_check_mutate_var(ctx, rv, e->loc);
+                    if (e->attr.obj->kind == EXPR_VAR) {
+                        int idx = own_find(ctx, e->attr.obj->var.name);
+                        if (idx >= 0 && (ctx->slots[idx].state == OWN_MOVED || ctx->slots[idx].state == OWN_MAYBE_MOVED)) {
+                            error_at(e->loc, "use of moved value '%s'", e->attr.obj->var.name);
+                        }
+                    } else {
+                        own_check_expr(mod, fn, ctx, e->attr.obj, false);
+                    }
+                } else if (strcmp(e->attr.attr, "ref") == 0) {
+                    own_check_expr(mod, fn, ctx, e->attr.obj, false);
+                } else {
+                    if (e->attr.obj->kind == EXPR_VAR) {
+                        int idx = own_find(ctx, e->attr.obj->var.name);
+                        if (idx >= 0 && (ctx->slots[idx].state == OWN_MOVED || ctx->slots[idx].state == OWN_MAYBE_MOVED)) {
+                            error_at(e->loc, "use of moved value '%s'", e->attr.obj->var.name);
+                        }
+                    } else {
+                        own_check_expr(mod, fn, ctx, e->attr.obj, false);
+                    }
+                }
+                break;
+            }
             if (want_move && type_is_owned(e->ty) && e->attr.obj->ty) {
+                Type* base = type_deref_all(e->attr.obj->ty);
                 if (e->attr.obj->ty->kind == TY_MODULE) {
                     error_at(e->loc, "cannot move out of module global '%s'; use '.copy()' to clone", e->attr.attr);
                 }
-                if (e->attr.obj->ty->kind == TY_CLASS && expr_root_var(e->attr.obj)) {
+                if (base->kind == TY_CLASS && expr_root_var(e->attr.obj)) {
                     error_at(e->loc, "cannot move out of borrowed field '%s'; use '.copy()' to clone", e->attr.attr);
                 }
             }
@@ -7059,14 +7480,57 @@ static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, 
         }
         case EXPR_CALL: {
             Expr* ce = e->call.callee;
+            const char* tmp_bor_vars[32];
+            bool tmp_bor_mut[32];
+            int tmp_bor_cnt = 0;
+            const char* mut_vars[32];
+            int mut_cnt = 0;
+
+            if (e->is_ptr_take) {
+                if (want_move && type_is_owned(e->ty)) {
+                    error_at(e->loc, "cannot move out of dereferenced pointer; use '.copy()' to clone");
+                }
+                if (want_move && e->ty && e->ty->kind == TY_MUT_REF && !expr_is_mutable_place(mod, fn, e)) {
+                    error_at(e->loc, "cannot move mutable reference out of immutable reference");
+                }
+                for (int i = 0; i < e->call.arg_count; i++) own_check_expr(mod, fn, ctx, e->call.args[i], false);
+                break;
+            }
+
+            #define CHECK_CALL_ARG(arg_expr, arg_want_mut, arg_want_move) do { \
+                Expr* _ae = (arg_expr); \
+                if (((arg_want_mut) || (_ae->ty && _ae->ty->kind == TY_MUT_REF)) && _ae->kind == EXPR_VAR) { \
+                    const char* _av = _ae->var.name; \
+                    for (int _k = 0; _k < mut_cnt; _k++) { \
+                        if (strcmp(mut_vars[_k], _av) == 0) error_at(e->loc, "cannot borrow '%s' as mutable more than once", _av); \
+                    } \
+                    own_check_mutate_var(ctx, _av, _ae->loc); \
+                    if (mut_cnt < 32) mut_vars[mut_cnt++] = _av; \
+                } \
+                own_check_expr(mod, fn, ctx, _ae, (arg_want_move)); \
+                if (_ae->kind == EXPR_ATTR && _ae->is_ptr_take && strcmp(_ae->attr.attr, "addr") != 0) { \
+                    const char* _rv = expr_root_var(_ae->attr.obj); \
+                    int _oi = _rv ? own_find(ctx, _rv) : -1; \
+                    if (_oi >= 0 && tmp_bor_cnt < 32) { \
+                        bool _ism = (strcmp(_ae->attr.attr, "mut_ref") == 0); \
+                        if (_ism) ctx->slots[_oi].mut_borrows++; else ctx->slots[_oi].imm_borrows++; \
+                        tmp_bor_vars[tmp_bor_cnt] = _rv; tmp_bor_mut[tmp_bor_cnt] = _ism; tmp_bor_cnt++; \
+                    } \
+                } \
+            } while (0)
+
             if (ce->kind == EXPR_ATTR) {
-                Type* ot = ce->attr.obj->ty;
+                Type* raw_ot = ce->attr.obj->ty;
+                Type* ot = type_deref_all(raw_ot);
                 const char* mn = ce->attr.attr;
                 if (ot && (ot->kind == TY_LIST || ot->kind == TY_SET || ot->kind == TY_DICT || ot->kind == TY_FILE)) {
                     bool mut = is_mutating_container_method(ot, mn);
                     if (mut) {
+                        if (type_ptr_is_const(raw_ot)) {
+                            error_at(e->loc, "cannot call mutating method '%s' through immutable reference", mn);
+                        }
                         const char* rv = expr_root_var(ce->attr.obj);
-                        if (rv) own_check_mutate_var(ctx, rv, e->loc);
+                        if (rv && !type_is_ptr(raw_ot)) own_check_mutate_var(ctx, rv, e->loc);
                     }
                     own_check_expr(mod, fn, ctx, ce->attr.obj, false);
                     bool arg_move = (ot->kind == TY_LIST && (strcmp(mn, "append") == 0 || strcmp(mn, "insert") == 0)) ||
@@ -7075,60 +7539,47 @@ static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, 
                     for (int i = 0; i < e->call.arg_count; i++) {
                         bool mv = arg_move && (ot->kind != TY_LIST || strcmp(mn, "insert") != 0 || i == 1) &&
                                   type_is_owned(e->call.args[i]->ty);
-                        own_check_expr(mod, fn, ctx, e->call.args[i], mv);
+                        CHECK_CALL_ARG(e->call.args[i], false, mv);
                     }
-                    break;
+                    goto call_release_borrows;
                 }
                 if (ot && ot->kind == TY_CLASS) {
                     FuncInfo* m = e->call.resolved_fn ? e->call.resolved_fn : find_method_in_class(ot->cls, mn);
                     if (m && m->param_modes) {
                         int sp = m->is_static ? 0 : 1;
-                        const char* mut_vars[16];
-                        int mut_cnt = 0;
                         if (!m->is_static && !m->is_classmethod && m->param_count > 0 && m->param_modes[0] == PM_MUT_BORROW) {
+                            if (type_ptr_is_const(raw_ot)) {
+                                error_at(e->loc, "cannot call mutating method '%s.%s()' through immutable reference", ot->cls->name, mn);
+                            }
                             const char* rv = expr_root_var(ce->attr.obj);
-                            if (rv) {
+                            if (rv && !type_is_ptr(raw_ot)) {
                                 own_check_mutate_var(ctx, rv, e->loc);
-                                if (mut_cnt < 16) mut_vars[mut_cnt++] = rv;
+                                if (mut_cnt < 32) mut_vars[mut_cnt++] = rv;
                             }
                         }
+                        if (!m->is_static && !m->is_classmethod && m->param_count > 0 &&
+                            m->param_modes[0] == PM_MOVE && type_is_ptr(raw_ot)) {
+                            error_at(e->loc, "cannot call consuming method '%s.%s()' through reference", ot->cls->name, mn);
+                        }
                         bool self_move = !m->is_static && !m->is_classmethod && m->param_count > 0 &&
-                                         m->param_modes[0] == PM_MOVE && type_is_owned(ot);
+                                         m->param_modes[0] == PM_MOVE && type_is_owned(raw_ot);
                         own_check_expr(mod, fn, ctx, ce->attr.obj, self_move);
                         for (int i = 0; i < e->call.arg_count && i + sp < m->param_count; i++) {
                             ParamMode pm = m->param_modes[i + sp];
-                            if (pm == PM_MUT_BORROW && e->call.args[i]->kind == EXPR_VAR) {
-                                const char* av = e->call.args[i]->var.name;
-                                for (int k = 0; k < mut_cnt; k++) {
-                                    if (strcmp(mut_vars[k], av) == 0) error_at(e->loc, "cannot borrow '%s' as mutable more than once", av);
-                                }
-                                own_check_mutate_var(ctx, av, e->call.args[i]->loc);
-                                if (mut_cnt < 16) mut_vars[mut_cnt++] = av;
-                            }
-                            own_check_expr(mod, fn, ctx, e->call.args[i], pm == PM_MOVE && type_is_owned(e->call.args[i]->ty));
+                            CHECK_CALL_ARG(e->call.args[i], pm == PM_MUT_BORROW, pm == PM_MOVE && type_is_owned(e->call.args[i]->ty));
                         }
-                        break;
+                        goto call_release_borrows;
                     }
                 }
                 if (ot && ot->kind == TY_MODULE) {
                     ModuleInfo* mm = ot->mod;
                     FuncInfo* mf = e->call.resolved_fn ? e->call.resolved_fn : find_func_in_mod(mm, mn);
                     if (mf && mf->param_modes) {
-                        const char* mut_vars[16];
-                        int mut_cnt = 0;
                         for (int i = 0; i < e->call.arg_count && i < mf->param_count; i++) {
                             ParamMode pm = mf->param_modes[i];
-                            if (pm == PM_MUT_BORROW && e->call.args[i]->kind == EXPR_VAR) {
-                                const char* av = e->call.args[i]->var.name;
-                                for (int k = 0; k < mut_cnt; k++) {
-                                    if (strcmp(mut_vars[k], av) == 0) error_at(e->loc, "cannot borrow '%s' as mutable more than once", av);
-                                }
-                                own_check_mutate_var(ctx, av, e->call.args[i]->loc);
-                                if (mut_cnt < 16) mut_vars[mut_cnt++] = av;
-                            }
-                            own_check_expr(mod, fn, ctx, e->call.args[i], pm == PM_MOVE && type_is_owned(e->call.args[i]->ty));
+                            CHECK_CALL_ARG(e->call.args[i], pm == PM_MUT_BORROW, pm == PM_MOVE && type_is_owned(e->call.args[i]->ty));
                         }
-                        break;
+                        goto call_release_borrows;
                     }
                     ClassInfo* mci = find_class_in_mod(mm, mn);
                     if (mci) {
@@ -7138,14 +7589,14 @@ static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, 
                             if (init_fn && init_fn->param_modes && i + 1 < init_fn->param_count) {
                                 mv = (init_fn->param_modes[i + 1] == PM_MOVE) && type_is_owned(e->call.args[i]->ty);
                             }
-                            own_check_expr(mod, fn, ctx, e->call.args[i], mv);
+                            CHECK_CALL_ARG(e->call.args[i], false, mv);
                         }
-                        break;
+                        goto call_release_borrows;
                     }
                 }
                 own_check_expr(mod, fn, ctx, ce->attr.obj, false);
-                for (int i = 0; i < e->call.arg_count; i++) own_check_expr(mod, fn, ctx, e->call.args[i], false);
-                break;
+                for (int i = 0; i < e->call.arg_count; i++) CHECK_CALL_ARG(e->call.args[i], false, false);
+                goto call_release_borrows;
             }
             if (ce->kind == EXPR_VAR) {
                 const char* cname = ce->var.name;
@@ -7157,9 +7608,9 @@ static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, 
                         if (init_fn && init_fn->param_modes && i + 1 < init_fn->param_count) {
                             mv = (init_fn->param_modes[i + 1] == PM_MOVE) && type_is_owned(e->call.args[i]->ty);
                         }
-                        own_check_expr(mod, fn, ctx, e->call.args[i], mv);
+                        CHECK_CALL_ARG(e->call.args[i], false, mv);
                     }
-                    break;
+                    goto call_release_borrows;
                 }
                 FuncInfo* tf = e->call.resolved_fn ? e->call.resolved_fn : find_func_in_mod(mod, cname);
                 if (!tf && fn) {
@@ -7170,24 +7621,26 @@ static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, 
                     }
                 }
                 if (tf && tf->param_modes) {
-                    const char* mut_vars[16];
-                    int mut_cnt = 0;
                     for (int i = 0; i < e->call.arg_count && i < tf->param_count; i++) {
                         ParamMode pm = tf->param_modes[i];
-                        if (pm == PM_MUT_BORROW && e->call.args[i]->kind == EXPR_VAR) {
-                            const char* av = e->call.args[i]->var.name;
-                            for (int k = 0; k < mut_cnt; k++) {
-                                if (strcmp(mut_vars[k], av) == 0) error_at(e->loc, "cannot borrow '%s' as mutable more than once", av);
-                            }
-                            own_check_mutate_var(ctx, av, e->call.args[i]->loc);
-                            if (mut_cnt < 16) mut_vars[mut_cnt++] = av;
-                        }
-                        own_check_expr(mod, fn, ctx, e->call.args[i], pm == PM_MOVE && type_is_owned(e->call.args[i]->ty));
+                        CHECK_CALL_ARG(e->call.args[i], pm == PM_MUT_BORROW, pm == PM_MOVE && type_is_owned(e->call.args[i]->ty));
                     }
-                    break;
+                    goto call_release_borrows;
                 }
             }
-            for (int i = 0; i < e->call.arg_count; i++) own_check_expr(mod, fn, ctx, e->call.args[i], false);
+            for (int i = 0; i < e->call.arg_count; i++) CHECK_CALL_ARG(e->call.args[i], false, false);
+        call_release_borrows:
+            #undef CHECK_CALL_ARG
+            for (int k = 0; k < tmp_bor_cnt; k++) {
+                int oi = own_find(ctx, tmp_bor_vars[k]);
+                if (oi >= 0) {
+                    if (tmp_bor_mut[k]) {
+                        if (ctx->slots[oi].mut_borrows > 0) ctx->slots[oi].mut_borrows--;
+                    } else {
+                        if (ctx->slots[oi].imm_borrows > 0) ctx->slots[oi].imm_borrows--;
+                    }
+                }
+            }
             break;
         }
         default:
@@ -7222,7 +7675,10 @@ static void own_check_stmts(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Stmt** s
         Stmt* s = stmts[i];
         switch (s->kind) {
             case STMT_RETURN:
-                if (s->ret.expr) own_check_expr(mod, fn, ctx, s->ret.expr, type_is_owned(s->ret.expr->ty));
+                if (s->ret.expr) {
+                    own_check_expr(mod, fn, ctx, s->ret.expr, type_is_owned(s->ret.expr->ty));
+                    own_check_ret_ref(mod, fn, ctx, s->ret.expr, s->loc);
+                }
                 break;
             case STMT_YIELD:
                 if (s->expr_s.expr) own_check_expr(mod, fn, ctx, s->expr_s.expr, type_is_owned(s->expr_s.expr->ty));
@@ -7245,12 +7701,42 @@ static void own_check_stmts(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Stmt** s
                     }
                     VarSym* vs = resolve_var(mod, fn, vname, NULL);
                     Type* vty = vs ? vs->type : s->assign.value->ty;
-                    bool is_borrow = !is_glob && expr_is_borrow_source(s->assign.value) && type_is_owned(vty);
-                    if (is_borrow) {
+                    bool can_ptr_view = (fn == NULL) || !is_glob;
+                    bool is_ptr_take_bor = can_ptr_view && s->assign.value->kind == EXPR_ATTR && s->assign.value->is_ptr_take &&
+                                           (strcmp(s->assign.value->attr.attr, "ref") == 0 || strcmp(s->assign.value->attr.attr, "mut_ref") == 0);
+                    bool is_ref_var_copy = can_ptr_view && s->assign.value->kind == EXPR_VAR && s->assign.value->ty &&
+                                           (s->assign.value->ty->kind == TY_REF ||
+                                            (s->assign.value->ty->kind == TY_OPTIONAL && s->assign.value->ty->elem->kind == TY_REF));
+                    bool is_mut_ref_var_move = can_ptr_view && s->assign.value->kind == EXPR_VAR && s->assign.value->ty &&
+                                               (s->assign.value->ty->kind == TY_MUT_REF ||
+                                                (s->assign.value->ty->kind == TY_OPTIONAL && s->assign.value->ty->elem->kind == TY_MUT_REF)) &&
+                                               (!vty || vty->kind != TY_ADDR);
+                    bool is_owned_bor = !is_glob && expr_is_borrow_source(s->assign.value) && type_is_owned(vty);
+                    bool is_borrow = is_owned_bor || is_ptr_take_bor || is_ref_var_copy || is_mut_ref_var_move;
+
+                    const char* xfer_owner = NULL;
+                    bool xfer_mut = false;
+                    bool xfer_stack = false;
+                    if (is_mut_ref_var_move) {
+                        int sidx = own_find(ctx, s->assign.value->var.name);
+                        if (sidx >= 0 && ctx->slots[sidx].is_view) {
+                            xfer_owner = ctx->slots[sidx].borrow_owner;
+                            xfer_mut = ctx->slots[sidx].is_mut_borrow;
+                            xfer_stack = ctx->slots[sidx].borrows_stack;
+                        }
+                        own_check_expr(mod, fn, ctx, s->assign.value, true);
+                        if (sidx >= 0) {
+                            ctx->slots[sidx].is_view = false;
+                            ctx->slots[sidx].is_mut_borrow = false;
+                            ctx->slots[sidx].borrows_stack = false;
+                            ctx->slots[sidx].borrow_owner = NULL;
+                        }
+                    } else if (is_borrow) {
                         own_check_expr(mod, fn, ctx, s->assign.value, false);
                     } else {
                         own_check_expr(mod, fn, ctx, s->assign.value, type_is_owned(vty));
                     }
+
                     int idx = own_find(ctx, vname);
                     if (idx >= 0) {
                         if (ctx->slots[idx].imm_borrows > 0 || ctx->slots[idx].mut_borrows > 0) {
@@ -7263,7 +7749,39 @@ static void own_check_stmts(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Stmt** s
                     if (idx >= 0) {
                         ctx->slots[idx].state = OWN_ALIVE;
                         ctx->slots[idx].is_view = is_borrow;
-                        if (is_borrow) {
+                        ctx->slots[idx].is_mut_borrow = false;
+                        ctx->slots[idx].borrows_stack = false;
+                        if (is_ptr_take_bor) {
+                            const char* rv = expr_root_var(s->assign.value->attr.obj);
+                            bool is_m = (strcmp(s->assign.value->attr.attr, "mut_ref") == 0);
+                            ctx->slots[idx].is_mut_borrow = is_m;
+                            ctx->slots[idx].borrows_stack = expr_borrows_stack(mod, fn, ctx, s->assign.value->attr.obj);
+                            ctx->slots[idx].borrow_owner = rv;
+                            if (rv) {
+                                int oi = own_find(ctx, rv);
+                                if (oi >= 0) {
+                                    if (is_m) ctx->slots[oi].mut_borrows++;
+                                    else ctx->slots[oi].imm_borrows++;
+                                }
+                            }
+                        } else if (is_ref_var_copy) {
+                            int sidx = own_find(ctx, s->assign.value->var.name);
+                            if (sidx >= 0 && ctx->slots[sidx].is_view && ctx->slots[sidx].borrow_owner) {
+                                const char* bo = ctx->slots[sidx].borrow_owner;
+                                ctx->slots[idx].borrow_owner = bo;
+                                ctx->slots[idx].borrows_stack = ctx->slots[sidx].borrows_stack;
+                                int oi = own_find(ctx, bo);
+                                if (oi >= 0) ctx->slots[oi].imm_borrows++;
+                            } else {
+                                ctx->slots[idx].is_view = false;
+                                ctx->slots[idx].borrow_owner = NULL;
+                            }
+                        } else if (is_mut_ref_var_move) {
+                            ctx->slots[idx].is_view = (xfer_owner != NULL);
+                            ctx->slots[idx].is_mut_borrow = xfer_mut;
+                            ctx->slots[idx].borrows_stack = xfer_stack;
+                            ctx->slots[idx].borrow_owner = xfer_owner;
+                        } else if (is_owned_bor) {
                             const char* rv = expr_root_var(s->assign.value);
                             ctx->slots[idx].borrow_owner = rv;
                             if (rv) {
@@ -7274,17 +7792,20 @@ static void own_check_stmts(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Stmt** s
                             ctx->slots[idx].borrow_owner = NULL;
                         }
                     }
+                } else if (tgt->kind == EXPR_CALL && tgt->is_ptr_take) {
+                    own_check_expr(mod, fn, ctx, tgt, false);
+                    own_check_expr(mod, fn, ctx, s->assign.value, type_is_owned(s->assign.value->ty));
                 } else if (tgt->kind == EXPR_ATTR) {
                     const char* rv = expr_root_var(tgt->attr.obj);
-                    if (rv) own_check_mutate_var(ctx, rv, s->loc);
+                    if (rv && !type_is_ptr(tgt->attr.obj->ty)) own_check_mutate_var(ctx, rv, s->loc);
                     own_check_expr(mod, fn, ctx, tgt->attr.obj, false);
                     own_check_expr(mod, fn, ctx, s->assign.value, type_is_owned(s->assign.value->ty));
                 } else if (tgt->kind == EXPR_INDEX) {
                     const char* rv = expr_root_var(tgt->index.obj);
-                    if (rv) own_check_mutate_var(ctx, rv, s->loc);
+                    if (rv && !type_is_ptr(tgt->index.obj->ty)) own_check_mutate_var(ctx, rv, s->loc);
                     own_check_expr(mod, fn, ctx, tgt->index.obj, false);
-                    bool move_key = tgt->index.obj->ty && tgt->index.obj->ty->kind == TY_DICT &&
-                                    type_is_owned(tgt->index.obj->ty->key);
+                    Type* it_ot = type_deref_all(tgt->index.obj->ty);
+                    bool move_key = it_ot && it_ot->kind == TY_DICT && type_is_owned(it_ot->key);
                     own_check_expr(mod, fn, ctx, tgt->index.index, move_key);
                     own_check_expr(mod, fn, ctx, s->assign.value, type_is_owned(s->assign.value->ty));
                 }
@@ -7302,9 +7823,13 @@ static void own_check_stmts(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Stmt** s
                 }
                 break;
             case STMT_AUG_ASSIGN: {
-                const char* rv = expr_root_var(s->aug_assign.target);
-                if (rv) own_check_mutate_var(ctx, rv, s->loc);
-                own_check_expr(mod, fn, ctx, s->aug_assign.target, false);
+                Expr* tgt = s->aug_assign.target;
+                const char* rv = expr_root_var(tgt);
+                if (rv && !(tgt->kind == EXPR_ATTR && type_is_ptr(tgt->attr.obj->ty)) &&
+                    !(tgt->kind == EXPR_INDEX && type_is_ptr(tgt->index.obj->ty))) {
+                    own_check_mutate_var(ctx, rv, s->loc);
+                }
+                own_check_expr(mod, fn, ctx, tgt, false);
                 own_check_expr(mod, fn, ctx, s->aug_assign.value, false);
                 break;
             }
@@ -7489,8 +8014,9 @@ static void check_program_ownership(void) {
             int idx = own_ensure(&ctx, fn->param_names[p], fn->param_types[p], false);
             if (idx >= 0) {
                 ctx.slots[idx].state = OWN_ALIVE;
-                ctx.slots[idx].is_view = (fn->param_modes && fn->param_modes[p] != PM_MOVE);
-                ctx.slots[idx].is_mut_borrow = (fn->param_modes && fn->param_modes[p] == PM_MUT_BORROW);
+                bool is_owned_p = type_is_owned(fn->param_types[p]);
+                ctx.slots[idx].is_view = (is_owned_p && fn->param_modes && fn->param_modes[p] != PM_MOVE);
+                ctx.slots[idx].is_mut_borrow = (is_owned_p && fn->param_modes && fn->param_modes[p] == PM_MUT_BORROW);
             }
         }
         if (fn->is_lambda && fn->lambda_ast) {
@@ -7648,6 +8174,7 @@ static const char* llvm_reg_ty(Type* t) {
         case TY_F64: return "double";
         case TY_STR: case TY_BYTES: case TY_BIGINT: case TY_FILE:
         case TY_LIST: case TY_SET: case TY_DICT: case TY_TASK: case TY_FUNC:
+        case TY_REF: case TY_MUT_REF: case TY_ADDR:
         case TY_NONE_LIT:
             return "ptr";
         case TY_CLASS:
@@ -7805,6 +8332,11 @@ static const char* cg_coerce(const char* val, Type* from, Type* to) {
         cg_emit("%s = insertvalue %s %s, %s %s, 1", r2, llvm_reg_ty(to), r1, llvm_mem_ty(to->elem), minner);
         return r2;
     }
+    if (type_is_ptr(from) && type_is_int(to)) {
+        const char* iv = cg_reg();
+        cg_emit("%s = ptrtoint ptr %s to i64", iv, val);
+        return cg_coerce(iv, g_ty_u64, to);
+    }
     if (from->kind == TY_BOOL && type_is_int(to)) {
         const char* r = cg_reg();
         cg_emit("%s = zext i1 %s to %s", r, val, llvm_reg_ty(to));
@@ -7896,6 +8428,10 @@ static const char* cg_truthy(const char* val, Type* t) {
         return b;
     }
     if (t->kind == TY_CLASS && !t->cls->is_value_type) {
+        cg_emit("%s = icmp ne ptr %s, null", r, val);
+        return r;
+    }
+    if (type_is_ptr(t)) {
         cg_emit("%s = icmp ne ptr %s, null", r, val);
         return r;
     }
@@ -9268,6 +9804,129 @@ static VarSym* cg_find_var_sym(const char* name) {
 static const char* cg_expr(Expr* e, Type* hint);
 static void cg_stmts(Stmt** stmts, int count);
 
+static const char* cg_eval_recv(Expr* obj_e) {
+    const char* v = cg_expr(obj_e, NULL);
+    Type* t = obj_e->ty;
+    while (type_is_ptr(t)) {
+        Type* next = t->elem;
+        const char* mv = cg_reg();
+        cg_emit("%s = load %s, ptr %s", mv, llvm_mem_ty(next), v);
+        v = cg_mem_to_reg(mv, next);
+        t = next;
+    }
+    return v;
+}
+
+static const char* cg_lvalue_ptr(Expr* e);
+
+static const char* cg_deref_to_class_ptr(Expr* obj_e, ClassInfo** out_cls) {
+    Type* t = obj_e->ty;
+    if (!type_is_ptr(t)) {
+        if (out_cls) *out_cls = t->cls;
+        if (t->cls->is_value_type) return cg_lvalue_ptr(obj_e);
+        return cg_expr(obj_e, NULL);
+    }
+    const char* p = cg_expr(obj_e, NULL);
+    while (type_is_ptr(t->elem)) {
+        const char* np = cg_reg();
+        cg_emit("%s = load ptr, ptr %s", np, p);
+        p = np;
+        t = t->elem;
+    }
+    ClassInfo* cls = t->elem->cls;
+    if (out_cls) *out_cls = cls;
+    if (cls->is_value_type) return p;
+    const char* np = cg_reg();
+    cg_emit("%s = load ptr, ptr %s", np, p);
+    return np;
+}
+
+static const char* cg_lvalue_ptr(Expr* e) {
+    if (!e) return "null";
+    if (e->kind == EXPR_VAR) {
+        if (strcmp(e->var.name, "self") == 0 || (strcmp(e->var.name, "cls") == 0 && g_cg.cur_fn && g_cg.cur_fn->is_classmethod)) {
+            VarSym* sv = find_local_in_fn(g_cg.cur_fn, g_cg.cur_fn->param_names[0]);
+            return cg_ensure_local_alloca(sv->llvm_name, sv->type);
+        }
+        Type* dummy = NULL;
+        return cg_var_ptr(e->var.name, &dummy);
+    }
+    if (e->kind == EXPR_ATTR) {
+        const char* an = e->attr.attr;
+        if (e->attr.obj->ty->kind == TY_MODULE) {
+            VarSym* gv = find_global_in_mod(e->attr.obj->ty->mod, an);
+            return gv ? gv->llvm_name : "null";
+        }
+        ClassInfo* cls = NULL;
+        const char* obj_p = cg_deref_to_class_ptr(e->attr.obj, &cls);
+        FieldInfo* fi = find_field_in_class(cls, an);
+        if (fi) {
+            const char* fp = cg_reg();
+            cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, cls->llvm_name, obj_p, fi->slot_index);
+            return fp;
+        }
+        FieldInfo* ca = find_class_attr(cls, an);
+        if (ca) {
+            ClassInfo* owner = cls;
+            for (int m = 0; m < cls->mro_count; m++) {
+                for (int k = 0; k < cls->mro[m]->class_attr_count; k++) {
+                    if (strcmp(cls->mro[m]->class_attrs[k].name, an) == 0) { owner = cls->mro[m]; goto found_ca_lv; }
+                }
+            }
+            found_ca_lv:;
+            return arena_sprintf("@_cattr_%s%s__%s", owner->mod->prefix, owner->name, an);
+        }
+        return "null";
+    }
+    if (e->kind == EXPR_INDEX) {
+        const char* ov = cg_eval_recv(e->index.obj);
+        Type* ot = type_deref_all(e->index.obj->ty);
+        if (ot->kind == TY_LIST) {
+            const char* iv = cg_coerce(cg_expr(e->index.index, g_ty_i64), e->index.index->ty, g_ty_i64);
+            const char* idx_ok = iv;
+            if (!e->is_inbounds) {
+                const char* lp = cg_reg(); const char* len32 = cg_reg(); const char* len64 = cg_reg();
+                cg_emit("%s = getelementptr %%%s, ptr %s, i32 0, i32 0", lp, ot->mangled, ov);
+                cg_emit("%s = load i32, ptr %s", len32, lp);
+                cg_emit("%s = sext i32 %s to i64", len64, len32);
+                if (!e->index.index->is_nonneg) {
+                    const char* is_neg = cg_reg(); const char* adj = cg_reg(); const char* sel = cg_reg();
+                    cg_emit("%s = icmp slt i64 %s, 0", is_neg, iv);
+                    cg_emit("%s = add i64 %s, %s", adj, iv, len64);
+                    cg_emit("%s = select i1 %s, i64 %s, i64 %s", sel, is_neg, adj, iv);
+                    idx_ok = sel;
+                }
+                const char* ok = cg_reg();
+                const char* l_inb = cg_lbl("lv_inb"); const char* l_oob = cg_lbl("lv_oob");
+                cg_emit("%s = icmp ult i64 %s, %s", ok, idx_ok, len64);
+                cg_cond_br(ok, l_inb, l_oob);
+                cg_label(l_oob);
+                cg_emit("call void @stricta_bounds_fail(i64 %s, i64 %s, ptr null, i32 0)", iv, len64);
+                cg_emit("unreachable");
+                cg_label(l_inb);
+            }
+            const char* ip = cg_reg(); const char* arr = cg_reg(); const char* slot = cg_reg();
+            cg_emit("%s = getelementptr %%%s, ptr %s, i32 0, i32 2", ip, ot->mangled, ov);
+            cg_emit("%s = load ptr, ptr %s", arr, ip);
+            cg_emit("%s = getelementptr %s, ptr %s, i64 %s", slot, llvm_mem_ty(ot->elem), arr, idx_ok);
+            return slot;
+        }
+        return "null";
+    }
+    if (e->kind == EXPR_CALL && e->is_ptr_take) {
+        int lvl = (e->call.arg_count == 2) ? (int)e->call.args[0]->int_lit.ival : 1;
+        Expr* parg = e->call.args[(e->call.arg_count == 2) ? 1 : 0];
+        const char* p = cg_expr(parg, NULL);
+        for (int k = 1; k < lvl; k++) {
+            const char* np = cg_reg();
+            cg_emit("%s = load ptr, ptr %s", np, p);
+            p = np;
+        }
+        return p;
+    }
+    return "null";
+}
+
 static void cg_reg_temp(const char* reg, Type* ty) {
     if (!reg || !ty || !type_is_owned(ty) || g_cg.temp_count >= 128) return;
     emit_drop_for_type(ty);
@@ -9375,6 +10034,7 @@ static bool expr_produces_fresh_temp(Expr* e) {
             }
             return false;
         case EXPR_CALL:
+            if (e->is_ptr_take) return false;
             if (e->call.callee->kind == EXPR_VAR && strcmp(e->call.callee->var.name, "super") == 0) return false;
             return true;
         default:
@@ -9414,6 +10074,13 @@ static const char* cg_to_str(const char* val, Type* t) {
     if (t->kind == TY_BIGINT) {
         const char* r = cg_reg();
         cg_emit("%s = call ptr @stricta_bigint_to_str(ptr %s)", r, val);
+        return r;
+    }
+    if (type_is_ptr(t)) {
+        const char* iv = cg_reg();
+        const char* r = cg_reg();
+        cg_emit("%s = ptrtoint ptr %s to i64", iv, val);
+        cg_emit("%s = call ptr @stricta_hex(i64 %s)", r, iv);
         return r;
     }
     if (t->kind == TY_OPTIONAL) {
@@ -10645,8 +11312,10 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
     int argc = call->call.arg_count;
     Expr** args = call->call.args;
 
+    obj_ty = type_deref_all(obj_ty);
+
     if (obj_ty->kind == TY_STR) {
-        const char* self_v = cg_expr(obj_e, NULL);
+        const char* self_v = cg_eval_recv(obj_e);
         if (strcmp(mname, "split") == 0) {
             const char* sep = (argc == 1) ? cg_expr(args[0], g_ty_str) : "null";
             const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_split(ptr %s, ptr %s)", r, self_v, sep); return r;
@@ -10752,7 +11421,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
     }
 
     if (obj_ty->kind == TY_BYTES || obj_ty->kind == TY_BIGINT || obj_ty->kind == TY_TUPLE) {
-        const char* ov = cg_expr(obj_e, NULL);
+        const char* ov = cg_eval_recv(obj_e);
         if (strcmp(mname, "copy") == 0) {
             if (!type_is_owned(obj_ty)) return ov;
             emit_clone_for_type(obj_ty);
@@ -10764,7 +11433,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
     }
 
     if (obj_ty->kind == TY_FILE) {
-        const char* fv = cg_expr(obj_e, NULL);
+        const char* fv = cg_eval_recv(obj_e);
         if (strcmp(mname, "read") == 0) {
             const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_file_read(ptr %s)", r, fv); return r;
         }
@@ -10778,7 +11447,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
     }
 
     if (obj_ty->kind == TY_LIST) {
-        const char* lv = cg_expr(obj_e, NULL);
+        const char* lv = cg_eval_recv(obj_e);
         const char* m = obj_ty->mangled;
         Type* el = obj_ty->elem;
         const char* mty = llvm_mem_ty(el);
@@ -10824,7 +11493,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
     }
 
     if (obj_ty->kind == TY_SET) {
-        const char* sv = cg_expr(obj_e, NULL);
+        const char* sv = cg_eval_recv(obj_e);
         const char* m = obj_ty->mangled;
         Type* el = obj_ty->elem;
         const char* mty = llvm_mem_ty(el);
@@ -10861,7 +11530,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
     }
 
     if (obj_ty->kind == TY_DICT) {
-        const char* dv = cg_expr(obj_e, NULL);
+        const char* dv = cg_eval_recv(obj_e);
         const char* m = obj_ty->mangled;
         Type* kt = obj_ty->key; Type* vt = obj_ty->val;
         const char* kmty = llvm_mem_ty(kt); const char* vmty = llvm_mem_ty(vt);
@@ -11044,7 +11713,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
 
         FuncInfo* m = call->call.resolved_fn ? call->call.resolved_fn : find_method_in_class(cls, mname);
         if (!m && strcmp(mname, "copy") == 0) {
-            const char* ov = cg_expr(obj_e, NULL);
+            const char* ov = cg_eval_recv(obj_e);
             if (!type_is_owned(obj_ty)) return ov;
             emit_clone_for_type(obj_ty);
             const char* r = cg_reg();
@@ -11052,7 +11721,7 @@ static const char* cg_method_call(Expr* call, Expr* obj_e, const char* mname, Ty
             return r;
         }
         bool call_on_class_type = (obj_e->kind == EXPR_VAR && find_class_in_mod(g_cg.cur_mod, obj_e->var.name) != NULL);
-        const char* self_val = call_on_class_type ? NULL : cg_expr(obj_e, NULL);
+        const char* self_val = call_on_class_type ? NULL : cg_eval_recv(obj_e);
         if (!call_on_class_type && !m->is_static && !m->is_classmethod && m->param_count > 0 &&
             m->param_modes && m->param_modes[0] == PM_MOVE) {
             cg_consume_expr(obj_e, self_val);
@@ -11557,8 +12226,8 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
             return d;
         }
         case EXPR_INDEX: {
-            const char* ov = cg_expr(e->index.obj, NULL);
-            Type* ot = e->index.obj->ty;
+            const char* ov = cg_eval_recv(e->index.obj);
+            Type* ot = type_deref_all(e->index.obj->ty);
             if (ot->kind == TY_TUPLE) {
                 int idx = (int)e->index.index->int_lit.ival;
                 if (idx < 0) idx += ot->tuple_count;
@@ -11624,8 +12293,8 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
             return "0";
         }
         case EXPR_SLICE: {
-            const char* ov = cg_expr(e->slice.obj, NULL);
-            Type* ot = e->slice.obj->ty;
+            const char* ov = cg_eval_recv(e->slice.obj);
+            Type* ot = type_deref_all(e->slice.obj->ty);
             if (!e->slice.step) {
                 const char* st = e->slice.start ? cg_coerce(cg_expr(e->slice.start, g_ty_i64), e->slice.start->ty, g_ty_i64) : "0";
                 const char* sp = e->slice.stop ? cg_coerce(cg_expr(e->slice.stop, g_ty_i64), e->slice.stop->ty, g_ty_i64) : "9223372036854775807";
@@ -11658,6 +12327,9 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
             return r;
         }
         case EXPR_ATTR: {
+            if (e->is_ptr_take) {
+                return cg_lvalue_ptr(e->attr.obj);
+            }
             const char* an = e->attr.attr;
             if (e->attr.obj->ty->kind == TY_MODULE) {
                 ModuleInfo* mm = e->attr.obj->ty->mod;
@@ -11668,19 +12340,21 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                     return cg_mem_to_reg(mv, gv->type);
                 }
             }
-            Type* ot = e->attr.obj->ty;
+            Type* raw_ot = e->attr.obj->ty;
+            Type* ot = type_deref_all(raw_ot);
             if (ot->kind == TY_CLASS) {
                 ClassInfo* cls = ot->cls;
                 FieldInfo* fi = find_field_in_class(cls, an);
                 if (fi) {
-                    const char* ov = cg_expr(e->attr.obj, NULL);
-                    if (cls->is_value_type) {
+                    if (!type_is_ptr(raw_ot) && cls->is_value_type) {
+                        const char* ov = cg_expr(e->attr.obj, NULL);
                         const char* mv = cg_reg();
                         cg_emit("%s = extractvalue %s %s, %d", mv, cls->llvm_name, ov, fi->slot_index);
                         return cg_mem_to_reg(mv, fi->type);
                     }
+                    const char* obj_p = cg_deref_to_class_ptr(e->attr.obj, NULL);
                     const char* fp = cg_reg(); const char* mv = cg_reg();
-                    cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, cls->llvm_name, ov, fi->slot_index);
+                    cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, cls->llvm_name, obj_p, fi->slot_index);
                     cg_emit("%s = load %s, ptr %s", mv, llvm_mem_ty(fi->type), fp);
                     return cg_mem_to_reg(mv, fi->type);
                 }
@@ -11699,7 +12373,7 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                 }
                 FuncInfo* prop = find_method_in_class(cls, an);
                 if (prop && prop->is_property) {
-                    const char* ov = cg_expr(e->attr.obj, NULL);
+                    const char* ov = cg_eval_recv(e->attr.obj);
                     const char* r = cg_reg();
                     cg_emit("%s = call %s %s(%s %s)", r, llvm_reg_ty(prop->ret_type), prop->llvm_name, llvm_reg_ty(ot), ov);
                     return r;
@@ -11733,8 +12407,8 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                     return "0";
                 }
                 if (strcmp(cname, "len") == 0) {
-                    const char* av = cg_expr(args[0], NULL);
-                    Type* at = args[0]->ty;
+                    const char* av = cg_eval_recv(args[0]);
+                    Type* at = type_deref_all(args[0]->ty);
                     if (at->kind == TY_TUPLE) return arena_sprintf("%d", at->tuple_count);
                     const char* lp = cg_reg(); const char* l32 = cg_reg(); const char* r = cg_reg();
                     const char* sty = (at->kind == TY_STR) ? "%StrictaStr" : (at->kind == TY_BYTES) ? "%StrictaBytes" : arena_sprintf("%%%s", at->mangled);
@@ -11743,6 +12417,12 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                     cg_emit("%s = load i32, ptr %s", l32, lp);
                     cg_emit("%s = sext i32 %s to i64", r, l32);
                     return r;
+                }
+                if (e->is_ptr_take) {
+                    const char* lp = cg_lvalue_ptr(e);
+                    const char* mv = cg_reg();
+                    cg_emit("%s = load %s, ptr %s", mv, llvm_mem_ty(ty), lp);
+                    return cg_mem_to_reg(mv, ty);
                 }
                 if (strcmp(cname, "str") == 0 || strcmp(cname, "repr") == 0) {
                     if (args[0]->ty->kind == TY_CLASS) {
@@ -12541,6 +13221,9 @@ static bool expr_escapes_var_d(Expr* e, const char* vname, bool allowed_pos, int
             }
             return false;
         case EXPR_ATTR:
+            if (e->is_ptr_take || expr_is_ptr_attr(e->attr.attr)) {
+                return expr_escapes_var_d(e->attr.obj, vname, false, depth);
+            }
             return expr_escapes_var_d(e->attr.obj, vname, true, depth);
         case EXPR_INT: case EXPR_FLOAT: case EXPR_BOOL: case EXPR_STR: case EXPR_NONE: case EXPR_BYTES:
             return false;
@@ -12815,34 +13498,36 @@ static void cg_stmts(Stmt** stmts, int count) {
                     if (vs && vs->drop_flag_llvm) {
                         cg_emit("store i1 %s, ptr %s", is_borrow ? "false" : "true", vs->drop_flag_llvm);
                     }
+                } else if (tgt->kind == EXPR_CALL && tgt->is_ptr_take) {
+                    const char* dst_p = cg_lvalue_ptr(tgt);
+                    Type* tt = tgt->ty;
+                    const char* raw_v = cg_expr(s->assign.value, tt);
+                    cg_consume_expr(s->assign.value, raw_v);
+                    const char* v = cg_coerce(raw_v, s->assign.value->ty, tt);
+                    if (type_is_owned(tt)) {
+                        emit_drop_for_type(tt);
+                        const char* old_v = cg_reg();
+                        cg_emit("%s = load %s, ptr %s", old_v, llvm_mem_ty(tt), dst_p);
+                        cg_emit("call void @_drop_%s(%s %s)", tt->mangled, llvm_mem_ty(tt), old_v);
+                    }
+                    cg_emit("store %s %s, ptr %s", llvm_mem_ty(tt), cg_reg_to_mem(v, tt), dst_p);
                 } else if (tgt->kind == EXPR_ATTR) {
-                    Type* ot = tgt->attr.obj->ty;
+                    Type* ot = type_deref_all(tgt->attr.obj->ty);
                     FieldInfo* fi = find_field_in_class(ot->cls, tgt->attr.attr);
                     if (fi) {
-                        const char* ov = cg_expr(tgt->attr.obj, NULL);
+                        const char* obj_p = cg_deref_to_class_ptr(tgt->attr.obj, NULL);
                         const char* raw_v = cg_expr(s->assign.value, fi->type);
                         cg_consume_expr(s->assign.value, raw_v);
                         const char* v = cg_coerce(raw_v, s->assign.value->ty, fi->type);
-                        if (ot->cls->is_value_type) {
-                            /* Value type mutation inside __init__ or local */
-                            if (tgt->attr.obj->kind == EXPR_VAR) {
-                                Type* dummy = NULL;
-                                const char* vp = cg_var_ptr(tgt->attr.obj->var.name, &dummy);
-                                const char* fp = cg_reg();
-                                cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, ot->cls->llvm_name, vp, fi->slot_index);
-                                cg_emit("store %s %s, ptr %s", llvm_mem_ty(fi->type), cg_reg_to_mem(v, fi->type), fp);
-                            }
-                        } else {
-                            const char* fp = cg_reg();
-                            cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, ot->cls->llvm_name, ov, fi->slot_index);
-                            if (type_is_owned(fi->type)) {
-                                emit_drop_for_type(fi->type);
-                                const char* old_v = cg_reg();
-                                cg_emit("%s = load %s, ptr %s", old_v, llvm_mem_ty(fi->type), fp);
-                                cg_emit("call void @_drop_%s(%s %s)", fi->type->mangled, llvm_mem_ty(fi->type), old_v);
-                            }
-                            cg_emit("store %s %s, ptr %s", llvm_mem_ty(fi->type), cg_reg_to_mem(v, fi->type), fp);
+                        const char* fp = cg_reg();
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, ot->cls->llvm_name, obj_p, fi->slot_index);
+                        if (type_is_owned(fi->type)) {
+                            emit_drop_for_type(fi->type);
+                            const char* old_v = cg_reg();
+                            cg_emit("%s = load %s, ptr %s", old_v, llvm_mem_ty(fi->type), fp);
+                            cg_emit("call void @_drop_%s(%s %s)", fi->type->mangled, llvm_mem_ty(fi->type), old_v);
                         }
+                        cg_emit("store %s %s, ptr %s", llvm_mem_ty(fi->type), cg_reg_to_mem(v, fi->type), fp);
                     } else {
                         FieldInfo* ca = find_class_attr(ot->cls, tgt->attr.attr);
                         ClassInfo* owner = ot->cls;
@@ -12859,8 +13544,8 @@ static void cg_stmts(Stmt** stmts, int count) {
                                 owner->mod->prefix, owner->name, tgt->attr.attr);
                     }
                 } else if (tgt->kind == EXPR_INDEX) {
-                    const char* ov = cg_expr(tgt->index.obj, NULL);
-                    Type* ot = tgt->index.obj->ty;
+                    const char* ov = cg_eval_recv(tgt->index.obj);
+                    Type* ot = type_deref_all(tgt->index.obj->ty);
                     if (ot->kind == TY_LIST) {
                         const char* iv = cg_coerce(cg_expr(tgt->index.index, g_ty_i64), tgt->index.index->ty, g_ty_i64);
                         const char* raw_vv = cg_expr(s->assign.value, ot->elem);
@@ -12944,13 +13629,32 @@ static void cg_stmts(Stmt** stmts, int count) {
                         cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(cg_coerce(res, vt, vt), vt), vp);
                         if (vs && vs->drop_flag_llvm) cg_emit("store i1 true, ptr %s", vs->drop_flag_llvm);
                     }
+                } else if (tgt->kind == EXPR_CALL && tgt->is_ptr_take) {
+                    const char* vp = cg_lvalue_ptr(tgt);
+                    Type* vt = tgt->ty;
+                    const char* cur_m = cg_reg();
+                    cg_emit("%s = load %s, ptr %s", cur_m, llvm_mem_ty(vt), vp);
+                    const char* cur = cg_mem_to_reg(cur_m, vt);
+                    const char* rv = cg_expr(s->aug_assign.value, vt);
+                    if (vt->kind == TY_SET) {
+                        const char* fnm = strcmp(bop, "|") == 0 ? "update" : strcmp(bop, "&") == 0 ? "intersection_update" :
+                                          strcmp(bop, "-") == 0 ? "difference_update" : "symmetric_difference_update";
+                        cg_emit("call void @_%s_%s(ptr %s, ptr %s)", vt->mangled, fnm, cur, rv);
+                    } else {
+                        const char* res = cg_binop_values(bop, cur, vt, rv, s->aug_assign.value->ty, vt);
+                        if (type_is_owned(vt)) {
+                            emit_drop_for_type(vt);
+                            cg_emit("call void @_drop_%s(%s %s)", vt->mangled, llvm_mem_ty(vt), cur_m);
+                        }
+                        cg_emit("store %s %s, ptr %s", llvm_mem_ty(vt), cg_reg_to_mem(cg_coerce(res, vt, vt), vt), vp);
+                    }
                 } else if (tgt->kind == EXPR_ATTR) {
-                    Type* ot = tgt->attr.obj->ty;
+                    Type* ot = type_deref_all(tgt->attr.obj->ty);
                     FieldInfo* fi = find_field_in_class(ot->cls, tgt->attr.attr);
                     if (fi) {
-                        const char* ov = cg_expr(tgt->attr.obj, NULL);
+                        const char* obj_p = cg_deref_to_class_ptr(tgt->attr.obj, NULL);
                         const char* fp = cg_reg();
-                        cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, ot->cls->llvm_name, ov, fi->slot_index);
+                        cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 %d", fp, ot->cls->llvm_name, obj_p, fi->slot_index);
                         const char* cur_m = cg_reg();
                         cg_emit("%s = load %s, ptr %s", cur_m, llvm_mem_ty(fi->type), fp);
                         const char* cur = cg_mem_to_reg(cur_m, fi->type);
@@ -12963,8 +13667,8 @@ static void cg_stmts(Stmt** stmts, int count) {
                         cg_emit("store %s %s, ptr %s", llvm_mem_ty(fi->type), cg_reg_to_mem(cg_coerce(res, fi->type, fi->type), fi->type), fp);
                     }
                 } else if (tgt->kind == EXPR_INDEX) {
-                    const char* ov = cg_expr(tgt->index.obj, NULL);
-                    Type* ot = tgt->index.obj->ty;
+                    const char* ov = cg_eval_recv(tgt->index.obj);
+                    Type* ot = type_deref_all(tgt->index.obj->ty);
                     const char* iv = cg_coerce(cg_expr(tgt->index.index, g_ty_i64), tgt->index.index->ty, g_ty_i64);
                     const char* cur = cg_mem_to_reg(({ const char* r = cg_reg(); cg_emit("%s = call %s @_%s_get(ptr %s, i64 %s)", r, llvm_mem_ty(ot->elem), ot->mangled, ov, iv); r; }), ot->elem);
                     const char* rv = cg_expr(s->aug_assign.value, ot->elem);

@@ -1,0 +1,187 @@
+from dataclasses import dataclass
+
+@dataclass
+class Vec2:
+    x: int
+    y: int
+
+    def mag2(self) -> int:
+        return self.x * self.x + self.y * self.y
+
+class BoxNode:
+    value: int
+    label: str
+
+    def __init__(self, value: int, label: str):
+        self.value = value
+        self.label = label
+
+    def bump(self, delta: int) -> None:
+        self.value += delta
+
+class AddrHolder:
+    ptr: addr[int]
+    items: list[addr[int]]
+
+    def __init__(self, ptr: addr[int]):
+        self.ptr = ptr
+        self.items = [ptr]
+
+G_VAL: int = 123
+
+def read_ref(r: ref[int]) -> int:
+    return val(r)
+
+def inc_mut(m: ref[mut int], delta: int) -> None:
+    val(m) += delta
+
+def swap_ints(a: mut_ref[int], b: mut_ref[int]) -> None:
+    tmp = val(a)
+    val(a) = val(b)
+    val(b) = tmp
+
+def sum_list_ref(xs: ref[list[int]]) -> int:
+    total = 0
+    for i in range(len(xs)):
+        total += xs[i]
+    return total
+
+def push_list_mut(xs: mut_ref[list[int]], v: int) -> None:
+    xs.append(v)
+
+def global_ref() -> ref[int]:
+    return G_VAL.ref
+
+def node_val_ref(n: BoxNode) -> ref[int]:
+    return n.value.ref
+
+def list_head_ref(xs: list[int]) -> ref[int]:
+    return xs[0].ref
+
+def read_generic(p):
+    return val(p)
+
+# 1. Shared immutable references and NLL
+x = 10
+r1: ref[int] = x.ref
+r2 = x.ref
+assert val(r1) == 10
+assert val(r2) == 10
+assert r1 == r2
+assert read_ref(r1) == 10
+# After last use of r1/r2, x can be mutated again (NLL)
+x = 15
+
+# 2. Mutable references: mut_ref[T] and ref[mut T]
+m: mut_ref[int] = x.mut_ref
+val(m) = 20
+val(m) += 5
+inc_mut(m, 3)
+assert val(m) == 28
+# After last use of m, x is readable and equals 28
+assert x == 28
+
+a = 100
+b = 200
+swap_ints(a.mut_ref, b.mut_ref)
+assert a == 200 and b == 100
+
+# Coercion: mut_ref[T] -> ref[T] -> addr[T]
+y = 77
+my = y.mut_ref
+assert read_ref(my) == 77
+ay: addr[int] = my
+assert val(ay) == 77
+assert int(y.addr) == int(ay)
+assert hex(y.addr) == str(y.addr)
+
+# 3. Multi-level pointers
+z = 5
+pz = z.mut_ref
+ppz = pz.mut_ref
+assert val(2, ppz) == 5
+val(2, ppz) = 42
+assert val(pz) == 42
+
+rpp = pz.ref
+assert val(2, rpp) == 42
+assert z == 42
+
+# 4. Raw addr[T], addr[const T], addr[mut T], stored in classes and lists
+c_ptr: addr[const int] = a.addr
+m_ptr: addr[mut int] = b.addr
+assert val(c_ptr) == 200
+val(m_ptr) += 50
+assert b == 150
+holder = AddrHolder(a.addr)
+holder.items.append(b.addr)
+assert val(holder.ptr) == 200
+assert val(holder.items[1]) == 150
+
+# 5. Unified . on value-type @dataclass pointers
+v = Vec2(3, 4)
+rv = v.ref
+assert rv.x == 3 and rv.y == 4 and rv.mag2() == 25
+mv = v.mut_ref
+mv.x = 6
+mv.y += 4
+assert mv.mag2() == 100
+assert v.x == 6 and v.y == 8
+
+# 6. Unified . on heap class pointers and field references
+bn = BoxNode(10, "hi")
+rbn = bn.ref
+assert rbn.value == 10 and rbn.label == "hi"
+mbn = bn.mut_ref
+mbn.value = 30
+mbn.bump(12)
+assert bn.value == 42
+f_ref = bn.value.mut_ref
+val(f_ref) += 8
+assert bn.value == 50
+
+# 7. Unified . and element references on containers & str
+nums = [1, 2, 3]
+assert sum_list_ref(nums.ref) == 6
+push_list_mut(nums.mut_ref, 4)
+assert nums == [1, 2, 3, 4]
+elem_m = nums[1].mut_ref
+val(elem_m) = 20
+val(elem_m) += 2
+assert nums[1] == 22
+
+s = "hello"
+rs = s.ref
+assert len(rs) == 5 and rs.upper() == "HELLO"
+ms = s.mut_ref
+val(ms) = "world"
+val(ms) += "!"
+s_copy = val(ms).copy()
+assert s == "world!" and s_copy == "world!"
+
+# 8. Nullable references
+opt_r: ref[int] | None = None
+assert opt_r is None
+assert not bool(opt_r)
+opt_r = x.ref
+if opt_r is not None:
+    assert val(opt_r) == 28
+    assert bool(opt_r)
+
+# 9. Global / param-derived returned refs and generics
+gr = global_ref()
+assert val(gr) == 123
+nr = node_val_ref(bn)
+assert val(nr) == 50
+hr = list_head_ref(nums)
+assert val(hr) == 1
+assert read_generic(x.ref) == 28
+assert read_generic(v.ref).x == 6
+
+# 10. Moving mut_ref transfers borrow
+m1 = a.mut_ref
+m2 = m1
+val(m2) = 333
+assert a == 333
+
+print("POINTERS_OK")

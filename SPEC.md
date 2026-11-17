@@ -23,10 +23,38 @@ Stricta enforces strict static types on all bindings, parameters, fields, and co
 - `set[T]` (`Set[T]`): Monomorphized open-addressing hash set (`%Set_T`).
 - `dict[K, V]` (`Dict[K, V]`): Monomorphized dense open-addressing hash table (`%Dict_K_V`).
 - `tuple[T1, T2, ...]` (`Tuple[...]`): Unboxed LLVM value struct (`%Tuple_...`).
-- `T | None` (`Optional[T]`): Nullable pointer for reference types (`str`, classes, containers), or `{ i8, T }` tagged struct for value types.
+- `T | None` (`Optional[T]`): Nullable pointer for reference types (`str`, classes, containers, pointers), or `{ i8, T }` tagged struct for value types.
 - `Callable[[ArgTypes...], RetType]`: Typed function pointer.
+- `Task[T]`: Concurrent `pthread`-backed async task handle returned by `async def` functions and consumed via `await`.
+- **Safe References & Raw Addresses** *(Stricta extensions beyond Python)*:
+  - `ref[T]` (also written `ref[const T]`): Non-null shared immutable reference to a `T`.
+  - `mut_ref[T]` (also written `ref[mut T]`): Non-null exclusive mutable reference to a `T`.
+  - `addr[T]` (also written `addr[const T]` / `addr[mut T]`): Unchecked C-style address/pointer to a `T`.
 
-### 1.3 Strict Typing & Inference Rules
+### 1.3 Types Beyond Standard Python
+
+Stricta adds several zero-overhead static types that do not exist in standard Python:
+
+| Type | Constructors / Syntax | Description & Semantics |
+| :--- | :--- | :--- |
+| `i8`, `i16`, `i32`, `i64` | `i8(x)`, `i16(x)`, `i32(x)`, `i64(x)` | Fixed-width signed integers (`int` is an alias for `i64`). Widening (`i8` → `i16` → `i32` → `i64`) is implicit; narrowing uses explicit conversion functions. |
+| `u8`, `u16`, `u32`, `u64` | `u8(x)`, `u16(x)`, `u32(x)`, `u64(x)` | Fixed-width unsigned integers with unsigned LLVM arithmetic/comparisons. Widening (`u8` → `u16` → `u32` → `u64`) is implicit. |
+| `f32`, `f64` | `f32(x)`, `f64(x)` | IEEE-754 single-precision (`float` in LLVM) and double-precision (`double`, `float` alias) floats. |
+| `bigint` | `bigint(x)` | Heap-allocated arbitrary-precision signed integer (`+`, `-`, `*`, `//`, `%`, `**`, `abs`, comparisons, `str`). |
+| `File` | `open(path, mode="r")` | Owned file handle supporting `.read()`, `.write()`, `.close()`, and `with open(...) as f:`. |
+| `Task[T]` | `async def` + `await` | Owned concurrency handle; spawns a `pthread` worker taking ownership (`MOVE`) of owned arguments and returns `T` on `await` (or joins/drops deterministically if un-awaited). |
+| `ref[T]` | `x.ref` | Non-null shared immutable reference checked by the borrow checker (multiple `ref[T]` allowed; no mutation while live; cannot outlive local stack/owner). |
+| `mut_ref[T]` / `ref[mut T]` | `x.mut_ref` | Non-null exclusive mutable reference (move-only on assignment, reborrowed across calls; forbids aliasing or accessing the owner while live; cannot outlive local stack/owner). |
+| `addr[T]` | `x.addr` | Raw address/pointer (`addr[const T]` / `addr[mut T]` accepted). Not borrow-checked and storable in class fields and containers (`list[addr[T]]`), convertible to integers via `int(p)` / `u64(p)` and formatted as hex via `str(p)` / `hex(p)`. |
+
+#### Pointer & Reference Operations
+- **Taking References / Addresses**: `.ref`, `.mut_ref`, and `.addr` work on any addressable place (variables, class/`@dataclass` fields, list elements `xs[i]`, and dereferenced pointers `val(p)`). Taking `.mut_ref` requires a mutable place (rejected through `ref[T]`).
+- **Dereferencing (`val`)**: `val(p)` reads the target value (or `val(level, p)` for multi-level dereferencing, e.g. `val(2, pp)`). For mutable references (`mut_ref[T]`, `addr[T]`), `val(p) = expr` and `val(p) += expr` mutate the target in place (dropping any previous owned value before overwriting). Moving an owned `T` out of `val(p)` is rejected; use `val(p).copy()`.
+- **Unified `.` Access**: Fields, methods, `@property` getters, subscripts (`r[i]`, `m[i] = v`), slicing, and `len(r)` auto-dereference through `ref[T]`, `mut_ref[T]`, and `addr[T]` (including by-value `@dataclass` types). Mutating field/method/index operations are rejected through `ref[T]`.
+- **Nullable Pointers & Coercions**: `ref[T] | None`, `mut_ref[T] | None`, and `addr[T] | None` compile to zero-cost nullable `ptr` values and narrow with `is None` / `is not None`. `mut_ref[T]` coerces implicitly to `ref[T]`, and both `ref[T]` and `mut_ref[T]` coerce implicitly to `addr[T]`.
+- **Safety Boundaries**: `ref[T]` and `mut_ref[T]` cannot be returned when pointing to local stack storage and cannot be stored in class fields or heap containers (`list`, `set`, `dict`); use `addr[T]` when raw pointer storage is needed.
+
+### 1.4 Strict Typing & Inference Rules
 - Function parameters support explicit annotations (`def add(a: int, b: int) -> int:`), default-value inference (`def f(x = 0)`), and **call-site monomorphization** for unannotated parameters (`def first(xs): return xs[0]`), which specializes a typed LLVM function per distinct call-site argument signature. Parameters with default `None`, `[]`, `{}`, or `set()` still require an explicit annotation (`x: T | None = None`).
 - Functions with an explicit `-> RetType` enforce it strictly (including **definite-return checking** on all control-flow paths); functions omitting `-> RetType` infer their static return type (`T`, `T | None`, `list[T]` for generators, or `None` when returning nothing) from their `return` / `yield` statements.
 - Local variables and module globals infer their static type deterministically from initializers (`x = 10` → `int`, `ORIGIN = Vec2D(0, 0)` → `Vec2D`), from deferred first-use operations, calls, or returns on empty containers (`items = []; items.append(1)` → `list[int]`, `counts = {}; counts["a"] = 1` → `dict[str, int]`, `seen = set(); seen.add("x")` → `set[str]`), or optional auto-promotion (`best = None; best = node` → `Node | None`, `[None, 10]` → `list[int | None]`).
