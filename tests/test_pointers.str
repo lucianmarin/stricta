@@ -19,6 +19,9 @@ class BoxNode:
     def bump(self, delta: int) -> None:
         self.value += delta
 
+    def value_mut(self) -> mut_ref[int]:
+        return self.value.mut_ref
+
 class AddrHolder:
     ptr: addr[int]
     items: list[addr[int]]
@@ -193,8 +196,11 @@ p_off = p_arr + 2
 assert val(p_off) == 99
 assert val(p_off - 1) == 22
 
-# 12. sys_argv builtin
+# 12. sys_argv builtin & returning mut_ref from method
 cli_args = sys_argv()
 assert len(cli_args) >= 1
+bn_m = bn.value_mut()
+val(bn_m) += 5
+assert bn.value == 55
 
 print("POINTERS_OK")

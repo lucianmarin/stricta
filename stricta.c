@@ -6847,6 +6847,15 @@ static void scan_expr_param_modes(FuncInfo* fn, Expr* e, bool moved_ctx, bool* c
             scan_expr_param_modes(fn, e->walrus.val, true, changed);
             break;
         case EXPR_ATTR:
+            if (e->is_ptr_take && strcmp(e->attr.attr, "mut_ref") == 0) {
+                const char* rv = expr_root_var(e->attr.obj);
+                if (rv) {
+                    int pi = fn_param_index(fn, rv);
+                    if (pi >= 0 && !type_is_ptr(fn->param_types[pi])) {
+                        raise_param_mode(fn, pi, PM_MUT_BORROW, changed);
+                    }
+                }
+            }
             scan_expr_param_modes(fn, e->attr.obj, false, changed);
             break;
         case EXPR_INDEX:
