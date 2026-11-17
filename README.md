@@ -45,6 +45,23 @@ Or emit LLVM IR (`.ll`):
 
 ---
 
+## 📦 Packages & Standard Library
+
+Stricta's ecosystem centers on two companion projects:
+
+* **[fetch](https://github.com/lucianmarin/fetch)** — Decentralized package manager written in Stricta that uses GitHub repositories and Git tags/SHAs directly via `package.lmon` manifests (no central registry):
+  ```bash
+  fetch init myapp
+  fetch add lucianmarin/strlib
+  fetch build main.str -o myapp
+  ```
+* **[strlib](https://github.com/lucianmarin/strlib)** — Standard library for Stricta written in Stricta using `@extern` C bindings, providing `sys`, `os`, `time`, `date`, `datetime`, `lmon`, `json`, `http`, `math`, `re`, `path`, and `hashlib`:
+  ```python
+  from strlib import os, sys, datetime
+  ```
+
+---
+
 ## 📊 Performance: Stricta vs Python 3 vs C (`clang -O2`)
 
 Benchmark suite (`perf/*.str`) comparing Python 3.14, memory-safe Stricta (`stricta.c` → LLVM IR → `clang -O2`), and hand-written C (`perf/*.c` with `clang -O2`).
