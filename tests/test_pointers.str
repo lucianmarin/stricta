@@ -184,4 +184,17 @@ m2 = m1
 val(m2) = 333
 assert a == 333
 
+# 11. Pointer indexing and arithmetic on addr[T]
+p_arr = nums[0].addr
+assert p_arr[0] == 1 and p_arr[1] == 22 and p_arr[2] == 3
+p_arr[2] = 99
+assert nums[2] == 99
+p_off = p_arr + 2
+assert val(p_off) == 99
+assert val(p_off - 1) == 22
+
+# 12. sys_argv builtin
+cli_args = sys_argv()
+assert len(cli_args) >= 1
+
 print("POINTERS_OK")

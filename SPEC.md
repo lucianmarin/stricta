@@ -1,6 +1,6 @@
 # Stricta Language Specification
 
-Stricta is a **strict, safe, compiled version of Python** (`.str` file extension). It uses Python syntax while enforcing strict ahead-of-time static typing and compile-time memory safety with zero dynamic fallback. The single-file C11 compiler (`stricta.c`) lexes, parses, type-checks, and lowers `.str` programs directly to LLVM IR (`.ll`), which `clang -O2` compiles and links with the lean C runtime (`runtime.c`) into native executables.
+Stricta is a **strict, safe, compiled version of Python** (`.str` file extension). It uses Python syntax while enforcing strict ahead-of-time static typing and compile-time memory safety with zero dynamic fallback. The single-file C11 compiler (`stricta.c`) lexes, parses, type-checks, and lowers `.str` programs directly to self-contained LLVM IR (`.ll`), which `clang -O2` compiles and links against libc into native executables with no separate C runtime file.
 
 ---
 
@@ -99,10 +99,9 @@ Because values have a single owner and cannot be implicitly aliased across mutab
 
 ---
 
-## 5. Compiler & Runtime Architecture
+## 5. Compiler Architecture
 
-- **`stricta.c`**: Single-file C11 compiler containing the arena allocator, indentation lexer, recursive-descent parser, strict semantic/type analyzer, ownership/borrow checker, monomorphization registry, and LLVM IR code generator.
-- **`runtime.h` / `runtime.c`**: Lean C11 runtime providing UTF-8 string operations (`is_static`/clone/free), `bytes`, `bigint`, `File` I/O, compiler-lowered exception state and bounds-failure traps, CLI `sys.argv`, OS/time `@extern` primitives, and typed print helpers—with zero NaN-boxing, ARC, or GC.
+- **`stricta.c`**: Single-file C11 compiler containing the arena allocator, indentation lexer, recursive-descent parser, strict semantic/type analyzer, ownership/borrow checker, monomorphization registry, and self-contained LLVM IR code generator (emitting runtime primitives for UTF-8 strings, `bytes`, `bigint`, `File` I/O, thread-local exceptions, bounds traps, and `pthread` tasks directly against libc, with zero NaN-boxing, ARC, or GC).
 - **Build & Test**:
   ```bash
   make       # builds ./stricta from stricta.c

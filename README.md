@@ -14,7 +14,7 @@ Stricta is a **strict, safe, compiled version of Python** (`.str` extension)—a
   * `list[T]`, `set[T]`, and `dict[K, V]` are monomorphized in LLVM IR with unboxed element storage, inline open-addressing hash tables, and stack-backed non-escaping local lists and comprehensions.
   * Polymorphic hierarchies and cooperative diamond `super()` dispatch via `type_id` switches, with `O(1)` bitmask `isinstance()` checks.
   * `range()` loops, `dict.items()`/`values()` loops, comprehensions, and `sum`/`any`/`all(genexpr)` / matrix multiplication lower directly to native loops.
-* **Single-File C11 Compiler**: `stricta.c` compiles in milliseconds with zero external dependencies and emits LLVM IR linked against a lean typed C runtime (`runtime.h` / `runtime.c`), with `@extern` C FFI and `owner/repo` package imports (used by `lucianmarin/strlib` and `lucianmarin/fetch`).
+* **Single-File C11 Compiler**: `stricta.c` compiles in milliseconds with zero external dependencies and emits self-contained LLVM IR linked directly against libc (`clang -O2`), with `@extern` C FFI (`.bin`/`unbin`, `addr[T]`) and `owner/repo` package imports (used by `lucianmarin/strlib` and `lucianmarin/fetch`).
 
 ---
 

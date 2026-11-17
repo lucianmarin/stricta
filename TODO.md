@@ -1,6 +1,6 @@
 # Stricta TODO
 
-Implementation status of Python features in Stricta (`stricta.c` + `runtime.c`).
+Implementation status of Python features in Stricta (`stricta.c`).
 
 ## Types
 

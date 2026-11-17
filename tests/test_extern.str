@@ -1,14 +1,39 @@
-@extern("stricta_os_getcwd")
+@extern("getcwd")
+def _libc_getcwd(buf: addr[u8], size: int) -> addr[u8] | None:
+    pass
+
+@extern("time")
+def _libc_time(tloc: addr[int] | None) -> int:
+    pass
+
+@extern("access")
+def _libc_access(path: addr[u8], mode: i32) -> i32:
+    pass
+
+@extern("malloc")
+def _libc_malloc(size: int) -> addr[u8]:
+    pass
+
+@extern("free")
+def _libc_free(p: addr[u8]) -> None:
+    pass
+
+@extern("strlen")
+def _libc_strlen(s: addr[u8]) -> int:
+    pass
+
 def _c_getcwd() -> str:
-    pass
+    buf = _libc_malloc(4096)
+    p = _libc_getcwd(buf, 4096)
+    res = unbin(p) if p is not None else ""
+    _libc_free(buf)
+    return res
 
-@extern("stricta_time_now")
 def _c_time_now() -> float:
-    pass
+    return float(_libc_time(None))
 
-@extern("stricta_os_exists")
 def _c_exists(path: str) -> int:
-    pass
+    return 1 if _libc_access(path.bin, i32(0)) == i32(0) else 0
 
 def test_extern_ffi() -> None:
     cwd = _c_getcwd()
@@ -17,6 +42,9 @@ def test_extern_ffi() -> None:
     assert _c_exists("nonexistent_file_xyz_999") == 0
     t = _c_time_now()
     assert t > 1700000000.0
+    assert _libc_strlen("hello".bin) == 5
+    raw_b = b"abc\x00"
+    assert _libc_strlen(raw_b.bin) == 3
 
 test_extern_ffi()
 print("EXTERN TESTS PASSED")

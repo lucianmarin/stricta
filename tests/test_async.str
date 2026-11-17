@@ -1,10 +1,25 @@
-@extern("stricta_time_sleep")
-def c_sleep(secs: float) -> None:
+from dataclasses import dataclass
+
+@dataclass
+class Timespec:
+    tv_sec: int
+    tv_nsec: int
+
+@extern("usleep")
+def _libc_usleep(usec: u32) -> i32:
     pass
 
-@extern("stricta_time_monotonic")
+@extern("clock_gettime")
+def _libc_clock_gettime(clk_id: i32, tp: mut_ref[Timespec]) -> i32:
+    pass
+
+def c_sleep(secs: float) -> None:
+    _libc_usleep(u32(int(secs * 1000000.0)))
+
 def c_mono() -> float:
-    return 0.0
+    ts = Timespec(0, 0)
+    _libc_clock_gettime(i32(0), ts.mut_ref)
+    return float(ts.tv_sec) + float(ts.tv_nsec) * 1e-9
 
 async def add_async(a: int, b: int = 10) -> int:
     return a + b

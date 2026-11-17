@@ -3311,6 +3311,7 @@ static bool is_builtin_fn_name(const char* n) {
         "all", "any", "sorted", "reversed", "enumerate", "zip", "range",
         "open", "input", "isinstance", "list", "set", "dict", "tuple",
         "iter", "next", "super", "map", "filter", "bigint", "val",
+        "unbin", "sys_argv",
         "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
         NULL
     };
@@ -4116,6 +4117,9 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 res = g_ty_bigint;
                 break;
             }
+            if (lt->kind == TY_ADDR && type_is_int(rt) && (strcmp(op, "+") == 0 || strcmp(op, "-") == 0)) {
+                res = lt; break;
+            }
             if (!type_is_numeric(lt) && lt->kind != TY_BOOL) {
                 error_at(e->loc, "operator '%s' unsupported for '%s' and '%s'", op, type_str(lt), type_str(rt));
             }
@@ -4268,8 +4272,14 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
         }
         case EXPR_INDEX: {
             Type* raw_ot = check_expr(mod, fn, e->index.obj, NULL);
+            Type* ptr_ot = raw_ot;
+            while (ptr_ot->kind == TY_REF || ptr_ot->kind == TY_MUT_REF) ptr_ot = ptr_ot->elem;
             Type* ot = type_deref_all(raw_ot);
-            if (ot->kind == TY_LIST) {
+            if (ptr_ot->kind == TY_ADDR) {
+                Type* it = check_expr(mod, fn, e->index.index, g_ty_i64);
+                if (!type_is_int(it)) error_at(e->index.index->loc, "pointer index must be int");
+                res = ptr_ot->elem;
+            } else if (ot->kind == TY_LIST) {
                 Type* it = check_expr(mod, fn, e->index.index, g_ty_i64);
                 if (!type_is_int(it)) error_at(e->index.index->loc, "list index must be int");
                 e->index.index->is_nonneg = expr_is_nonneg(mod, fn, e->index.index);
@@ -4352,6 +4362,10 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
             }
             if (base_ot->kind == TY_OPTIONAL) {
                 error_at(e->loc, "cannot access attribute '%s' on optional type '%s'; narrow with 'is not None' or check", an, type_str(base_ot));
+            }
+            if ((base_ot->kind == TY_STR || base_ot->kind == TY_BYTES) && strcmp(an, "bin") == 0) {
+                res = make_addr_type(g_ty_u8);
+                break;
             }
             if (base_ot->kind == TY_CLASS) {
                 ClassInfo* cls = base_ot->cls;
@@ -4503,6 +4517,18 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 if (strcmp(cname, "chr") == 0) {
                     if (argc != 1 || !type_is_int(check_expr(mod, fn, args[0], g_ty_i64))) error_at(e->loc, "chr() expects int");
                     res = g_ty_str; break;
+                }
+                if (strcmp(cname, "unbin") == 0) {
+                    if (argc != 1) error_at(e->loc, "unbin() takes 1 argument");
+                    Type* pt = check_expr(mod, fn, args[0], NULL);
+                    if (!type_is_ptr(pt) || (pt->elem->kind != TY_U8 && pt->elem->kind != TY_I8)) {
+                        error_at(args[0]->loc, "unbin() expects addr[u8] or addr[i8], got '%s'", type_str(pt));
+                    }
+                    res = g_ty_str; break;
+                }
+                if (strcmp(cname, "sys_argv") == 0) {
+                    if (argc != 0) error_at(e->loc, "sys_argv() takes 0 arguments");
+                    res = make_list_type(g_ty_str); break;
                 }
                 if (strcmp(cname, "hex") == 0 || strcmp(cname, "bin") == 0 || strcmp(cname, "oct") == 0) {
                     if (argc != 1) error_at(e->loc, "%s() takes 1 argument", cname);
@@ -5564,8 +5590,16 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                     if (!expr_is_mutable_place(mod, fn, tgt->index.obj)) {
                         error_at(tgt->loc, "cannot mutate element through immutable reference");
                     }
+                    Type* ptr_ot = raw_ot;
+                    while (ptr_ot->kind == TY_REF || ptr_ot->kind == TY_MUT_REF) ptr_ot = ptr_ot->elem;
                     Type* ot = type_deref_all(raw_ot);
-                    if (ot->kind == TY_LIST) {
+                    if (ptr_ot->kind == TY_ADDR) {
+                        if (type_ptr_is_const(ptr_ot)) error_at(tgt->loc, "cannot assign through immutable pointer '%s'", type_str(ptr_ot));
+                        if (!type_is_int(check_expr(mod, fn, tgt->index.index, g_ty_i64))) error_at(tgt->index.index->loc, "pointer index must be int");
+                        tgt->ty = ptr_ot->elem;
+                        Type* vt = check_expr(mod, fn, s->assign.value, ptr_ot->elem);
+                        if (!type_assignable(ptr_ot->elem, vt)) error_at(s->loc, "pointer element assignment type mismatch");
+                    } else if (ot->kind == TY_LIST) {
                         if (!type_is_int(check_expr(mod, fn, tgt->index.index, g_ty_i64))) error_at(tgt->index.index->loc, "list index must be int");
                         tgt->index.index->is_nonneg = expr_is_nonneg(mod, fn, tgt->index.index);
                         if (tgt->index.obj->kind == EXPR_VAR && tgt->index.index->kind == EXPR_VAR &&
@@ -10572,6 +10606,17 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
             return r;
         }
     }
+    if (lt->kind == TY_ADDR && type_is_int(rt) && (strcmp(op, "+") == 0 || strcmp(op, "-") == 0)) {
+        const char* off = cg_coerce(rv, rt, g_ty_i64);
+        if (strcmp(op, "-") == 0) {
+            const char* neg = cg_reg();
+            cg_emit("%s = sub i64 0, %s", neg, off);
+            off = neg;
+        }
+        const char* r = cg_reg();
+        cg_emit("%s = getelementptr %s, ptr %s, i64 %s", r, llvm_mem_ty(lt->elem), lv, off);
+        return r;
+    }
     if (lt->kind == TY_STR && rt->kind == TY_STR && strcmp(op, "+") == 0) {
         const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_str_concat(ptr %s, ptr %s)", r, lv, rv); return r;
     }
@@ -12226,6 +12271,23 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
             return d;
         }
         case EXPR_INDEX: {
+            Type* ptr_ot = e->index.obj->ty;
+            while (ptr_ot && (ptr_ot->kind == TY_REF || ptr_ot->kind == TY_MUT_REF)) ptr_ot = ptr_ot->elem;
+            if (ptr_ot && ptr_ot->kind == TY_ADDR) {
+                const char* pv = cg_expr(e->index.obj, NULL);
+                Type* rt = e->index.obj->ty;
+                while (rt && (rt->kind == TY_REF || rt->kind == TY_MUT_REF)) {
+                    const char* np = cg_reg();
+                    cg_emit("%s = load ptr, ptr %s", np, pv);
+                    pv = np;
+                    rt = rt->elem;
+                }
+                const char* iv = cg_coerce(cg_expr(e->index.index, g_ty_i64), e->index.index->ty, g_ty_i64);
+                const char* slot = cg_reg(); const char* mv = cg_reg();
+                cg_emit("%s = getelementptr %s, ptr %s, i64 %s", slot, llvm_mem_ty(ptr_ot->elem), pv, iv);
+                cg_emit("%s = load %s, ptr %s", mv, llvm_mem_ty(ptr_ot->elem), slot);
+                return cg_mem_to_reg(mv, ptr_ot->elem);
+            }
             const char* ov = cg_eval_recv(e->index.obj);
             Type* ot = type_deref_all(e->index.obj->ty);
             if (ot->kind == TY_TUPLE) {
@@ -12342,6 +12404,14 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
             }
             Type* raw_ot = e->attr.obj->ty;
             Type* ot = type_deref_all(raw_ot);
+            if ((ot->kind == TY_STR || ot->kind == TY_BYTES) && strcmp(an, "bin") == 0) {
+                const char* ov = cg_eval_recv(e->attr.obj);
+                const char* sty = (ot->kind == TY_BYTES) ? "%StrictaBytes" : "%StrictaStr";
+                const char* cp = cg_reg(); const char* r = cg_reg();
+                cg_emit("%s = getelementptr %s, ptr %s, i32 0, i32 2", cp, sty, ov);
+                cg_emit("%s = load ptr, ptr %s", r, cp);
+                return r;
+            }
             if (ot->kind == TY_CLASS) {
                 ClassInfo* cls = ot->cls;
                 FieldInfo* fi = find_field_in_class(cls, an);
@@ -12480,6 +12550,17 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                 }
                 if (strcmp(cname, "chr") == 0) {
                     const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_chr(i64 %s)", r, cg_coerce(cg_expr(args[0], g_ty_i64), args[0]->ty, g_ty_i64)); return r;
+                }
+                if (strcmp(cname, "unbin") == 0) {
+                    const char* pv = cg_expr(args[0], NULL);
+                    const char* r = cg_reg();
+                    cg_emit("%s = call ptr @stricta_str_cstr(ptr %s)", r, pv);
+                    return r;
+                }
+                if (strcmp(cname, "sys_argv") == 0) {
+                    const char* r = cg_reg();
+                    cg_emit("%s = call ptr @stricta_sys_get_argv()", r);
+                    return r;
                 }
                 if (strcmp(cname, "hex") == 0 || strcmp(cname, "bin") == 0 || strcmp(cname, "oct") == 0) {
                     const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_%s(i64 %s)", r, cname, cg_coerce(cg_expr(args[0], g_ty_i64), args[0]->ty, g_ty_i64)); return r;
@@ -13544,6 +13625,26 @@ static void cg_stmts(Stmt** stmts, int count) {
                                 owner->mod->prefix, owner->name, tgt->attr.attr);
                     }
                 } else if (tgt->kind == EXPR_INDEX) {
+                    Type* ptr_ot = tgt->index.obj->ty;
+                    while (ptr_ot && (ptr_ot->kind == TY_REF || ptr_ot->kind == TY_MUT_REF)) ptr_ot = ptr_ot->elem;
+                    if (ptr_ot && ptr_ot->kind == TY_ADDR) {
+                        const char* pv = cg_expr(tgt->index.obj, NULL);
+                        Type* rt = tgt->index.obj->ty;
+                        while (rt && (rt->kind == TY_REF || rt->kind == TY_MUT_REF)) {
+                            const char* np = cg_reg();
+                            cg_emit("%s = load ptr, ptr %s", np, pv);
+                            pv = np;
+                            rt = rt->elem;
+                        }
+                        const char* iv = cg_coerce(cg_expr(tgt->index.index, g_ty_i64), tgt->index.index->ty, g_ty_i64);
+                        const char* raw_vv = cg_expr(s->assign.value, ptr_ot->elem);
+                        cg_consume_expr(s->assign.value, raw_vv);
+                        const char* vv = cg_coerce(raw_vv, s->assign.value->ty, ptr_ot->elem);
+                        const char* slot = cg_reg();
+                        cg_emit("%s = getelementptr %s, ptr %s, i64 %s", slot, llvm_mem_ty(ptr_ot->elem), pv, iv);
+                        cg_emit("store %s %s, ptr %s", llvm_mem_ty(ptr_ot->elem), cg_reg_to_mem(vv, ptr_ot->elem), slot);
+                        break;
+                    }
                     const char* ov = cg_eval_recv(tgt->index.obj);
                     Type* ot = type_deref_all(tgt->index.obj->ty);
                     if (ot->kind == TY_LIST) {
@@ -14619,123 +14720,1515 @@ static void analyze_can_raise(void) {
     }
 }
 
+static void emit_rt_cstr(StrBuf* b, const char* sym, const char* s) {
+    size_t slen = strlen(s);
+    sb_printf(b, "%s = private unnamed_addr constant [%zu x i8] c\"", sym, slen + 1);
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\\') sb_append(b, "\\5C");
+        else if (c == '"') sb_append(b, "\\22");
+        else if (c < 32 || c >= 127) sb_printf(b, "\\%02X", (unsigned)c);
+        else sb_printf(b, "%c", (char)c);
+    }
+    sb_append(b, "\\00\"\n");
+}
+
+static void emit_llvm_rt_core(StrBuf* b) {
+    sb_append(b, "%StrictaStr = type { i32, i32, ptr, i32 }\n");
+    sb_append(b, "%StrictaBytes = type { i32, i32, ptr }\n");
+    sb_append(b, "%StrictaPtrList = type { i32, i32, ptr }\n");
+    sb_append(b, "%StrictaBigInt = type { i32, i32, ptr }\n");
+    sb_append(b, "%StrictaFile = type { ptr }\n");
+    sb_append(b, "%StrictaTask = type { i64, i32, i32, i64, ptr, ptr, i32, ptr, ptr }\n\n");
+
+    sb_append(b, "@stricta_sys_argv = internal global ptr null\n");
+    sb_append(b, "@_exc_type_id = internal thread_local global i32 0\n");
+    sb_append(b, "@_exc_obj = internal thread_local global ptr null\n");
+    sb_append(b, "@_exc_msg = internal thread_local global ptr null\n\n");
+
+    emit_rt_cstr(b, "@.rt_oom", "MemoryError: out of memory\n");
+    emit_rt_cstr(b, "@.rt_empty", "");
+    emit_rt_cstr(b, "@.rt_true", "True");
+    emit_rt_cstr(b, "@.rt_false", "False");
+    emit_rt_cstr(b, "@.rt_zero", "0");
+    emit_rt_cstr(b, "@.rt_one", "1");
+    emit_rt_cstr(b, "@.rt_neg_one", "-1");
+    emit_rt_cstr(b, "@.rt_unk", "<unknown>");
+    emit_rt_cstr(b, "@.rt_str_ctx", "<str>");
+    emit_rt_cstr(b, "@.rt_unh_msg", "Unhandled exception: %s\n");
+    emit_rt_cstr(b, "@.rt_unh_id", "Unhandled exception (type_id=%d)\n");
+    emit_rt_cstr(b, "@.rt_assert_msg", "AssertionError (%s:%d): %s\n");
+    emit_rt_cstr(b, "@.rt_assert_nomsg", "AssertionError (%s:%d)\n");
+    emit_rt_cstr(b, "@.rt_bounds", "IndexError (%s:%d): index %lld out of range for length %lld\n");
+    emit_rt_cstr(b, "@.rt_err_step", "ValueError: slice step cannot be zero");
+    emit_rt_cstr(b, "@.rt_err_sep", "ValueError: empty separator");
+    emit_rt_cstr(b, "@.rt_err_sub", "ValueError: substring not found");
+    emit_rt_cstr(b, "@.rt_err_zdiv", "ZeroDivisionError: integer division by zero");
+    emit_rt_cstr(b, "@.rt_err_open", "FileNotFoundError: cannot open file");
+    emit_rt_cstr(b, "@.rt_err_task", "RuntimeError: failed to spawn async task thread (%d)\n");
+    emit_rt_cstr(b, "@.rt_mode_r", "r");
+    emit_rt_cstr(b, "@.rt_fmt_lld", "%lld");
+    emit_rt_cstr(b, "@.rt_fmt_llu", "%llu");
+    emit_rt_cstr(b, "@.rt_fmt_g", "%.15g");
+    emit_rt_cstr(b, "@.rt_fmt_ffmt", "%.*f");
+    emit_rt_cstr(b, "@.rt_fmt_s", "%s");
+    emit_rt_cstr(b, "@.rt_fmt_sn", "%.*s");
+    emit_rt_cstr(b, "@.rt_fmt_hex", "0x%llx");
+    emit_rt_cstr(b, "@.rt_fmt_nhex", "-0x%llx");
+    emit_rt_cstr(b, "@.rt_fmt_oct", "0o%llo");
+    emit_rt_cstr(b, "@.rt_fmt_noct", "-0o%llo");
+    sb_append(b, "\n");
+
+    /* Libc / POSIX external declarations */
+    sb_append(b, "declare noalias ptr @malloc(i64)\n");
+    sb_append(b, "declare noalias ptr @calloc(i64, i64)\n");
+    sb_append(b, "declare ptr @realloc(ptr, i64)\n");
+    sb_append(b, "declare void @free(ptr)\n");
+    sb_append(b, "declare i32 @memcmp(ptr, ptr, i64)\n");
+    sb_append(b, "declare i64 @strlen(ptr)\n");
+    sb_append(b, "declare ptr @strstr(ptr, ptr)\n");
+    sb_append(b, "declare ptr @strchr(ptr, i32)\n");
+    sb_append(b, "declare i64 @strtoll(ptr, ptr, i32)\n");
+    sb_append(b, "declare double @strtod(ptr, ptr)\n");
+    sb_append(b, "declare i32 @printf(ptr, ...)\n");
+    sb_append(b, "declare i32 @dprintf(i32, ptr, ...)\n");
+    sb_append(b, "declare i32 @snprintf(ptr, i64, ptr, ...)\n");
+    sb_append(b, "declare i32 @putchar(i32)\n");
+    sb_append(b, "declare i32 @getchar()\n");
+    sb_append(b, "declare i32 @fflush(ptr)\n");
+    sb_append(b, "declare ptr @fopen(ptr, ptr)\n");
+    sb_append(b, "declare i32 @fseek(ptr, i64, i32)\n");
+    sb_append(b, "declare i64 @ftell(ptr)\n");
+    sb_append(b, "declare i64 @fread(ptr, i64, i64, ptr)\n");
+    sb_append(b, "declare i64 @fwrite(ptr, i64, i64, ptr)\n");
+    sb_append(b, "declare i32 @fclose(ptr)\n");
+    sb_append(b, "declare void @exit(i32)\n");
+    sb_append(b, "declare double @pow(double, double)\n");
+    sb_append(b, "declare i32 @pthread_create(ptr, ptr, ptr, ptr)\n");
+    sb_append(b, "declare i32 @pthread_join(i64, ptr)\n");
+    sb_append(b, "declare i32 @llvm.smax.i32(i32, i32)\n");
+    sb_append(b, "declare i32 @llvm.smin.i32(i32, i32)\n");
+    sb_append(b, "declare i64 @llvm.smax.i64(i64, i64)\n");
+    sb_append(b, "declare i64 @llvm.smin.i64(i64, i64)\n");
+    sb_append(b, "declare double @llvm.floor.f64(double)\n");
+    sb_append(b, "declare float @llvm.floor.f32(float)\n");
+    sb_append(b, "declare double @llvm.round.f64(double)\n");
+    sb_append(b, "declare double @llvm.fabs.f64(double)\n");
+    sb_append(b, "declare float @llvm.fabs.f32(float)\n");
+    sb_append(b, "declare i64 @llvm.abs.i64(i64, i1)\n");
+    sb_append(b, "declare i32 @llvm.abs.i32(i32, i1)\n");
+    sb_append(b, "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
+    sb_append(b, "declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n\n");
+
+    /* Memory helpers */
+    sb_append(b,
+        "define internal ptr @stricta_alloc(i64 %sz) {\nentry:\n"
+        "  %nz = icmp eq i64 %sz, 0\n"
+        "  %rsz = select i1 %nz, i64 1, i64 %sz\n"
+        "  %p = call ptr @malloc(i64 %rsz)\n"
+        "  %ok = icmp ne ptr %p, null\n"
+        "  br i1 %ok, label %done, label %oom\noom:\n"
+        "  %e = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_oom)\n"
+        "  call void @exit(i32 1)\n  unreachable\ndone:\n  ret ptr %p\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_calloc(i64 %cnt, i64 %sz) {\nentry:\n"
+        "  %c0 = icmp eq i64 %cnt, 0\n  %rc = select i1 %c0, i64 1, i64 %cnt\n"
+        "  %s0 = icmp eq i64 %sz, 0\n  %rs = select i1 %s0, i64 1, i64 %sz\n"
+        "  %p = call ptr @calloc(i64 %rc, i64 %rs)\n"
+        "  %ok = icmp ne ptr %p, null\n  br i1 %ok, label %done, label %oom\noom:\n"
+        "  %e = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_oom)\n"
+        "  call void @exit(i32 1)\n  unreachable\ndone:\n  ret ptr %p\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_realloc(ptr %ptr, i64 %sz) {\nentry:\n"
+        "  %s0 = icmp eq i64 %sz, 0\n  %rs = select i1 %s0, i64 1, i64 %sz\n"
+        "  %p = call ptr @realloc(ptr %ptr, i64 %rs)\n"
+        "  %ok = icmp ne ptr %p, null\n  br i1 %ok, label %done, label %oom\noom:\n"
+        "  %e = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_oom)\n"
+        "  call void @exit(i32 1)\n  unreachable\ndone:\n  ret ptr %p\n}\n\n");
+    sb_append(b,
+        "define internal void @stricta_free(ptr %ptr) alwaysinline {\nentry:\n"
+        "  call void @free(ptr %ptr)\n  ret void\n}\n\n");
+
+    /* CLI args */
+    sb_append(b,
+        "define internal void @stricta_init_args(i32 %argc, ptr %argv) {\nentry:\n"
+        "  %lsz = ptrtoint ptr getelementptr (%StrictaPtrList, ptr null, i32 1) to i64\n"
+        "  %lst = call ptr @stricta_alloc(i64 %lsz)\n"
+        "  %p0 = getelementptr %StrictaPtrList, ptr %lst, i32 0, i32 0\n"
+        "  store i32 %argc, ptr %p0\n"
+        "  %c4 = icmp sgt i32 %argc, 4\n"
+        "  %cap = select i1 %c4, i32 %argc, i32 4\n"
+        "  %p1 = getelementptr %StrictaPtrList, ptr %lst, i32 0, i32 1\n"
+        "  store i32 %cap, ptr %p1\n"
+        "  %cap64 = sext i32 %cap to i64\n"
+        "  %asz = mul i64 %cap64, 8\n"
+        "  %items = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %p2 = getelementptr %StrictaPtrList, ptr %lst, i32 0, i32 2\n"
+        "  store ptr %items, ptr %p2\n"
+        "  %ip = alloca i32\n  store i32 0, ptr %ip\n  br label %loop\nloop:\n"
+        "  %i = load i32, ptr %ip\n  %cond = icmp slt i32 %i, %argc\n"
+        "  br i1 %cond, label %body, label %done\nbody:\n"
+        "  %ap = getelementptr ptr, ptr %argv, i32 %i\n"
+        "  %arg = load ptr, ptr %ap\n"
+        "  %s = call ptr @stricta_str_cstr(ptr %arg)\n"
+        "  %dp = getelementptr ptr, ptr %items, i32 %i\n"
+        "  store ptr %s, ptr %dp\n"
+        "  %ni = add i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %loop\ndone:\n"
+        "  store ptr %lst, ptr @stricta_sys_argv\n  ret void\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_sys_get_argv() {\nentry:\n"
+        "  %sav = load ptr, ptr @stricta_sys_argv\n"
+        "  %has = icmp ne ptr %sav, null\n"
+        "  br i1 %has, label %gn, label %zn\nzn:\n  br label %bn\ngn:\n"
+        "  %lp0 = getelementptr %StrictaPtrList, ptr %sav, i32 0, i32 0\n"
+        "  %n0 = load i32, ptr %lp0\n  br label %bn\nbn:\n"
+        "  %n = phi i32 [ 0, %zn ], [ %n0, %gn ]\n"
+        "  %lsz = ptrtoint ptr getelementptr (%StrictaPtrList, ptr null, i32 1) to i64\n"
+        "  %res = call ptr @stricta_alloc(i64 %lsz)\n"
+        "  %p0 = getelementptr %StrictaPtrList, ptr %res, i32 0, i32 0\n  store i32 %n, ptr %p0\n"
+        "  %c4 = icmp sgt i32 %n, 4\n  %cap = select i1 %c4, i32 %n, i32 4\n"
+        "  %p1 = getelementptr %StrictaPtrList, ptr %res, i32 0, i32 1\n  store i32 %cap, ptr %p1\n"
+        "  %cap64 = sext i32 %cap to i64\n  %asz = mul i64 %cap64, 8\n"
+        "  %items = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %p2 = getelementptr %StrictaPtrList, ptr %res, i32 0, i32 2\n  store ptr %items, ptr %p2\n"
+        "  %has2 = icmp ne ptr %sav, null\n  br i1 %has2, label %initl, label %done\ninitl:\n"
+        "  %sp2 = getelementptr %StrictaPtrList, ptr %sav, i32 0, i32 2\n"
+        "  %sitems = load ptr, ptr %sp2\n"
+        "  %ip = alloca i32\n  store i32 0, ptr %ip\n  br label %loop\nloop:\n"
+        "  %i = load i32, ptr %ip\n  %cond = icmp slt i32 %i, %n\n"
+        "  br i1 %cond, label %body, label %done\nbody:\n"
+        "  %sp = getelementptr ptr, ptr %sitems, i32 %i\n  %sv = load ptr, ptr %sp\n"
+        "  %cl = call ptr @stricta_str_clone(ptr %sv)\n"
+        "  %dp = getelementptr ptr, ptr %items, i32 %i\n  store ptr %cl, ptr %dp\n"
+        "  %ni = add i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %loop\ndone:\n"
+        "  ret ptr %res\n}\n\n");
+
+    /* Exceptions & traps */
+    sb_append(b,
+        "define internal void @stricta_set_exc(i32 %tid, ptr %obj, ptr %msg) {\nentry:\n"
+        "  %old = load ptr, ptr @_exc_msg\n  %has = icmp ne ptr %old, null\n"
+        "  br i1 %has, label %freemsg, label %set\nfreemsg:\n"
+        "  call void @stricta_str_free(ptr %old)\n  store ptr null, ptr @_exc_msg\n  br label %set\nset:\n"
+        "  store i32 %tid, ptr @_exc_type_id\n  store ptr %obj, ptr @_exc_obj\n"
+        "  %hasm = icmp ne ptr %msg, null\n  %cstr = select i1 %hasm, ptr %msg, ptr @.rt_empty\n"
+        "  %ns = call ptr @stricta_str_cstr(ptr %cstr)\n"
+        "  store ptr %ns, ptr @_exc_msg\n  ret void\n}\n\n");
+    sb_append(b,
+        "define internal void @stricta_clear_exc(i32 %free_obj) {\nentry:\n"
+        "  %old = load ptr, ptr @_exc_msg\n  %has = icmp ne ptr %old, null\n"
+        "  br i1 %has, label %freemsg, label %chkobj\nfreemsg:\n"
+        "  call void @stricta_str_free(ptr %old)\n  store ptr null, ptr @_exc_msg\n  br label %chkobj\nchkobj:\n"
+        "  %fo = icmp ne i32 %free_obj, 0\n  %obj = load ptr, ptr @_exc_obj\n"
+        "  %ho = icmp ne ptr %obj, null\n  %do_free = and i1 %fo, %ho\n"
+        "  br i1 %do_free, label %freeobj, label %done\nfreeobj:\n"
+        "  call void @free(ptr %obj)\n  br label %done\ndone:\n"
+        "  store ptr null, ptr @_exc_obj\n  store i32 0, ptr @_exc_type_id\n  ret void\n}\n\n");
+    sb_append(b,
+        "define internal void @stricta_unhandled_exc() {\nentry:\n"
+        "  %m = load ptr, ptr @_exc_msg\n  %hm = icmp ne ptr %m, null\n"
+        "  br i1 %hm, label %chklen, label %noid\nchklen:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %m, i32 0, i32 0\n"
+        "  %l = load i32, ptr %lp\n  %gt0 = icmp sgt i32 %l, 0\n"
+        "  br i1 %gt0, label %pmsg, label %noid\npmsg:\n"
+        "  %cp = getelementptr %StrictaStr, ptr %m, i32 0, i32 2\n"
+        "  %cs = load ptr, ptr %cp\n"
+        "  %r1 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_unh_msg, ptr %cs)\n"
+        "  br label %die\nnoid:\n"
+        "  %tid = load i32, ptr @_exc_type_id\n"
+        "  %r2 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_unh_id, i32 %tid)\n"
+        "  br label %die\ndie:\n  call void @exit(i32 1)\n  unreachable\n}\n\n");
+    sb_append(b,
+        "define internal i32 @stricta_exc_type_id() {\nentry:\n  %v = load i32, ptr @_exc_type_id\n  ret i32 %v\n}\n\n"
+        "define internal ptr @stricta_exc_obj() {\nentry:\n  %v = load ptr, ptr @_exc_obj\n  ret ptr %v\n}\n\n"
+        "define internal ptr @stricta_exc_msg() {\nentry:\n"
+        "  %v = load ptr, ptr @_exc_msg\n  %ok = icmp ne ptr %v, null\n"
+        "  br i1 %ok, label %retm, label %empt\nretm:\n  ret ptr %v\nempt:\n"
+        "  %e = call ptr @stricta_str_cstr(ptr @.rt_empty)\n  ret ptr %e\n}\n\n");
+    sb_append(b,
+        "define internal void @stricta_assert_fail(ptr %msg, ptr %file, i32 %line) {\nentry:\n"
+        "  %hf = icmp ne ptr %file, null\n  %rf = select i1 %hf, ptr %file, ptr @.rt_unk\n"
+        "  %hm = icmp ne ptr %msg, null\n  br i1 %hm, label %chk0, label %nomsg\nchk0:\n"
+        "  %c0 = load i8, ptr %msg\n  %ne0 = icmp ne i8 %c0, 0\n"
+        "  br i1 %ne0, label %withmsg, label %nomsg\nwithmsg:\n"
+        "  %r1 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_assert_msg, ptr %rf, i32 %line, ptr %msg)\n"
+        "  br label %die\nnomsg:\n"
+        "  %r2 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_assert_nomsg, ptr %rf, i32 %line)\n"
+        "  br label %die\ndie:\n  call void @exit(i32 1)\n  unreachable\n}\n\n");
+    sb_append(b,
+        "define internal void @stricta_bounds_fail(i64 %idx, i64 %len, ptr %file, i32 %line) {\nentry:\n"
+        "  %hf = icmp ne ptr %file, null\n  %rf = select i1 %hf, ptr %file, ptr @.rt_unk\n"
+        "  %r = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_bounds, ptr %rf, i32 %line, i64 %idx, i64 %len)\n"
+        "  call void @exit(i32 1)\n  unreachable\n}\n\n");
+
+    /* Print & Input */
+    sb_append(b,
+        "define internal void @stricta_print_i64(i64 %v) {\nentry:\n"
+        "  %r = call i32 (ptr, ...) @printf(ptr @.rt_fmt_lld, i64 %v)\n  ret void\n}\n\n"
+        "define internal void @stricta_print_u64(i64 %v) {\nentry:\n"
+        "  %r = call i32 (ptr, ...) @printf(ptr @.rt_fmt_llu, i64 %v)\n  ret void\n}\n\n"
+        "define internal void @stricta_print_bool(i32 %v) {\nentry:\n"
+        "  %b = icmp ne i32 %v, 0\n  %s = select i1 %b, ptr @.rt_true, ptr @.rt_false\n"
+        "  %r = call i32 (ptr, ...) @printf(ptr @.rt_fmt_s, ptr %s)\n  ret void\n}\n\n"
+        "define internal void @stricta_print_str(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %chk, label %done\nchk:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %gt0 = icmp sgt i32 %len, 0\n  br i1 %gt0, label %pr, label %done\npr:\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %cs = load ptr, ptr %cp\n"
+        "  %r = call i32 (ptr, ...) @printf(ptr @.rt_fmt_sn, i32 %len, ptr %cs)\n  br label %done\ndone:\n  ret void\n}\n\n"
+        "define internal void @stricta_print_cstr(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %pr, label %done\npr:\n"
+        "  %r = call i32 (ptr, ...) @printf(ptr @.rt_fmt_s, ptr %s)\n  br label %done\ndone:\n  ret void\n}\n\n"
+        "define internal void @stricta_print_space() {\nentry:\n  %r = call i32 @putchar(i32 32)\n  ret void\n}\n\n"
+        "define internal void @stricta_print_newline() {\nentry:\n  %r = call i32 @putchar(i32 10)\n  ret void\n}\n\n");
+    sb_append(b,
+        "define internal void @stricta_print_f64(double %v) {\nentry:\n"
+        "  %buf = alloca [64 x i8]\n"
+        "  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 64, ptr @.rt_fmt_g, double %v)\n"
+        "  %p1 = call ptr @strchr(ptr %buf, i32 46)\n  %b1 = icmp ne ptr %p1, null\n  br i1 %b1, label %out, label %c2\nc2:\n"
+        "  %p2 = call ptr @strchr(ptr %buf, i32 101)\n  %b2 = icmp ne ptr %p2, null\n  br i1 %b2, label %out, label %c3\nc3:\n"
+        "  %p3 = call ptr @strchr(ptr %buf, i32 69)\n  %b3 = icmp ne ptr %p3, null\n  br i1 %b3, label %out, label %c4\nc4:\n"
+        "  %p4 = call ptr @strchr(ptr %buf, i32 110)\n  %b4 = icmp ne ptr %p4, null\n  br i1 %b4, label %out, label %c5\nc5:\n"
+        "  %p5 = call ptr @strchr(ptr %buf, i32 105)\n  %b5 = icmp ne ptr %p5, null\n  br i1 %b5, label %out, label %app\napp:\n"
+        "  %n2 = add i32 %n, 2\n  %fit = icmp slt i32 %n2, 64\n  br i1 %fit, label %doapp, label %out\ndoapp:\n"
+        "  %g0 = getelementptr i8, ptr %buf, i32 %n\n  store i8 46, ptr %g0\n"
+        "  %n1 = add i32 %n, 1\n  %g1 = getelementptr i8, ptr %buf, i32 %n1\n  store i8 48, ptr %g1\n"
+        "  %g2 = getelementptr i8, ptr %buf, i32 %n2\n  store i8 0, ptr %g2\n  br label %out\nout:\n"
+        "  %r = call i32 (ptr, ...) @printf(ptr @.rt_fmt_s, ptr %buf)\n  ret void\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_input(ptr %prompt) {\nentry:\n"
+        "  %hp = icmp ne ptr %prompt, null\n  br i1 %hp, label %chk, label %read\nchk:\n"
+        "  %plp = getelementptr %StrictaStr, ptr %prompt, i32 0, i32 0\n  %pl = load i32, ptr %plp\n"
+        "  %pg = icmp sgt i32 %pl, 0\n  br i1 %pg, label %pr, label %read\npr:\n"
+        "  %pcp = getelementptr %StrictaStr, ptr %prompt, i32 0, i32 2\n  %pcs = load ptr, ptr %pcp\n"
+        "  %r1 = call i32 (ptr, ...) @printf(ptr @.rt_fmt_sn, i32 %pl, ptr %pcs)\n"
+        "  %r2 = call i32 @fflush(ptr null)\n  br label %read\nread:\n"
+        "  %cap_p = alloca i64\n  %len_p = alloca i64\n  %buf_p = alloca ptr\n"
+        "  store i64 256, ptr %cap_p\n  store i64 0, ptr %len_p\n"
+        "  %ib = call ptr @stricta_alloc(i64 256)\n  store ptr %ib, ptr %buf_p\n  br label %loop\nloop:\n"
+        "  %ch = call i32 @getchar()\n"
+        "  %eof = icmp eq i32 %ch, -1\n  %nl = icmp eq i32 %ch, 10\n  %stop = or i1 %eof, %nl\n"
+        "  br i1 %stop, label %done, label %push\npush:\n"
+        "  %len = load i64, ptr %len_p\n  %cap = load i64, ptr %cap_p\n"
+        "  %need = add i64 %len, 2\n  %grow = icmp ugt i64 %need, %cap\n"
+        "  br i1 %grow, label %dogrow, label %storec\ndogrow:\n"
+        "  %ncap = mul i64 %cap, 2\n  %ob = load ptr, ptr %buf_p\n"
+        "  %nb = call ptr @stricta_realloc(ptr %ob, i64 %ncap)\n"
+        "  store ptr %nb, ptr %buf_p\n  store i64 %ncap, ptr %cap_p\n  br label %storec\nstorec:\n"
+        "  %cb = load ptr, ptr %buf_p\n  %gp = getelementptr i8, ptr %cb, i64 %len\n"
+        "  %c8 = trunc i32 %ch to i8\n  store i8 %c8, ptr %gp\n"
+        "  %nlen = add i64 %len, 1\n  store i64 %nlen, ptr %len_p\n  br label %loop\ndone:\n"
+        "  %flen = load i64, ptr %len_p\n  %fb = load ptr, ptr %buf_p\n"
+        "  %gt0 = icmp sgt i64 %flen, 0\n  br i1 %gt0, label %chkcr, label %mk\nchkcr:\n"
+        "  %m1 = sub i64 %flen, 1\n  %lp = getelementptr i8, ptr %fb, i64 %m1\n"
+        "  %lc = load i8, ptr %lp\n  %iscr = icmp eq i8 %lc, 13\n"
+        "  br i1 %iscr, label %stripcr, label %mk\nstripcr:\n"
+        "  store i64 %m1, ptr %len_p\n  br label %mk\nmk:\n"
+        "  %fl2 = load i64, ptr %len_p\n  %fl32 = trunc i64 %fl2 to i32\n"
+        "  %res = call ptr @stricta_str_new(ptr %fb, i32 %fl32)\n"
+        "  call void @free(ptr %fb)\n  ret ptr %res\n}\n\n");
+}
+
+static void emit_llvm_rt_str(StrBuf* b) {
+    sb_append(b,
+        "define internal ptr @stricta_str_new(ptr %s, i32 %len) {\nentry:\n"
+        "  %ssz = ptrtoint ptr getelementptr (%StrictaStr, ptr null, i32 1) to i64\n"
+        "  %st = call ptr @stricta_alloc(i64 %ssz)\n"
+        "  %p0 = getelementptr %StrictaStr, ptr %st, i32 0, i32 0\n  store i32 %len, ptr %p0\n"
+        "  %p1 = getelementptr %StrictaStr, ptr %st, i32 0, i32 1\n  store i32 0, ptr %p1\n"
+        "  %p3 = getelementptr %StrictaStr, ptr %st, i32 0, i32 3\n  store i32 0, ptr %p3\n"
+        "  %l64 = sext i32 %len to i64\n  %asize = add i64 %l64, 1\n"
+        "  %ch = call ptr @stricta_alloc(i64 %asize)\n"
+        "  %p2 = getelementptr %StrictaStr, ptr %st, i32 0, i32 2\n  store ptr %ch, ptr %p2\n"
+        "  %gt0 = icmp sgt i32 %len, 0\n  %ns = icmp ne ptr %s, null\n  %do = and i1 %gt0, %ns\n"
+        "  br i1 %do, label %cp, label %nul\ncp:\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %ch, ptr %s, i64 %l64, i1 false)\n  br label %nul\nnul:\n"
+        "  %end = getelementptr i8, ptr %ch, i64 %l64\n  store i8 0, ptr %end\n  ret ptr %st\n}\n\n");
+    sb_append(b,
+        "define internal void @stricta_str_free(ptr %s) alwaysinline {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %chk, label %done\nchk:\n"
+        "  %sp = getelementptr %StrictaStr, ptr %s, i32 0, i32 3\n  %stat = load i32, ptr %sp\n"
+        "  %dyn = icmp eq i32 %stat, 0\n  br i1 %dyn, label %dofree, label %done\ndofree:\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  call void @free(ptr %ch)\n  call void @free(ptr %s)\n  br label %done\ndone:\n  ret void\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_clone(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %chk, label %ret_same\nchk:\n"
+        "  %sp = getelementptr %StrictaStr, ptr %s, i32 0, i32 3\n  %stat = load i32, ptr %sp\n"
+        "  %dyn = icmp eq i32 %stat, 0\n  br i1 %dyn, label %doclone, label %ret_same\nret_same:\n"
+        "  ret ptr %s\ndoclone:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %r = call ptr @stricta_str_new(ptr %ch, i32 %len)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_cstr(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %nonnull, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nnonnull:\n"
+        "  %l64 = call i64 @strlen(ptr %s)\n  %l32 = trunc i64 %l64 to i32\n"
+        "  %r = call ptr @stricta_str_new(ptr %s, i32 %l32)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_concat(ptr %a, ptr %b) {\nentry:\n"
+        "  %ha = icmp ne ptr %a, null\n  br i1 %ha, label %ga, label %za\nza:\n  br label %ba\nga:\n"
+        "  %lap = getelementptr %StrictaStr, ptr %a, i32 0, i32 0\n  %lav = load i32, ptr %lap\n  br label %ba\nba:\n"
+        "  %la = phi i32 [ 0, %za ], [ %lav, %ga ]\n"
+        "  %hb = icmp ne ptr %b, null\n  br i1 %hb, label %gb, label %zb\nzb:\n  br label %bb\ngb:\n"
+        "  %lbp = getelementptr %StrictaStr, ptr %b, i32 0, i32 0\n  %lbv = load i32, ptr %lbp\n  br label %bb\nbb:\n"
+        "  %lb = phi i32 [ 0, %zb ], [ %lbv, %gb ]\n"
+        "  %tot = add i32 %la, %lb\n  %ssz = ptrtoint ptr getelementptr (%StrictaStr, ptr null, i32 1) to i64\n"
+        "  %st = call ptr @stricta_alloc(i64 %ssz)\n"
+        "  %p0 = getelementptr %StrictaStr, ptr %st, i32 0, i32 0\n  store i32 %tot, ptr %p0\n"
+        "  %p1 = getelementptr %StrictaStr, ptr %st, i32 0, i32 1\n  store i32 0, ptr %p1\n"
+        "  %p3 = getelementptr %StrictaStr, ptr %st, i32 0, i32 3\n  store i32 0, ptr %p3\n"
+        "  %tot64 = sext i32 %tot to i64\n  %asz = add i64 %tot64, 1\n"
+        "  %ch = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %p2 = getelementptr %StrictaStr, ptr %st, i32 0, i32 2\n  store ptr %ch, ptr %p2\n"
+        "  %la64 = sext i32 %la to i64\n  %ca = icmp sgt i32 %la, 0\n  br i1 %ca, label %cpa, label %chkb\ncpa:\n"
+        "  %acp = getelementptr %StrictaStr, ptr %a, i32 0, i32 2\n  %ach = load ptr, ptr %acp\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %ch, ptr %ach, i64 %la64, i1 false)\n  br label %chkb\nchkb:\n"
+        "  %cb = icmp sgt i32 %lb, 0\n  br i1 %cb, label %cpb, label %nul\ncpb:\n"
+        "  %bcp = getelementptr %StrictaStr, ptr %b, i32 0, i32 2\n  %bch = load ptr, ptr %bcp\n"
+        "  %dstb = getelementptr i8, ptr %ch, i64 %la64\n  %lb64 = sext i32 %lb to i64\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %dstb, ptr %bch, i64 %lb64, i1 false)\n  br label %nul\nnul:\n"
+        "  %end = getelementptr i8, ptr %ch, i64 %tot64\n  store i8 0, ptr %end\n  ret ptr %st\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_repeat(ptr %s, i64 %cnt) {\nentry:\n"
+        "  %hs = icmp ne ptr %s, null\n  %cpos = icmp sgt i64 %cnt, 0\n  %ok1 = and i1 %hs, %cpos\n"
+        "  br i1 %ok1, label %chklen, label %empt\nchklen:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %lpos = icmp sgt i32 %len, 0\n  br i1 %lpos, label %mk, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nmk:\n"
+        "  %len64 = sext i32 %len to i64\n  %tot = mul i64 %len64, %cnt\n"
+        "  %ssz = ptrtoint ptr getelementptr (%StrictaStr, ptr null, i32 1) to i64\n"
+        "  %st = call ptr @stricta_alloc(i64 %ssz)\n"
+        "  %tot32 = trunc i64 %tot to i32\n"
+        "  %p0 = getelementptr %StrictaStr, ptr %st, i32 0, i32 0\n  store i32 %tot32, ptr %p0\n"
+        "  %p1 = getelementptr %StrictaStr, ptr %st, i32 0, i32 1\n  store i32 0, ptr %p1\n"
+        "  %p3 = getelementptr %StrictaStr, ptr %st, i32 0, i32 3\n  store i32 0, ptr %p3\n"
+        "  %asz = add i64 %tot, 1\n  %ch = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %p2 = getelementptr %StrictaStr, ptr %st, i32 0, i32 2\n  store ptr %ch, ptr %p2\n"
+        "  %scp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %sch = load ptr, ptr %scp\n"
+        "  %ip = alloca i64\n  store i64 0, ptr %ip\n  br label %loop\nloop:\n"
+        "  %i = load i64, ptr %ip\n  %cond = icmp slt i64 %i, %cnt\n"
+        "  br i1 %cond, label %body, label %done\nbody:\n"
+        "  %off = mul i64 %i, %len64\n  %dp = getelementptr i8, ptr %ch, i64 %off\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %dp, ptr %sch, i64 %len64, i1 false)\n"
+        "  %ni = add i64 %i, 1\n  store i64 %ni, ptr %ip\n  br label %loop\ndone:\n"
+        "  %end = getelementptr i8, ptr %ch, i64 %tot\n  store i8 0, ptr %end\n  ret ptr %st\n}\n\n");
+    sb_append(b,
+        "define internal i64 @stricta_slice_adjust(i64 %len, i64 %start, i32 %has_start, i64 %stop, i32 %has_stop, i64 %step, ptr %out_start) {\nentry:\n"
+        "  %z = icmp eq i64 %step, 0\n  br i1 %z, label %bad, label %st0\nbad:\n"
+        "  call void @stricta_set_exc(i32 1, ptr null, ptr @.rt_err_step)\n"
+        "  store i64 0, ptr %out_start\n  ret i64 -1\nst0:\n"
+        "  %sneg = icmp slt i64 %step, 0\n  %hs = icmp ne i32 %has_start, 0\n"
+        "  br i1 %hs, label %adj_st, label %def_st\ndef_st:\n"
+        "  %lm1 = sub i64 %len, 1\n  %ds = select i1 %sneg, i64 %lm1, i64 0\n  br label %st_ok\nadj_st:\n"
+        "  %sn = icmp slt i64 %start, 0\n  br i1 %sn, label %st_lt0, label %st_ge0\nst_lt0:\n"
+        "  %sa = add i64 %start, %len\n  %sa0 = icmp slt i64 %sa, 0\n"
+        "  %cl1 = select i1 %sneg, i64 -1, i64 0\n"
+        "  %r1 = select i1 %sa0, i64 %cl1, i64 %sa\n  br label %st_ok\nst_ge0:\n"
+        "  %sge = icmp sge i64 %start, %len\n"
+        "  %lm1b = sub i64 %len, 1\n  %cl2 = select i1 %sneg, i64 %lm1b, i64 %len\n"
+        "  %r2 = select i1 %sge, i64 %cl2, i64 %start\n  br label %st_ok\nst_ok:\n"
+        "  %fs = phi i64 [ %ds, %def_st ], [ %r1, %st_lt0 ], [ %r2, %st_ge0 ]\n"
+        "  %hsp = icmp ne i32 %has_stop, 0\n  br i1 %hsp, label %adj_sp, label %def_sp\ndef_sp:\n"
+        "  %dsp = select i1 %sneg, i64 -1, i64 %len\n  br label %sp_ok\nadj_sp:\n"
+        "  %spn = icmp slt i64 %stop, 0\n  br i1 %spn, label %sp_lt0, label %sp_ge0\nsp_lt0:\n"
+        "  %spa = add i64 %stop, %len\n  %spa0 = icmp slt i64 %spa, 0\n"
+        "  %spcl1 = select i1 %sneg, i64 -1, i64 0\n"
+        "  %spr1 = select i1 %spa0, i64 %spcl1, i64 %spa\n  br label %sp_ok\nsp_ge0:\n"
+        "  %spge = icmp sge i64 %stop, %len\n"
+        "  %lm1c = sub i64 %len, 1\n  %spcl2 = select i1 %sneg, i64 %lm1c, i64 %len\n"
+        "  %spr2 = select i1 %spge, i64 %spcl2, i64 %stop\n  br label %sp_ok\nsp_ok:\n"
+        "  %fsp = phi i64 [ %dsp, %def_sp ], [ %spr1, %sp_lt0 ], [ %spr2, %sp_ge0 ]\n"
+        "  store i64 %fs, ptr %out_start\n"
+        "  %spos = icmp sgt i64 %step, 0\n  br i1 %spos, label %pos, label %neg\npos:\n"
+        "  %le = icmp sle i64 %fsp, %fs\n  br i1 %le, label %ret0, label %pcalc\npcalc:\n"
+        "  %span1 = sub i64 %fsp, %fs\n  %nm1 = add i64 %span1, %step\n  %nm2 = sub i64 %nm1, 1\n"
+        "  %q1 = udiv i64 %nm2, %step\n  ret i64 %q1\nneg:\n"
+        "  %le2 = icmp sle i64 %fs, %fsp\n  br i1 %le2, label %ret0, label %ncalc\nncalc:\n"
+        "  %span2 = sub i64 %fs, %fsp\n  %sp1 = add i64 %step, 1\n  %nsp1 = sub i64 0, %sp1\n"
+        "  %ustep = add i64 %nsp1, 1\n  %nn1 = add i64 %span2, %ustep\n  %nn2 = sub i64 %nn1, 1\n"
+        "  %q2 = udiv i64 %nn2, %ustep\n  ret i64 %q2\nret0:\n  ret i64 0\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_slice(ptr %s, i64 %start, i64 %end) {\nentry:\n"
+        "  %hs = icmp ne ptr %s, null\n  br i1 %hs, label %work, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nwork:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %l32 = load i32, ptr %lp\n"
+        "  %len = sext i32 %l32 to i64\n"
+        "  %sn = icmp slt i64 %start, 0\n  %s1 = add i64 %start, %len\n  %s2 = select i1 %sn, i64 %s1, i64 %start\n"
+        "  %sl0 = icmp slt i64 %s2, 0\n  %fs = select i1 %sl0, i64 0, i64 %s2\n"
+        "  %en = icmp slt i64 %end, 0\n  %e1 = add i64 %end, %len\n  %e2 = select i1 %en, i64 %e1, i64 %end\n"
+        "  %egl = icmp sgt i64 %e2, %len\n  %fe = select i1 %egl, i64 %len, i64 %e2\n"
+        "  %bad = icmp sge i64 %fs, %fe\n  br i1 %bad, label %empt, label %mk\nmk:\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %src = getelementptr i8, ptr %ch, i64 %fs\n  %dl = sub i64 %fe, %fs\n  %dl32 = trunc i64 %dl to i32\n"
+        "  %r = call ptr @stricta_str_new(ptr %src, i32 %dl32)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_slice_step(ptr %s, i64 %start, i32 %hs, i64 %stop, i32 %hsp, i64 %step) {\nentry:\n"
+        "  %cur_p = alloca i64\n  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %work, label %nulls\nnulls:\n"
+        "  %d0 = call i64 @stricta_slice_adjust(i64 0, i64 %start, i32 %hs, i64 %stop, i32 %hsp, i64 %step, ptr %cur_p)\n"
+        "  %e0 = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e0\nwork:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %l32 = load i32, ptr %lp\n"
+        "  %len = sext i32 %l32 to i64\n"
+        "  %cnt = call i64 @stricta_slice_adjust(i64 %len, i64 %start, i32 %hs, i64 %stop, i32 %hsp, i64 %step, ptr %cur_p)\n"
+        "  %le0 = icmp sle i64 %cnt, 0\n  br i1 %le0, label %empt, label %chk1\nempt:\n"
+        "  %e1 = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e1\nchk1:\n"
+        "  %cur0 = load i64, ptr %cur_p\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %is1 = icmp eq i64 %step, 1\n  br i1 %is1, label %fast1, label %slow\nfast1:\n"
+        "  %src = getelementptr i8, ptr %ch, i64 %cur0\n  %c32 = trunc i64 %cnt to i32\n"
+        "  %r1 = call ptr @stricta_str_new(ptr %src, i32 %c32)\n  ret ptr %r1\nslow:\n"
+        "  %ssz = ptrtoint ptr getelementptr (%StrictaStr, ptr null, i32 1) to i64\n"
+        "  %st = call ptr @stricta_alloc(i64 %ssz)\n  %cnt32 = trunc i64 %cnt to i32\n"
+        "  %p0 = getelementptr %StrictaStr, ptr %st, i32 0, i32 0\n  store i32 %cnt32, ptr %p0\n"
+        "  %p1 = getelementptr %StrictaStr, ptr %st, i32 0, i32 1\n  store i32 0, ptr %p1\n"
+        "  %p3 = getelementptr %StrictaStr, ptr %st, i32 0, i32 3\n  store i32 0, ptr %p3\n"
+        "  %asz = add i64 %cnt, 1\n  %och = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %p2 = getelementptr %StrictaStr, ptr %st, i32 0, i32 2\n  store ptr %och, ptr %p2\n"
+        "  %ip = alloca i64\n  store i64 0, ptr %ip\n  br label %loop\nloop:\n"
+        "  %i = load i64, ptr %ip\n  %cond = icmp slt i64 %i, %cnt\n  br i1 %cond, label %body, label %done\nbody:\n"
+        "  %cur = load i64, ptr %cur_p\n  %sp = getelementptr i8, ptr %ch, i64 %cur\n  %bval = load i8, ptr %sp\n"
+        "  %dp = getelementptr i8, ptr %och, i64 %i\n  store i8 %bval, ptr %dp\n"
+        "  %ncur = add i64 %cur, %step\n  store i64 %ncur, ptr %cur_p\n"
+        "  %ni = add i64 %i, 1\n  store i64 %ni, ptr %ip\n  br label %loop\ndone:\n"
+        "  %end = getelementptr i8, ptr %och, i64 %cnt\n  store i8 0, ptr %end\n  ret ptr %st\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_char_at(ptr %s, i64 %idx) {\nentry:\n"
+        "  %hs = icmp ne ptr %s, null\n  br i1 %hs, label %chk, label %fail0\nfail0:\n"
+        "  call void @stricta_bounds_fail(i64 %idx, i64 0, ptr @.rt_str_ctx, i32 0)\n  unreachable\nchk:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %l32 = load i32, ptr %lp\n"
+        "  %z = icmp eq i32 %l32, 0\n  br i1 %z, label %fail0, label %adj\nadj:\n"
+        "  %len = sext i32 %l32 to i64\n  %neg = icmp slt i64 %idx, 0\n"
+        "  %ai = add i64 %idx, %len\n  %fi = select i1 %neg, i64 %ai, i64 %idx\n"
+        "  %b1 = icmp slt i64 %fi, 0\n  %b2 = icmp sge i64 %fi, %len\n  %bad = or i1 %b1, %b2\n"
+        "  br i1 %bad, label %failn, label %ok\nfailn:\n"
+        "  call void @stricta_bounds_fail(i64 %fi, i64 %len, ptr @.rt_str_ctx, i32 0)\n  unreachable\nok:\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %sp = getelementptr i8, ptr %ch, i64 %fi\n"
+        "  %r = call ptr @stricta_str_new(ptr %sp, i32 1)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal i32 @stricta_str_eq(ptr %a, ptr %b) {\nentry:\n"
+        "  %same = icmp eq ptr %a, %b\n  br i1 %same, label %ret1, label %chkn\nchkn:\n"
+        "  %na = icmp eq ptr %a, null\n  %nb = icmp eq ptr %b, null\n  %any = or i1 %na, %nb\n"
+        "  br i1 %any, label %ret0, label %chkl\nchkl:\n"
+        "  %lap = getelementptr %StrictaStr, ptr %a, i32 0, i32 0\n  %la = load i32, ptr %lap\n"
+        "  %lbp = getelementptr %StrictaStr, ptr %b, i32 0, i32 0\n  %lb = load i32, ptr %lbp\n"
+        "  %leq = icmp eq i32 %la, %lb\n  br i1 %leq, label %chkh, label %ret0\nchkh:\n"
+        "  %hap = getelementptr %StrictaStr, ptr %a, i32 0, i32 1\n  %ha = load i32, ptr %hap\n"
+        "  %hbp = getelementptr %StrictaStr, ptr %b, i32 0, i32 1\n  %hb = load i32, ptr %hbp\n"
+        "  %ha0 = icmp ne i32 %ha, 0\n  %hb0 = icmp ne i32 %hb, 0\n  %hneq = icmp ne i32 %ha, %hb\n"
+        "  %hbad1 = and i1 %ha0, %hb0\n  %hbad = and i1 %hbad1, %hneq\n"
+        "  br i1 %hbad, label %ret0, label %docmp\ndocmp:\n"
+        "  %acp = getelementptr %StrictaStr, ptr %a, i32 0, i32 2\n  %ac = load ptr, ptr %acp\n"
+        "  %bcp = getelementptr %StrictaStr, ptr %b, i32 0, i32 2\n  %bc = load ptr, ptr %bcp\n"
+        "  %l64 = sext i32 %la to i64\n  %mc = call i32 @memcmp(ptr %ac, ptr %bc, i64 %l64)\n"
+        "  %eq = icmp eq i32 %mc, 0\n  %r = zext i1 %eq to i32\n  ret i32 %r\nret1:\n  ret i32 1\nret0:\n  ret i32 0\n}\n\n");
+    sb_append(b,
+        "define internal i32 @stricta_str_cmp(ptr %a, ptr %b) {\nentry:\n"
+        "  %same = icmp eq ptr %a, %b\n  br i1 %same, label %ret0, label %c1\nc1:\n"
+        "  %na = icmp eq ptr %a, null\n  br i1 %na, label %retm1, label %c2\nc2:\n"
+        "  %nb = icmp eq ptr %b, null\n  br i1 %nb, label %ret1, label %work\nwork:\n"
+        "  %lap = getelementptr %StrictaStr, ptr %a, i32 0, i32 0\n  %la = load i32, ptr %lap\n"
+        "  %lbp = getelementptr %StrictaStr, ptr %b, i32 0, i32 0\n  %lb = load i32, ptr %lbp\n"
+        "  %minl = call i32 @llvm.smin.i32(i32 %la, i32 %lb)\n"
+        "  %min64 = sext i32 %minl to i64\n"
+        "  %acp = getelementptr %StrictaStr, ptr %a, i32 0, i32 2\n  %ac = load ptr, ptr %acp\n"
+        "  %bcp = getelementptr %StrictaStr, ptr %b, i32 0, i32 2\n  %bc = load ptr, ptr %bcp\n"
+        "  %mc = call i32 @memcmp(ptr %ac, ptr %bc, i64 %min64)\n"
+        "  %nz = icmp ne i32 %mc, 0\n  br i1 %nz, label %retmc, label %cmplen\nretmc:\n  ret i32 %mc\ncmplen:\n"
+        "  %lt = icmp slt i32 %la, %lb\n  br i1 %lt, label %retm1, label %gtchk\ngtchk:\n"
+        "  %gt = icmp sgt i32 %la, %lb\n  br i1 %gt, label %ret1, label %ret0\nretm1:\n  ret i32 -1\nret1:\n  ret i32 1\nret0:\n  ret i32 0\n}\n\n");
+    sb_append(b,
+        "define internal i64 @stricta_str_hash(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %chk, label %ret0\nret0:\n  ret i64 0\nchk:\n"
+        "  %hp = getelementptr %StrictaStr, ptr %s, i32 0, i32 1\n  %h0 = load i32, ptr %hp\n"
+        "  %hz = icmp eq i32 %h0, 0\n  br i1 %hz, label %calc, label %fin\ncalc:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %ip = alloca i32\n  %hv = alloca i32\n"
+        "  store i32 0, ptr %ip\n  store i32 -2128831035, ptr %hv\n  br label %loop\nloop:\n"
+        "  %i = load i32, ptr %ip\n  %cond = icmp slt i32 %i, %len\n  br i1 %cond, label %body, label %lout\nbody:\n"
+        "  %gp = getelementptr i8, ptr %ch, i32 %i\n  %b8 = load i8, ptr %gp\n  %b32 = zext i8 %b8 to i32\n"
+        "  %hc = load i32, ptr %hv\n  %hx = xor i32 %hc, %b32\n  %hm = mul i32 %hx, 16777619\n"
+        "  store i32 %hm, ptr %hv\n  %ni = add i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %loop\nlout:\n"
+        "  %hf = load i32, ptr %hv\n  %is0 = icmp eq i32 %hf, 0\n  %h1 = select i1 %is0, i32 1, i32 %hf\n"
+        "  %sp = getelementptr %StrictaStr, ptr %s, i32 0, i32 3\n  %stat = load i32, ptr %sp\n"
+        "  %dyn = icmp eq i32 %stat, 0\n  br i1 %dyn, label %saveh, label %fin\nsaveh:\n"
+        "  store i32 %h1, ptr %hp\n  br label %fin\nfin:\n"
+        "  %fh = phi i32 [ %h0, %chk ], [ %h1, %lout ], [ %h1, %saveh ]\n"
+        "  %x0 = zext i32 %fh to i64\n"
+        "  %x1 = lshr i64 %x0, 16\n  %x2 = xor i64 %x0, %x1\n  %x3 = mul i64 %x2, 73244475\n"
+        "  %x4 = lshr i64 %x3, 16\n  %x5 = xor i64 %x3, %x4\n  ret i64 %x5\n}\n\n");
+    sb_append(b,
+        "define internal i32 @stricta_str_contains(ptr %sub, ptr %s) {\nentry:\n"
+        "  %ns = icmp eq ptr %sub, null\n  %nt = icmp eq ptr %s, null\n  %bad = or i1 %ns, %nt\n"
+        "  br i1 %bad, label %ret0, label %chkl\nchkl:\n"
+        "  %lp1 = getelementptr %StrictaStr, ptr %sub, i32 0, i32 0\n  %l1 = load i32, ptr %lp1\n"
+        "  %z1 = icmp eq i32 %l1, 0\n  br i1 %z1, label %ret1, label %chkl2\nchkl2:\n"
+        "  %lp2 = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %l2 = load i32, ptr %lp2\n"
+        "  %gt = icmp sgt i32 %l1, %l2\n  br i1 %gt, label %ret0, label %find\nfind:\n"
+        "  %cp1 = getelementptr %StrictaStr, ptr %sub, i32 0, i32 2\n  %c1 = load ptr, ptr %cp1\n"
+        "  %cp2 = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %c2 = load ptr, ptr %cp2\n"
+        "  %hit = call ptr @strstr(ptr %c2, ptr %c1)\n"
+        "  %ok = icmp ne ptr %hit, null\n  %r = zext i1 %ok to i32\n  ret i32 %r\nret1:\n  ret i32 1\nret0:\n  ret i32 0\n}\n\n");
+    sb_append(b,
+        "define internal void @_rt_split_push(ptr %lst, ptr %item) {\nentry:\n"
+        "  %lp = getelementptr %StrictaPtrList, ptr %lst, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %cp = getelementptr %StrictaPtrList, ptr %lst, i32 0, i32 1\n  %cap = load i32, ptr %cp\n"
+        "  %ip = getelementptr %StrictaPtrList, ptr %lst, i32 0, i32 2\n"
+        "  %full = icmp sge i32 %len, %cap\n  br i1 %full, label %grow, label %put\ngrow:\n"
+        "  %ncap = mul i32 %cap, 2\n  store i32 %ncap, ptr %cp\n"
+        "  %arr = load ptr, ptr %ip\n  %ncap64 = sext i32 %ncap to i64\n  %nsz = mul i64 %ncap64, 8\n"
+        "  %narr = call ptr @stricta_realloc(ptr %arr, i64 %nsz)\n  store ptr %narr, ptr %ip\n  br label %put\nput:\n"
+        "  %farr = load ptr, ptr %ip\n  %dp = getelementptr ptr, ptr %farr, i32 %len\n  store ptr %item, ptr %dp\n"
+        "  %nlen = add i32 %len, 1\n  store i32 %nlen, ptr %lp\n  ret void\n}\n\n");
+    sb_append(b,
+        "define internal i1 @_rt_is_space(i8 %c) alwaysinline {\nentry:\n"
+        "  %s1 = icmp eq i8 %c, 32\n  %ge9 = icmp uge i8 %c, 9\n  %le13 = icmp ule i8 %c, 13\n"
+        "  %s2 = and i1 %ge9, %le13\n  %r = or i1 %s1, %s2\n  ret i1 %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_split(ptr %s, ptr %sep) {\nentry:\n"
+        "  %lsz = ptrtoint ptr getelementptr (%StrictaPtrList, ptr null, i32 1) to i64\n"
+        "  %lst = call ptr @stricta_alloc(i64 %lsz)\n"
+        "  %p0 = getelementptr %StrictaPtrList, ptr %lst, i32 0, i32 0\n  store i32 0, ptr %p0\n"
+        "  %p1 = getelementptr %StrictaPtrList, ptr %lst, i32 0, i32 1\n  store i32 8, ptr %p1\n"
+        "  %items = call ptr @stricta_alloc(i64 64)\n"
+        "  %p2 = getelementptr %StrictaPtrList, ptr %lst, i32 0, i32 2\n  store ptr %items, ptr %p2\n"
+        "  %hs = icmp ne ptr %s, null\n  br i1 %hs, label %chks, label %retl\nchks:\n"
+        "  %slp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %slen = load i32, ptr %slp\n"
+        "  %scp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %sch = load ptr, ptr %scp\n"
+        "  %hsep = icmp ne ptr %sep, null\n  br i1 %hsep, label %wsep, label %wspace\nwspace:\n"
+        "  %ip = alloca i32\n  store i32 0, ptr %ip\n  br label %wsl1\nwsl1:\n"
+        "  %i0 = load i32, ptr %ip\n  %c0 = icmp slt i32 %i0, %slen\n  br i1 %c0, label %wsc1, label %retl\nwsc1:\n"
+        "  %gp0 = getelementptr i8, ptr %sch, i32 %i0\n  %ch0 = load i8, ptr %gp0\n"
+        "  %sp0 = call i1 @_rt_is_space(i8 %ch0)\n  br i1 %sp0, label %wsinc1, label %wsstart\nwsinc1:\n"
+        "  %ni0 = add i32 %i0, 1\n  store i32 %ni0, ptr %ip\n  br label %wsl1\nwsstart:\n"
+        "  %st0 = load i32, ptr %ip\n  br label %wsl2\nwsl2:\n"
+        "  %i1 = load i32, ptr %ip\n  %c1 = icmp slt i32 %i1, %slen\n  br i1 %c1, label %wsc2, label %wspush\nwsc2:\n"
+        "  %gp1 = getelementptr i8, ptr %sch, i32 %i1\n  %ch1 = load i8, ptr %gp1\n"
+        "  %sp1 = call i1 @_rt_is_space(i8 %ch1)\n  br i1 %sp1, label %wspush, label %wsinc2\nwsinc2:\n"
+        "  %ni1 = add i32 %i1, 1\n  store i32 %ni1, ptr %ip\n  br label %wsl2\nwspush:\n"
+        "  %end0 = load i32, ptr %ip\n  %tlen = sub i32 %end0, %st0\n"
+        "  %tsrc = getelementptr i8, ptr %sch, i32 %st0\n"
+        "  %tok = call ptr @stricta_str_new(ptr %tsrc, i32 %tlen)\n"
+        "  call void @_rt_split_push(ptr %lst, ptr %tok)\n  br label %wsl1\nwsep:\n"
+        "  %seplp = getelementptr %StrictaStr, ptr %sep, i32 0, i32 0\n  %seplen = load i32, ptr %seplp\n"
+        "  %sep0 = icmp eq i32 %seplen, 0\n  br i1 %sep0, label %badsep, label %seploop0\nbadsep:\n"
+        "  call void @stricta_set_exc(i32 2, ptr null, ptr @.rt_err_sep)\n"
+        "  call void @stricta_unhandled_exc()\n  unreachable\nseploop0:\n"
+        "  %sepcp = getelementptr %StrictaStr, ptr %sep, i32 0, i32 2\n  %sepch = load ptr, ptr %sepcp\n"
+        "  %posp = alloca i32\n  store i32 0, ptr %posp\n  br label %seploop\nseploop:\n"
+        "  %pos = load i32, ptr %posp\n  %cond = icmp sle i32 %pos, %slen\n  br i1 %cond, label %sepbody, label %retl\nsepbody:\n"
+        "  %hay = getelementptr i8, ptr %sch, i32 %pos\n"
+        "  %hit = call ptr @strstr(ptr %hay, ptr %sepch)\n"
+        "  %nf = icmp eq ptr %hit, null\n  br i1 %nf, label %septail, label %sephit\nseptail:\n"
+        "  %rlen = sub i32 %slen, %pos\n"
+        "  %rtok = call ptr @stricta_str_new(ptr %hay, i32 %rlen)\n"
+        "  call void @_rt_split_push(ptr %lst, ptr %rtok)\n  br label %retl\nsephit:\n"
+        "  %hit_i = ptrtoint ptr %hit to i64\n  %sch_i = ptrtoint ptr %sch to i64\n"
+        "  %diff = sub i64 %hit_i, %sch_i\n  %end = trunc i64 %diff to i32\n"
+        "  %plen = sub i32 %end, %pos\n"
+        "  %ptok = call ptr @stricta_str_new(ptr %hay, i32 %plen)\n"
+        "  call void @_rt_split_push(ptr %lst, ptr %ptok)\n"
+        "  %npos = add i32 %end, %seplen\n  store i32 %npos, ptr %posp\n  br label %seploop\nretl:\n  ret ptr %lst\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_join(ptr %sep, ptr %list) {\nentry:\n"
+        "  %hl = icmp ne ptr %list, null\n  br i1 %hl, label %chkl, label %empt\nchkl:\n"
+        "  %lp = getelementptr %StrictaPtrList, ptr %list, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %z = icmp eq i32 %len, 0\n  br i1 %z, label %empt, label %work\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nwork:\n"
+        "  %hsep = icmp ne ptr %sep, null\n  br i1 %hsep, label %gsep, label %zsep\nzsep:\n  br label %bsep\ngsep:\n"
+        "  %slp = getelementptr %StrictaStr, ptr %sep, i32 0, i32 0\n  %slv = load i32, ptr %slp\n  %scp = getelementptr %StrictaStr, ptr %sep, i32 0, i32 2\n  %scv = load ptr, ptr %scp\n  br label %bsep\nbsep:\n"
+        "  %seplen = phi i32 [ 0, %zsep ], [ %slv, %gsep ]\n"
+        "  %sepch = phi ptr [ null, %zsep ], [ %scv, %gsep ]\n"
+        "  %seplen64 = sext i32 %seplen to i64\n"
+        "  %ip0 = getelementptr %StrictaPtrList, ptr %list, i32 0, i32 2\n  %items = load ptr, ptr %ip0\n"
+        "  %totp = alloca i64\n  %ip = alloca i32\n  store i64 0, ptr %totp\n  store i32 0, ptr %ip\n  br label %p1\np1:\n"
+        "  %i = load i32, ptr %ip\n  %c1 = icmp slt i32 %i, %len\n  br i1 %c1, label %p1b, label %p1d\np1b:\n"
+        "  %ep = getelementptr ptr, ptr %items, i32 %i\n  %it = load ptr, ptr %ep\n"
+        "  %hit = icmp ne ptr %it, null\n  br i1 %hit, label %p1add, label %p1sep\np1add:\n"
+        "  %ilp = getelementptr %StrictaStr, ptr %it, i32 0, i32 0\n  %il = load i32, ptr %ilp\n"
+        "  %il64 = sext i32 %il to i64\n  %t0 = load i64, ptr %totp\n  %t1 = add i64 %t0, %il64\n  store i64 %t1, ptr %totp\n  br label %p1sep\np1sep:\n"
+        "  %gt0 = icmp sgt i32 %i, 0\n  br i1 %gt0, label %p1as, label %p1n\np1as:\n"
+        "  %t2 = load i64, ptr %totp\n  %t3 = add i64 %t2, %seplen64\n  store i64 %t3, ptr %totp\n  br label %p1n\np1n:\n"
+        "  %ni = add i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %p1\np1d:\n"
+        "  %tot = load i64, ptr %totp\n"
+        "  %ssz = ptrtoint ptr getelementptr (%StrictaStr, ptr null, i32 1) to i64\n"
+        "  %out = call ptr @stricta_alloc(i64 %ssz)\n  %tot32 = trunc i64 %tot to i32\n"
+        "  %o0 = getelementptr %StrictaStr, ptr %out, i32 0, i32 0\n  store i32 %tot32, ptr %o0\n"
+        "  %o1 = getelementptr %StrictaStr, ptr %out, i32 0, i32 1\n  store i32 0, ptr %o1\n"
+        "  %o3 = getelementptr %StrictaStr, ptr %out, i32 0, i32 3\n  store i32 0, ptr %o3\n"
+        "  %asz = add i64 %tot, 1\n  %och = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %o2 = getelementptr %StrictaStr, ptr %out, i32 0, i32 2\n  store ptr %och, ptr %o2\n"
+        "  %offp = alloca i64\n  store i64 0, ptr %offp\n  store i32 0, ptr %ip\n  br label %p2\np2:\n"
+        "  %j = load i32, ptr %ip\n  %c2 = icmp slt i32 %j, %len\n  br i1 %c2, label %p2b, label %p2d\np2b:\n"
+        "  %jgt = icmp sgt i32 %j, 0\n  %sg = icmp sgt i32 %seplen, 0\n  %csep = and i1 %jgt, %sg\n"
+        "  br i1 %csep, label %cpsep, label %cpitem\ncpsep:\n"
+        "  %off0 = load i64, ptr %offp\n  %dp0 = getelementptr i8, ptr %och, i64 %off0\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %dp0, ptr %sepch, i64 %seplen64, i1 false)\n"
+        "  %off1 = add i64 %off0, %seplen64\n  store i64 %off1, ptr %offp\n  br label %cpitem\ncpitem:\n"
+        "  %ep2 = getelementptr ptr, ptr %items, i32 %j\n  %it2 = load ptr, ptr %ep2\n"
+        "  %hit2 = icmp ne ptr %it2, null\n  br i1 %hit2, label %chkilen, label %p2n\nchkilen:\n"
+        "  %ilp2 = getelementptr %StrictaStr, ptr %it2, i32 0, i32 0\n  %il2 = load i32, ptr %ilp2\n"
+        "  %ig0 = icmp sgt i32 %il2, 0\n  br i1 %ig0, label %doitem, label %p2n\ndoitem:\n"
+        "  %icp2 = getelementptr %StrictaStr, ptr %it2, i32 0, i32 2\n  %ich2 = load ptr, ptr %icp2\n"
+        "  %il2_64 = sext i32 %il2 to i64\n  %off2 = load i64, ptr %offp\n"
+        "  %dp1 = getelementptr i8, ptr %och, i64 %off2\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %dp1, ptr %ich2, i64 %il2_64, i1 false)\n"
+        "  %off3 = add i64 %off2, %il2_64\n  store i64 %off3, ptr %offp\n  br label %p2n\np2n:\n"
+        "  %nj = add i32 %j, 1\n  store i32 %nj, ptr %ip\n  br label %p2\np2d:\n"
+        "  %fend = load i64, ptr %offp\n  %endp = getelementptr i8, ptr %och, i64 %fend\n"
+        "  store i8 0, ptr %endp\n  ret ptr %out\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_upper(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %work, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nwork:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %out = call ptr @stricta_str_new(ptr %ch, i32 %len)\n"
+        "  %ocp = getelementptr %StrictaStr, ptr %out, i32 0, i32 2\n  %och = load ptr, ptr %ocp\n"
+        "  %ip = alloca i32\n  store i32 0, ptr %ip\n  br label %loop\nloop:\n"
+        "  %i = load i32, ptr %ip\n  %cond = icmp slt i32 %i, %len\n  br i1 %cond, label %body, label %done\nbody:\n"
+        "  %gp = getelementptr i8, ptr %och, i32 %i\n  %c = load i8, ptr %gp\n"
+        "  %ge = icmp uge i8 %c, 97\n  %le = icmp ule i8 %c, 122\n  %islo = and i1 %ge, %le\n"
+        "  %up = sub i8 %c, 32\n  %nc = select i1 %islo, i8 %up, i8 %c\n"
+        "  store i8 %nc, ptr %gp\n  %ni = add i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %loop\ndone:\n  ret ptr %out\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_lower(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %work, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nwork:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %out = call ptr @stricta_str_new(ptr %ch, i32 %len)\n"
+        "  %ocp = getelementptr %StrictaStr, ptr %out, i32 0, i32 2\n  %och = load ptr, ptr %ocp\n"
+        "  %ip = alloca i32\n  store i32 0, ptr %ip\n  br label %loop\nloop:\n"
+        "  %i = load i32, ptr %ip\n  %cond = icmp slt i32 %i, %len\n  br i1 %cond, label %body, label %done\nbody:\n"
+        "  %gp = getelementptr i8, ptr %och, i32 %i\n  %c = load i8, ptr %gp\n"
+        "  %ge = icmp uge i8 %c, 65\n  %le = icmp ule i8 %c, 90\n  %isup = and i1 %ge, %le\n"
+        "  %lo = add i8 %c, 32\n  %nc = select i1 %isup, i8 %lo, i8 %c\n"
+        "  store i8 %nc, ptr %gp\n  %ni = add i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %loop\ndone:\n  ret ptr %out\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_replace(ptr %s, ptr %olds, ptr %news) {\nentry:\n"
+        "  %hs = icmp ne ptr %s, null\n  %ho = icmp ne ptr %olds, null\n  %hn = icmp ne ptr %news, null\n"
+        "  %a1 = and i1 %hs, %ho\n  %a2 = and i1 %a1, %hn\n  br i1 %a2, label %chkol, label %fallback\nchkol:\n"
+        "  %olp = getelementptr %StrictaStr, ptr %olds, i32 0, i32 0\n  %olen = load i32, ptr %olp\n"
+        "  %og0 = icmp sgt i32 %olen, 0\n  br i1 %og0, label %count0, label %fallback\nfallback:\n"
+        "  br i1 %hs, label %cl, label %empt\ncl:\n"
+        "  %rc = call ptr @stricta_str_clone(ptr %s)\n  ret ptr %rc\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\ncount0:\n"
+        "  %scp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %sch = load ptr, ptr %scp\n"
+        "  %ocp = getelementptr %StrictaStr, ptr %olds, i32 0, i32 2\n  %och = load ptr, ptr %ocp\n"
+        "  %olen64 = sext i32 %olen to i64\n"
+        "  %cntp = alloca i64\n  %pp = alloca ptr\n"
+        "  store i64 0, ptr %cntp\n  store ptr %sch, ptr %pp\n  br label %cloop\ncloop:\n"
+        "  %cp0 = load ptr, ptr %pp\n  %hit0 = call ptr @strstr(ptr %cp0, ptr %och)\n"
+        "  %fnd0 = icmp ne ptr %hit0, null\n  br i1 %fnd0, label %chit, label %cdone\nchit:\n"
+        "  %c0 = load i64, ptr %cntp\n  %c1 = add i64 %c0, 1\n  store i64 %c1, ptr %cntp\n"
+        "  %np0 = getelementptr i8, ptr %hit0, i64 %olen64\n  store ptr %np0, ptr %pp\n  br label %cloop\ncdone:\n"
+        "  %cnt = load i64, ptr %cntp\n  %zcnt = icmp eq i64 %cnt, 0\n  br i1 %zcnt, label %cl, label %alloc\nalloc:\n"
+        "  %slp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %slen = load i32, ptr %slp\n"
+        "  %nlp = getelementptr %StrictaStr, ptr %news, i32 0, i32 0\n  %nlen = load i32, ptr %nlp\n"
+        "  %ncp = getelementptr %StrictaStr, ptr %news, i32 0, i32 2\n  %nch = load ptr, ptr %ncp\n"
+        "  %slen64 = sext i32 %slen to i64\n  %nlen64 = sext i32 %nlen to i64\n"
+        "  %diff = sub i64 %nlen64, %olen64\n  %delta = mul i64 %cnt, %diff\n"
+        "  %tot = add i64 %slen64, %delta\n"
+        "  %ssz = ptrtoint ptr getelementptr (%StrictaStr, ptr null, i32 1) to i64\n"
+        "  %out = call ptr @stricta_alloc(i64 %ssz)\n  %tot32 = trunc i64 %tot to i32\n"
+        "  %o0 = getelementptr %StrictaStr, ptr %out, i32 0, i32 0\n  store i32 %tot32, ptr %o0\n"
+        "  %o1 = getelementptr %StrictaStr, ptr %out, i32 0, i32 1\n  store i32 0, ptr %o1\n"
+        "  %o3 = getelementptr %StrictaStr, ptr %out, i32 0, i32 3\n  store i32 0, ptr %o3\n"
+        "  %asz = add i64 %tot, 1\n  %dch = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %o2 = getelementptr %StrictaStr, ptr %out, i32 0, i32 2\n  store ptr %dch, ptr %o2\n"
+        "  %dstp = alloca ptr\n  store ptr %dch, ptr %dstp\n  store ptr %sch, ptr %pp\n  br label %rloop\nrloop:\n"
+        "  %sp1 = load ptr, ptr %pp\n  %hit1 = call ptr @strstr(ptr %sp1, ptr %och)\n"
+        "  %fnd1 = icmp ne ptr %hit1, null\n  br i1 %fnd1, label %rhit, label %rtail\nrhit:\n"
+        "  %hi = ptrtoint ptr %hit1 to i64\n  %si = ptrtoint ptr %sp1 to i64\n"
+        "  %chunk = sub i64 %hi, %si\n  %dp0 = load ptr, ptr %dstp\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %dp0, ptr %sp1, i64 %chunk, i1 false)\n"
+        "  %dp1 = getelementptr i8, ptr %dp0, i64 %chunk\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %dp1, ptr %nch, i64 %nlen64, i1 false)\n"
+        "  %dp2 = getelementptr i8, ptr %dp1, i64 %nlen64\n  store ptr %dp2, ptr %dstp\n"
+        "  %np1 = getelementptr i8, ptr %hit1, i64 %olen64\n  store ptr %np1, ptr %pp\n  br label %rloop\nrtail:\n"
+        "  %sp2 = load ptr, ptr %pp\n  %rem = call i64 @strlen(ptr %sp2)\n  %dp3 = load ptr, ptr %dstp\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %dp3, ptr %sp2, i64 %rem, i1 false)\n"
+        "  %dp4 = getelementptr i8, ptr %dp3, i64 %rem\n  store i8 0, ptr %dp4\n  ret ptr %out\n}\n\n");
+    sb_append(b,
+        "define internal i64 @stricta_str_find(ptr %s, ptr %sub) {\nentry:\n"
+        "  %hs = icmp ne ptr %s, null\n  %hb = icmp ne ptr %sub, null\n  %ok = and i1 %hs, %hb\n"
+        "  br i1 %ok, label %chkl, label %retm1\nchkl:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %sub, i32 0, i32 0\n  %sl = load i32, ptr %lp\n"
+        "  %z = icmp eq i32 %sl, 0\n  br i1 %z, label %ret0, label %find\nfind:\n"
+        "  %scp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %sch = load ptr, ptr %scp\n"
+        "  %bcp = getelementptr %StrictaStr, ptr %sub, i32 0, i32 2\n  %bch = load ptr, ptr %bcp\n"
+        "  %p = call ptr @strstr(ptr %sch, ptr %bch)\n"
+        "  %fnd = icmp ne ptr %p, null\n  br i1 %fnd, label %hit, label %retm1\nhit:\n"
+        "  %pi = ptrtoint ptr %p to i64\n  %si = ptrtoint ptr %sch to i64\n"
+        "  %d = sub i64 %pi, %si\n  ret i64 %d\nret0:\n  ret i64 0\nretm1:\n  ret i64 -1\n}\n\n");
+    sb_append(b,
+        "define internal i64 @stricta_str_index(ptr %s, ptr %sub) {\nentry:\n"
+        "  %idx = call i64 @stricta_str_find(ptr %s, ptr %sub)\n"
+        "  %bad = icmp slt i64 %idx, 0\n  br i1 %bad, label %fail, label %ok\nfail:\n"
+        "  call void @stricta_set_exc(i32 2, ptr null, ptr @.rt_err_sub)\n"
+        "  call void @stricta_unhandled_exc()\n  unreachable\nok:\n  ret i64 %idx\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_strip(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %work, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nwork:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %l_p = alloca i32\n  %r_p = alloca i32\n"
+        "  store i32 0, ptr %l_p\n  store i32 %len, ptr %r_p\n  br label %lloop\nlloop:\n"
+        "  %l = load i32, ptr %l_p\n  %r = load i32, ptr %r_p\n  %c1 = icmp slt i32 %l, %r\n"
+        "  br i1 %c1, label %lc, label %rloop\nlc:\n"
+        "  %gp1 = getelementptr i8, ptr %ch, i32 %l\n  %ch1 = load i8, ptr %gp1\n"
+        "  %sp1 = call i1 @_rt_is_space(i8 %ch1)\n  br i1 %sp1, label %linc, label %rloop\nlinc:\n"
+        "  %nl = add i32 %l, 1\n  store i32 %nl, ptr %l_p\n  br label %lloop\nrloop:\n"
+        "  %l2 = load i32, ptr %l_p\n  %r2 = load i32, ptr %r_p\n  %c2 = icmp sgt i32 %r2, %l2\n"
+        "  br i1 %c2, label %rc, label %done\nrc:\n"
+        "  %rm1 = sub i32 %r2, 1\n  %gp2 = getelementptr i8, ptr %ch, i32 %rm1\n  %ch2 = load i8, ptr %gp2\n"
+        "  %sp2 = call i1 @_rt_is_space(i8 %ch2)\n  br i1 %sp2, label %rdec, label %done\nrdec:\n"
+        "  store i32 %rm1, ptr %r_p\n  br label %rloop\ndone:\n"
+        "  %lf = load i32, ptr %l_p\n  %rf = load i32, ptr %r_p\n  %nlen = sub i32 %rf, %lf\n"
+        "  %src = getelementptr i8, ptr %ch, i32 %lf\n"
+        "  %res = call ptr @stricta_str_new(ptr %src, i32 %nlen)\n  ret ptr %res\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_lstrip(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %work, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nwork:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %l_p = alloca i32\n  store i32 0, ptr %l_p\n  br label %loop\nloop:\n"
+        "  %l = load i32, ptr %l_p\n  %c1 = icmp slt i32 %l, %len\n  br i1 %c1, label %chk, label %done\nchk:\n"
+        "  %gp = getelementptr i8, ptr %ch, i32 %l\n  %c = load i8, ptr %gp\n"
+        "  %sp = call i1 @_rt_is_space(i8 %c)\n  br i1 %sp, label %inc, label %done\ninc:\n"
+        "  %nl = add i32 %l, 1\n  store i32 %nl, ptr %l_p\n  br label %loop\ndone:\n"
+        "  %lf = load i32, ptr %l_p\n  %nlen = sub i32 %len, %lf\n  %src = getelementptr i8, ptr %ch, i32 %lf\n"
+        "  %res = call ptr @stricta_str_new(ptr %src, i32 %nlen)\n  ret ptr %res\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_str_rstrip(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %work, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nwork:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %r_p = alloca i32\n  store i32 %len, ptr %r_p\n  br label %loop\nloop:\n"
+        "  %r = load i32, ptr %r_p\n  %c1 = icmp sgt i32 %r, 0\n  br i1 %c1, label %chk, label %done\nchk:\n"
+        "  %rm1 = sub i32 %r, 1\n  %gp = getelementptr i8, ptr %ch, i32 %rm1\n  %c = load i8, ptr %gp\n"
+        "  %sp = call i1 @_rt_is_space(i8 %c)\n  br i1 %sp, label %dec, label %done\ndec:\n"
+        "  store i32 %rm1, ptr %r_p\n  br label %loop\ndone:\n"
+        "  %rf = load i32, ptr %r_p\n"
+        "  %res = call ptr @stricta_str_new(ptr %ch, i32 %rf)\n  ret ptr %res\n}\n\n");
+    sb_append(b,
+        "define internal i32 @stricta_str_startswith(ptr %s, ptr %pref) {\nentry:\n"
+        "  %hs = icmp ne ptr %s, null\n  %hp = icmp ne ptr %pref, null\n  %ok = and i1 %hs, %hp\n"
+        "  br i1 %ok, label %chkl, label %ret0\nchkl:\n"
+        "  %slp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %slen = load i32, ptr %slp\n"
+        "  %plp = getelementptr %StrictaStr, ptr %pref, i32 0, i32 0\n  %plen = load i32, ptr %plp\n"
+        "  %gt = icmp sgt i32 %plen, %slen\n  br i1 %gt, label %ret0, label %cmp\ncmp:\n"
+        "  %scp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %sch = load ptr, ptr %scp\n"
+        "  %pcp = getelementptr %StrictaStr, ptr %pref, i32 0, i32 2\n  %pch = load ptr, ptr %pcp\n"
+        "  %p64 = sext i32 %plen to i64\n  %mc = call i32 @memcmp(ptr %sch, ptr %pch, i64 %p64)\n"
+        "  %eq = icmp eq i32 %mc, 0\n  %r = zext i1 %eq to i32\n  ret i32 %r\nret0:\n  ret i32 0\n}\n\n");
+    sb_append(b,
+        "define internal i32 @stricta_str_endswith(ptr %s, ptr %suf) {\nentry:\n"
+        "  %hs = icmp ne ptr %s, null\n  %hp = icmp ne ptr %suf, null\n  %ok = and i1 %hs, %hp\n"
+        "  br i1 %ok, label %chkl, label %ret0\nchkl:\n"
+        "  %slp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %slen = load i32, ptr %slp\n"
+        "  %ulp = getelementptr %StrictaStr, ptr %suf, i32 0, i32 0\n  %ulen = load i32, ptr %ulp\n"
+        "  %gt = icmp sgt i32 %ulen, %slen\n  br i1 %gt, label %ret0, label %cmp\ncmp:\n"
+        "  %scp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %sch = load ptr, ptr %scp\n"
+        "  %ucp = getelementptr %StrictaStr, ptr %suf, i32 0, i32 2\n  %uch = load ptr, ptr %ucp\n"
+        "  %off = sub i32 %slen, %ulen\n  %off64 = sext i32 %off to i64\n"
+        "  %sp = getelementptr i8, ptr %sch, i64 %off64\n  %u64 = sext i32 %ulen to i64\n"
+        "  %mc = call i32 @memcmp(ptr %sp, ptr %uch, i64 %u64)\n"
+        "  %eq = icmp eq i32 %mc, 0\n  %r = zext i1 %eq to i32\n  ret i32 %r\nret0:\n  ret i32 0\n}\n\n");
+    sb_append(b,
+        "define internal i64 @stricta_str_count(ptr %s, ptr %sub) {\nentry:\n"
+        "  %hs = icmp ne ptr %s, null\n  %hb = icmp ne ptr %sub, null\n  %ok = and i1 %hs, %hb\n"
+        "  br i1 %ok, label %chkl, label %ret0\nret0:\n  ret i64 0\nchkl:\n"
+        "  %slp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %slen = load i32, ptr %slp\n"
+        "  %ulp = getelementptr %StrictaStr, ptr %sub, i32 0, i32 0\n  %ulen = load i32, ptr %ulp\n"
+        "  %z = icmp eq i32 %ulen, 0\n  br i1 %z, label %ret_empty, label %work\nret_empty:\n"
+        "  %s64 = sext i32 %slen to i64\n  %sp1 = add i64 %s64, 1\n  ret i64 %sp1\nwork:\n"
+        "  %scp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %sch = load ptr, ptr %scp\n"
+        "  %ucp = getelementptr %StrictaStr, ptr %sub, i32 0, i32 2\n  %uch = load ptr, ptr %ucp\n"
+        "  %u64 = sext i32 %ulen to i64\n  %cntp = alloca i64\n  %pp = alloca ptr\n"
+        "  store i64 0, ptr %cntp\n  store ptr %sch, ptr %pp\n  br label %loop\nloop:\n"
+        "  %p = load ptr, ptr %pp\n  %hit = call ptr @strstr(ptr %p, ptr %uch)\n"
+        "  %fnd = icmp ne ptr %hit, null\n  br i1 %fnd, label %inc, label %done\ninc:\n"
+        "  %c = load i64, ptr %cntp\n  %nc = add i64 %c, 1\n  store i64 %nc, ptr %cntp\n"
+        "  %np = getelementptr i8, ptr %hit, i64 %u64\n  store ptr %np, ptr %pp\n  br label %loop\ndone:\n"
+        "  %res = load i64, ptr %cntp\n  ret i64 %res\n}\n\n");
+
+    /* Conversions */
+    sb_append(b,
+        "define internal ptr @stricta_int_to_str(i64 %v) {\nentry:\n"
+        "  %buf = alloca [32 x i8]\n"
+        "  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 32, ptr @.rt_fmt_lld, i64 %v)\n"
+        "  %r = call ptr @stricta_str_new(ptr %buf, i32 %n)\n  ret ptr %r\n}\n\n"
+        "define internal ptr @stricta_uint_to_str(i64 %v) {\nentry:\n"
+        "  %buf = alloca [32 x i8]\n"
+        "  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 32, ptr @.rt_fmt_llu, i64 %v)\n"
+        "  %r = call ptr @stricta_str_new(ptr %buf, i32 %n)\n  ret ptr %r\n}\n\n"
+        "define internal ptr @stricta_bool_to_str(i32 %v) {\nentry:\n"
+        "  %b = icmp ne i32 %v, 0\n  %s = select i1 %b, ptr @.rt_true, ptr @.rt_false\n"
+        "  %r = call ptr @stricta_str_cstr(ptr %s)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_float_to_str(double %v) {\nentry:\n"
+        "  %buf = alloca [64 x i8]\n  %np = alloca i32\n"
+        "  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 64, ptr @.rt_fmt_g, double %v)\n"
+        "  store i32 %n, ptr %np\n"
+        "  %p1 = call ptr @strchr(ptr %buf, i32 46)\n  %b1 = icmp ne ptr %p1, null\n  br i1 %b1, label %out, label %c2\nc2:\n"
+        "  %p2 = call ptr @strchr(ptr %buf, i32 101)\n  %b2 = icmp ne ptr %p2, null\n  br i1 %b2, label %out, label %c3\nc3:\n"
+        "  %p3 = call ptr @strchr(ptr %buf, i32 69)\n  %b3 = icmp ne ptr %p3, null\n  br i1 %b3, label %out, label %c4\nc4:\n"
+        "  %p4 = call ptr @strchr(ptr %buf, i32 110)\n  %b4 = icmp ne ptr %p4, null\n  br i1 %b4, label %out, label %c5\nc5:\n"
+        "  %p5 = call ptr @strchr(ptr %buf, i32 105)\n  %b5 = icmp ne ptr %p5, null\n  br i1 %b5, label %out, label %app\napp:\n"
+        "  %n2 = add i32 %n, 2\n  %fit = icmp slt i32 %n2, 64\n  br i1 %fit, label %doapp, label %out\ndoapp:\n"
+        "  %g0 = getelementptr i8, ptr %buf, i32 %n\n  store i8 46, ptr %g0\n"
+        "  %n1 = add i32 %n, 1\n  %g1 = getelementptr i8, ptr %buf, i32 %n1\n  store i8 48, ptr %g1\n"
+        "  %g2 = getelementptr i8, ptr %buf, i32 %n2\n  store i8 0, ptr %g2\n"
+        "  store i32 %n2, ptr %np\n  br label %out\nout:\n"
+        "  %fn = load i32, ptr %np\n  %r = call ptr @stricta_str_new(ptr %buf, i32 %fn)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_float_fmt(double %v, i32 %prec) {\nentry:\n"
+        "  %buf = alloca [128 x i8]\n"
+        "  %lt0 = icmp slt i32 %prec, 0\n  %p1 = select i1 %lt0, i32 6, i32 %prec\n"
+        "  %gt50 = icmp sgt i32 %p1, 50\n  %p2 = select i1 %gt50, i32 50, i32 %p1\n"
+        "  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 128, ptr @.rt_fmt_ffmt, i32 %p2, double %v)\n"
+        "  %r = call ptr @stricta_str_new(ptr %buf, i32 %n)\n  ret ptr %r\n}\n\n"
+        "define internal i64 @stricta_str_to_int(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %work, label %ret0\nret0:\n  ret i64 0\nwork:\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %r = call i64 @strtoll(ptr %ch, ptr null, i32 10)\n  ret i64 %r\n}\n\n"
+        "define internal double @stricta_str_to_float(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %work, label %ret0\nret0:\n  ret double 0.0\nwork:\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %r = call double @strtod(ptr %ch, ptr null)\n  ret double %r\n}\n\n"
+        "define internal i64 @stricta_ord(ptr %s) {\nentry:\n"
+        "  %ok = icmp ne ptr %s, null\n  br i1 %ok, label %chk, label %ret0\nchk:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %s, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %z = icmp eq i32 %len, 0\n  br i1 %z, label %ret0, label %get\nget:\n"
+        "  %cp = getelementptr %StrictaStr, ptr %s, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %b = load i8, ptr %ch\n  %r = zext i8 %b to i64\n  ret i64 %r\nret0:\n  ret i64 0\n}\n\n"
+        "define internal ptr @stricta_chr(i64 %code) {\nentry:\n"
+        "  %buf = alloca [2 x i8]\n  %c = trunc i64 %code to i8\n"
+        "  store i8 %c, ptr %buf\n  %g1 = getelementptr i8, ptr %buf, i32 1\n  store i8 0, ptr %g1\n"
+        "  %r = call ptr @stricta_str_new(ptr %buf, i32 1)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_hex(i64 %v) {\nentry:\n"
+        "  %buf = alloca [32 x i8]\n  %neg = icmp slt i64 %v, 0\n  br i1 %neg, label %isneg, label %ispos\nisneg:\n"
+        "  %nv = sub i64 0, %v\n"
+        "  %n1 = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 32, ptr @.rt_fmt_nhex, i64 %nv)\n"
+        "  %r1 = call ptr @stricta_str_new(ptr %buf, i32 %n1)\n  ret ptr %r1\nispos:\n"
+        "  %n2 = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 32, ptr @.rt_fmt_hex, i64 %v)\n"
+        "  %r2 = call ptr @stricta_str_new(ptr %buf, i32 %n2)\n  ret ptr %r2\n}\n\n"
+        "define internal ptr @stricta_oct(i64 %v) {\nentry:\n"
+        "  %buf = alloca [32 x i8]\n  %neg = icmp slt i64 %v, 0\n  br i1 %neg, label %isneg, label %ispos\nisneg:\n"
+        "  %nv = sub i64 0, %v\n"
+        "  %n1 = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 32, ptr @.rt_fmt_noct, i64 %nv)\n"
+        "  %r1 = call ptr @stricta_str_new(ptr %buf, i32 %n1)\n  ret ptr %r1\nispos:\n"
+        "  %n2 = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 32, ptr @.rt_fmt_oct, i64 %v)\n"
+        "  %r2 = call ptr @stricta_str_new(ptr %buf, i32 %n2)\n  ret ptr %r2\n}\n\n"
+        "define internal ptr @stricta_bin(i64 %v) {\nentry:\n"
+        "  %buf = alloca [80 x i8]\n  %posp = alloca i32\n  store i32 79, ptr %posp\n"
+        "  %g79 = getelementptr i8, ptr %buf, i32 79\n  store i8 0, ptr %g79\n"
+        "  %neg = icmp slt i64 %v, 0\n  %nv = sub i64 0, %v\n  %uv0 = select i1 %neg, i64 %nv, i64 %v\n"
+        "  %uvp = alloca i64\n  store i64 %uv0, ptr %uvp\n"
+        "  %isz = icmp eq i64 %uv0, 0\n  br i1 %isz, label %put0, label %loop\nput0:\n"
+        "  store i32 78, ptr %posp\n  %g78 = getelementptr i8, ptr %buf, i32 78\n  store i8 48, ptr %g78\n  br label %pref\nloop:\n"
+        "  %uv = load i64, ptr %uvp\n  %gt0 = icmp ugt i64 %uv, 0\n  br i1 %gt0, label %body, label %pref\nbody:\n"
+        "  %bit = and i64 %uv, 1\n  %dch = add i64 %bit, 48\n  %d8 = trunc i64 %dch to i8\n"
+        "  %p0 = load i32, ptr %posp\n  %p1 = sub i32 %p0, 1\n  store i32 %p1, ptr %posp\n"
+        "  %gp = getelementptr i8, ptr %buf, i32 %p1\n  store i8 %d8, ptr %gp\n"
+        "  %nuv = lshr i64 %uv, 1\n  store i64 %nuv, ptr %uvp\n  br label %loop\npref:\n"
+        "  %p2 = load i32, ptr %posp\n  %p3 = sub i32 %p2, 1\n  %g_b = getelementptr i8, ptr %buf, i32 %p3\n  store i8 98, ptr %g_b\n"
+        "  %p4 = sub i32 %p3, 1\n  %g_0 = getelementptr i8, ptr %buf, i32 %p4\n  store i8 48, ptr %g_0\n"
+        "  store i32 %p4, ptr %posp\n"
+        "  br i1 %neg, label %putm, label %fin\nputm:\n"
+        "  %p5 = sub i32 %p4, 1\n  %g_m = getelementptr i8, ptr %buf, i32 %p5\n  store i8 45, ptr %g_m\n"
+        "  store i32 %p5, ptr %posp\n  br label %fin\nfin:\n"
+        "  %fp = load i32, ptr %posp\n  %sp = getelementptr i8, ptr %buf, i32 %fp\n"
+        "  %r = call ptr @stricta_str_cstr(ptr %sp)\n  ret ptr %r\n}\n\n"
+        "define internal i64 @stricta_pow_i64(i64 %base0, i64 %exp0) {\nentry:\n"
+        "  %neg = icmp slt i64 %exp0, 0\n  br i1 %neg, label %ret0, label %init\nret0:\n  ret i64 0\ninit:\n"
+        "  %res_p = alloca i64\n  %b_p = alloca i64\n  %e_p = alloca i64\n"
+        "  store i64 1, ptr %res_p\n  store i64 %base0, ptr %b_p\n  store i64 %exp0, ptr %e_p\n  br label %loop\nloop:\n"
+        "  %e = load i64, ptr %e_p\n  %gt0 = icmp sgt i64 %e, 0\n  br i1 %gt0, label %body, label %done\nbody:\n"
+        "  %odd = and i64 %e, 1\n  %is1 = icmp ne i64 %odd, 0\n  br i1 %is1, label %mulr, label %sh\nmulr:\n"
+        "  %r0 = load i64, ptr %res_p\n  %b0 = load i64, ptr %b_p\n  %nr = mul i64 %r0, %b0\n  store i64 %nr, ptr %res_p\n  br label %sh\nsh:\n"
+        "  %ne = ashr i64 %e, 1\n  store i64 %ne, ptr %e_p\n  %gtn = icmp sgt i64 %ne, 0\n  br i1 %gtn, label %sqb, label %loop\nsqb:\n"
+        "  %b1 = load i64, ptr %b_p\n  %nb = mul i64 %b1, %b1\n  store i64 %nb, ptr %b_p\n  br label %loop\ndone:\n"
+        "  %fr = load i64, ptr %res_p\n  ret i64 %fr\n}\n\n");
+}
+
+static void emit_llvm_rt_bytes_file_task(StrBuf* b) {
+    /* Bytes */
+    sb_append(b,
+        "define internal ptr @stricta_bytes_new(ptr %data, i32 %len) {\nentry:\n"
+        "  %bsz = ptrtoint ptr getelementptr (%StrictaBytes, ptr null, i32 1) to i64\n"
+        "  %st = call ptr @stricta_alloc(i64 %bsz)\n"
+        "  %p0 = getelementptr %StrictaBytes, ptr %st, i32 0, i32 0\n  store i32 %len, ptr %p0\n"
+        "  %p1 = getelementptr %StrictaBytes, ptr %st, i32 0, i32 1\n  store i32 0, ptr %p1\n"
+        "  %l64 = sext i32 %len to i64\n  %asz = add i64 %l64, 1\n"
+        "  %ch = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %p2 = getelementptr %StrictaBytes, ptr %st, i32 0, i32 2\n  store ptr %ch, ptr %p2\n"
+        "  %gt0 = icmp sgt i32 %len, 0\n  %nd = icmp ne ptr %data, null\n  %do = and i1 %gt0, %nd\n"
+        "  br i1 %do, label %cp, label %nul\ncp:\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %ch, ptr %data, i64 %l64, i1 false)\n  br label %nul\nnul:\n"
+        "  %end = getelementptr i8, ptr %ch, i64 %l64\n  store i8 0, ptr %end\n  ret ptr %st\n}\n\n"
+        "define internal void @stricta_bytes_free(ptr %b) alwaysinline {\nentry:\n"
+        "  %ok = icmp ne ptr %b, null\n  br i1 %ok, label %chk, label %done\nchk:\n"
+        "  %sp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 1\n  %stat = load i32, ptr %sp\n"
+        "  %dyn = icmp eq i32 %stat, 0\n  br i1 %dyn, label %dofree, label %done\ndofree:\n"
+        "  %dp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 2\n  %da = load ptr, ptr %dp\n"
+        "  call void @free(ptr %da)\n  call void @free(ptr %b)\n  br label %done\ndone:\n  ret void\n}\n\n"
+        "define internal ptr @stricta_bytes_clone(ptr %b) {\nentry:\n"
+        "  %ok = icmp ne ptr %b, null\n  br i1 %ok, label %chk, label %ret_same\nchk:\n"
+        "  %sp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 1\n  %stat = load i32, ptr %sp\n"
+        "  %dyn = icmp eq i32 %stat, 0\n  br i1 %dyn, label %doclone, label %ret_same\nret_same:\n"
+        "  ret ptr %b\ndoclone:\n"
+        "  %lp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %dp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 2\n  %da = load ptr, ptr %dp\n"
+        "  %r = call ptr @stricta_bytes_new(ptr %da, i32 %len)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_bytes_slice(ptr %b, i64 %start, i64 %end) {\nentry:\n"
+        "  %hb = icmp ne ptr %b, null\n  br i1 %hb, label %work, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_bytes_new(ptr null, i32 0)\n  ret ptr %e\nwork:\n"
+        "  %lp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 0\n  %l32 = load i32, ptr %lp\n"
+        "  %len = sext i32 %l32 to i64\n"
+        "  %sn = icmp slt i64 %start, 0\n  %s1 = add i64 %start, %len\n  %s2 = select i1 %sn, i64 %s1, i64 %start\n"
+        "  %sl0 = icmp slt i64 %s2, 0\n  %fs = select i1 %sl0, i64 0, i64 %s2\n"
+        "  %en = icmp slt i64 %end, 0\n  %e1 = add i64 %end, %len\n  %e2 = select i1 %en, i64 %e1, i64 %end\n"
+        "  %egl = icmp sgt i64 %e2, %len\n  %fe = select i1 %egl, i64 %len, i64 %e2\n"
+        "  %bad = icmp sge i64 %fs, %fe\n  br i1 %bad, label %empt, label %mk\nmk:\n"
+        "  %dp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 2\n  %da = load ptr, ptr %dp\n"
+        "  %src = getelementptr i8, ptr %da, i64 %fs\n  %dl = sub i64 %fe, %fs\n  %dl32 = trunc i64 %dl to i32\n"
+        "  %r = call ptr @stricta_bytes_new(ptr %src, i32 %dl32)\n  ret ptr %r\n}\n\n"
+        "define internal ptr @stricta_bytes_slice_step(ptr %b, i64 %start, i32 %hs, i64 %stop, i32 %hsp, i64 %step) {\nentry:\n"
+        "  %cur_p = alloca i64\n  %ok = icmp ne ptr %b, null\n  br i1 %ok, label %work, label %nullb\nnullb:\n"
+        "  %d0 = call i64 @stricta_slice_adjust(i64 0, i64 %start, i32 %hs, i64 %stop, i32 %hsp, i64 %step, ptr %cur_p)\n"
+        "  %e0 = call ptr @stricta_bytes_new(ptr null, i32 0)\n  ret ptr %e0\nwork:\n"
+        "  %lp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 0\n  %l32 = load i32, ptr %lp\n"
+        "  %len = sext i32 %l32 to i64\n"
+        "  %cnt = call i64 @stricta_slice_adjust(i64 %len, i64 %start, i32 %hs, i64 %stop, i32 %hsp, i64 %step, ptr %cur_p)\n"
+        "  %le0 = icmp sle i64 %cnt, 0\n  br i1 %le0, label %empt, label %chk1\nempt:\n"
+        "  %e1 = call ptr @stricta_bytes_new(ptr null, i32 0)\n  ret ptr %e1\nchk1:\n"
+        "  %cur0 = load i64, ptr %cur_p\n"
+        "  %dp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 2\n  %da = load ptr, ptr %dp\n"
+        "  %is1 = icmp eq i64 %step, 1\n  br i1 %is1, label %fast1, label %slow\nfast1:\n"
+        "  %src = getelementptr i8, ptr %da, i64 %cur0\n  %c32 = trunc i64 %cnt to i32\n"
+        "  %r1 = call ptr @stricta_bytes_new(ptr %src, i32 %c32)\n  ret ptr %r1\nslow:\n"
+        "  %bsz = ptrtoint ptr getelementptr (%StrictaBytes, ptr null, i32 1) to i64\n"
+        "  %out = call ptr @stricta_alloc(i64 %bsz)\n  %cnt32 = trunc i64 %cnt to i32\n"
+        "  %p0 = getelementptr %StrictaBytes, ptr %out, i32 0, i32 0\n  store i32 %cnt32, ptr %p0\n"
+        "  %p1 = getelementptr %StrictaBytes, ptr %out, i32 0, i32 1\n  store i32 0, ptr %p1\n"
+        "  %asz = add i64 %cnt, 1\n  %och = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %p2 = getelementptr %StrictaBytes, ptr %out, i32 0, i32 2\n  store ptr %och, ptr %p2\n"
+        "  %ip = alloca i64\n  store i64 0, ptr %ip\n  br label %loop\nloop:\n"
+        "  %i = load i64, ptr %ip\n  %cond = icmp slt i64 %i, %cnt\n  br i1 %cond, label %body, label %done\nbody:\n"
+        "  %cur = load i64, ptr %cur_p\n  %sp = getelementptr i8, ptr %da, i64 %cur\n  %bval = load i8, ptr %sp\n"
+        "  %dst = getelementptr i8, ptr %och, i64 %i\n  store i8 %bval, ptr %dst\n"
+        "  %ncur = add i64 %cur, %step\n  store i64 %ncur, ptr %cur_p\n"
+        "  %ni = add i64 %i, 1\n  store i64 %ni, ptr %ip\n  br label %loop\ndone:\n"
+        "  %end = getelementptr i8, ptr %och, i64 %cnt\n  store i8 0, ptr %end\n  ret ptr %out\n}\n\n"
+        "define internal i32 @stricta_bytes_eq(ptr %a, ptr %b) {\nentry:\n"
+        "  %same = icmp eq ptr %a, %b\n  br i1 %same, label %ret1, label %chkn\nchkn:\n"
+        "  %na = icmp eq ptr %a, null\n  %nb = icmp eq ptr %b, null\n  %any = or i1 %na, %nb\n"
+        "  br i1 %any, label %ret0, label %chkl\nchkl:\n"
+        "  %lap = getelementptr %StrictaBytes, ptr %a, i32 0, i32 0\n  %la = load i32, ptr %lap\n"
+        "  %lbp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 0\n  %lb = load i32, ptr %lbp\n"
+        "  %leq = icmp eq i32 %la, %lb\n  br i1 %leq, label %docmp, label %ret0\ndocmp:\n"
+        "  %adp = getelementptr %StrictaBytes, ptr %a, i32 0, i32 2\n  %ad = load ptr, ptr %adp\n"
+        "  %bdp = getelementptr %StrictaBytes, ptr %b, i32 0, i32 2\n  %bd = load ptr, ptr %bdp\n"
+        "  %l64 = sext i32 %la to i64\n  %mc = call i32 @memcmp(ptr %ad, ptr %bd, i64 %l64)\n"
+        "  %eq = icmp eq i32 %mc, 0\n  %r = zext i1 %eq to i32\n  ret i32 %r\nret1:\n  ret i32 1\nret0:\n  ret i32 0\n}\n\n");
+
+    /* File I/O */
+    sb_append(b,
+        "define internal ptr @stricta_open(ptr %path, ptr %mode) {\nentry:\n"
+        "  %hm = icmp ne ptr %mode, null\n  br i1 %hm, label %chkm, label %defm\nchkm:\n"
+        "  %mlp = getelementptr %StrictaStr, ptr %mode, i32 0, i32 0\n  %ml = load i32, ptr %mlp\n"
+        "  %mg = icmp sgt i32 %ml, 0\n  br i1 %mg, label %getm, label %defm\ngetm:\n"
+        "  %mcp = getelementptr %StrictaStr, ptr %mode, i32 0, i32 2\n  %mch = load ptr, ptr %mcp\n  br label %gotm\ndefm:\n"
+        "  br label %gotm\ngotm:\n"
+        "  %m = phi ptr [ %mch, %getm ], [ @.rt_mode_r, %defm ]\n"
+        "  %hp = icmp ne ptr %path, null\n  br i1 %hp, label %getp, label %defp\ngetp:\n"
+        "  %pcp = getelementptr %StrictaStr, ptr %path, i32 0, i32 2\n  %pch = load ptr, ptr %pcp\n  br label %gotp\ndefp:\n"
+        "  br label %gotp\ngotp:\n"
+        "  %p = phi ptr [ %pch, %getp ], [ @.rt_empty, %defp ]\n"
+        "  %h = call ptr @fopen(ptr %p, ptr %m)\n  %ok = icmp ne ptr %h, null\n"
+        "  br i1 %ok, label %mk, label %fail\nfail:\n"
+        "  call void @stricta_set_exc(i32 4, ptr null, ptr @.rt_err_open)\n"
+        "  call void @stricta_unhandled_exc()\n  unreachable\nmk:\n"
+        "  %fsz = ptrtoint ptr getelementptr (%StrictaFile, ptr null, i32 1) to i64\n"
+        "  %f = call ptr @stricta_alloc(i64 %fsz)\n  store ptr %h, ptr %f\n  ret ptr %f\n}\n\n"
+        "define internal ptr @stricta_file_read(ptr %f) {\nentry:\n"
+        "  %hf = icmp ne ptr %f, null\n  br i1 %hf, label %chkh, label %empt\nchkh:\n"
+        "  %h = load ptr, ptr %f\n  %hh = icmp ne ptr %h, null\n  br i1 %hh, label %work, label %empt\nempt:\n"
+        "  %e = call ptr @stricta_str_new(ptr @.rt_empty, i32 0)\n  ret ptr %e\nwork:\n"
+        "  %r1 = call i32 @fseek(ptr %h, i64 0, i32 2)\n"
+        "  %sz = call i64 @ftell(ptr %h)\n"
+        "  %r2 = call i32 @fseek(ptr %h, i64 0, i32 0)\n"
+        "  %le0 = icmp sle i64 %sz, 0\n  br i1 %le0, label %empt, label %rd\nrd:\n"
+        "  %asz = add i64 %sz, 1\n  %buf = call ptr @stricta_alloc(i64 %asz)\n"
+        "  %n = call i64 @fread(ptr %buf, i64 1, i64 %sz, ptr %h)\n"
+        "  %end = getelementptr i8, ptr %buf, i64 %n\n  store i8 0, ptr %end\n"
+        "  %n32 = trunc i64 %n to i32\n"
+        "  %s = call ptr @stricta_str_new(ptr %buf, i32 %n32)\n"
+        "  call void @free(ptr %buf)\n  ret ptr %s\n}\n\n"
+        "define internal void @stricta_file_write(ptr %f, ptr %text) {\nentry:\n"
+        "  %hf = icmp ne ptr %f, null\n  %ht = icmp ne ptr %text, null\n  %ok = and i1 %hf, %ht\n"
+        "  br i1 %ok, label %chkh, label %done\nchkh:\n"
+        "  %h = load ptr, ptr %f\n  %hh = icmp ne ptr %h, null\n  br i1 %hh, label %chkl, label %done\nchkl:\n"
+        "  %lp = getelementptr %StrictaStr, ptr %text, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %gt0 = icmp sgt i32 %len, 0\n  br i1 %gt0, label %wr, label %done\nwr:\n"
+        "  %cp = getelementptr %StrictaStr, ptr %text, i32 0, i32 2\n  %ch = load ptr, ptr %cp\n"
+        "  %l64 = sext i32 %len to i64\n"
+        "  %n = call i64 @fwrite(ptr %ch, i64 1, i64 %l64, ptr %h)\n  br label %done\ndone:\n  ret void\n}\n\n"
+        "define internal void @stricta_file_close(ptr %f) {\nentry:\n"
+        "  %hf = icmp ne ptr %f, null\n  br i1 %hf, label %chkh, label %done\nchkh:\n"
+        "  %h = load ptr, ptr %f\n  %hh = icmp ne ptr %h, null\n  br i1 %hh, label %cl, label %done\ncl:\n"
+        "  %r = call i32 @fclose(ptr %h)\n  store ptr null, ptr %f\n  br label %done\ndone:\n  ret void\n}\n\n"
+        "define internal void @stricta_file_free(ptr %f) {\nentry:\n"
+        "  %hf = icmp ne ptr %f, null\n  br i1 %hf, label %work, label %done\nwork:\n"
+        "  call void @stricta_file_close(ptr %f)\n  call void @free(ptr %f)\n  br label %done\ndone:\n  ret void\n}\n\n");
+
+    /* Async Tasks */
+    sb_append(b,
+        "define internal ptr @stricta_task_spawn(ptr %entry_fn, ptr %arg_block, ptr %drop_res) {\nentry:\n"
+        "  %tsz = ptrtoint ptr getelementptr (%StrictaTask, ptr null, i32 1) to i64\n"
+        "  %t = call ptr @stricta_calloc(i64 1, i64 %tsz)\n"
+        "  %p4 = getelementptr %StrictaTask, ptr %t, i32 0, i32 4\n  store ptr %arg_block, ptr %p4\n"
+        "  %p5 = getelementptr %StrictaTask, ptr %t, i32 0, i32 5\n  store ptr %drop_res, ptr %p5\n"
+        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n"
+        "  %rc = call i32 @pthread_create(ptr %p0, ptr null, ptr %entry_fn, ptr %t)\n"
+        "  %ok = icmp eq i32 %rc, 0\n  br i1 %ok, label %done, label %fail\nfail:\n"
+        "  %r = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_err_task, i32 %rc)\n"
+        "  call void @exit(i32 1)\n  unreachable\ndone:\n  ret ptr %t\n}\n\n"
+        "define internal ptr @stricta_task_args(ptr %t) {\nentry:\n"
+        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %get, label %ret0\nget:\n"
+        "  %p4 = getelementptr %StrictaTask, ptr %t, i32 0, i32 4\n  %ab = load ptr, ptr %p4\n  ret ptr %ab\nret0:\n  ret ptr null\n}\n\n"
+        "define internal void @stricta_task_finish(ptr %t, i64 %bits) {\nentry:\n"
+        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %set, label %done\nset:\n"
+        "  %p3 = getelementptr %StrictaTask, ptr %t, i32 0, i32 3\n  store i64 %bits, ptr %p3\n"
+        "  %p2 = getelementptr %StrictaTask, ptr %t, i32 0, i32 2\n  store i32 1, ptr %p2\n  br label %done\ndone:\n  ret void\n}\n\n"
+        "define internal void @stricta_task_capture_exc(ptr %t) {\nentry:\n"
+        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %cap, label %done\ncap:\n"
+        "  %tid = load i32, ptr @_exc_type_id\n  %obj = load ptr, ptr @_exc_obj\n  %msg = load ptr, ptr @_exc_msg\n"
+        "  %p6 = getelementptr %StrictaTask, ptr %t, i32 0, i32 6\n  store i32 %tid, ptr %p6\n"
+        "  %p7 = getelementptr %StrictaTask, ptr %t, i32 0, i32 7\n  store ptr %obj, ptr %p7\n"
+        "  %p8 = getelementptr %StrictaTask, ptr %t, i32 0, i32 8\n  store ptr %msg, ptr %p8\n"
+        "  store i32 0, ptr @_exc_type_id\n  store ptr null, ptr @_exc_obj\n  store ptr null, ptr @_exc_msg\n  br label %done\ndone:\n  ret void\n}\n\n");
+    sb_append(b,
+        "define internal i64 @stricta_task_await(ptr %t) {\nentry:\n"
+        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %chkj, label %ret0\nret0:\n  ret i64 0\nchkj:\n"
+        "  %p1 = getelementptr %StrictaTask, ptr %t, i32 0, i32 1\n  %j = load i32, ptr %p1\n"
+        "  %nj = icmp eq i32 %j, 0\n  br i1 %nj, label %dojoin, label %chkexc\ndojoin:\n"
+        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n  %th = load i64, ptr %p0\n"
+        "  %jr = call i32 @pthread_join(i64 %th, ptr null)\n  store i32 1, ptr %p1\n  br label %chkexc\nchkexc:\n"
+        "  %p6 = getelementptr %StrictaTask, ptr %t, i32 0, i32 6\n  %tid = load i32, ptr %p6\n"
+        "  %he = icmp ne i32 %tid, 0\n  br i1 %he, label %rethrow, label %okret\nrethrow:\n"
+        "  call void @stricta_clear_exc(i32 0)\n"
+        "  %p7 = getelementptr %StrictaTask, ptr %t, i32 0, i32 7\n  %obj = load ptr, ptr %p7\n"
+        "  %p8 = getelementptr %StrictaTask, ptr %t, i32 0, i32 8\n  %msg = load ptr, ptr %p8\n"
+        "  store i32 %tid, ptr @_exc_type_id\n  store ptr %obj, ptr @_exc_obj\n  store ptr %msg, ptr @_exc_msg\n"
+        "  call void @free(ptr %t)\n  ret i64 0\nokret:\n"
+        "  %p3 = getelementptr %StrictaTask, ptr %t, i32 0, i32 3\n  %bits = load i64, ptr %p3\n"
+        "  call void @free(ptr %t)\n  ret i64 %bits\n}\n\n"
+        "define internal void @stricta_task_free(ptr %t) {\nentry:\n"
+        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %chkj, label %done\nchkj:\n"
+        "  %p1 = getelementptr %StrictaTask, ptr %t, i32 0, i32 1\n  %j = load i32, ptr %p1\n"
+        "  %nj = icmp eq i32 %j, 0\n  br i1 %nj, label %dojoin, label %chkexc\ndojoin:\n"
+        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n  %th = load i64, ptr %p0\n"
+        "  %jr = call i32 @pthread_join(i64 %th, ptr null)\n  store i32 1, ptr %p1\n  br label %chkexc\nchkexc:\n"
+        "  %p6 = getelementptr %StrictaTask, ptr %t, i32 0, i32 6\n  %tid = load i32, ptr %p6\n"
+        "  %he = icmp ne i32 %tid, 0\n  br i1 %he, label %dropexc, label %chkres\ndropexc:\n"
+        "  %p8 = getelementptr %StrictaTask, ptr %t, i32 0, i32 8\n  %msg = load ptr, ptr %p8\n"
+        "  %hm = icmp ne ptr %msg, null\n  br i1 %hm, label %fmsg, label %fobj\nfmsg:\n"
+        "  call void @stricta_str_free(ptr %msg)\n  br label %fobj\nfobj:\n"
+        "  %p7 = getelementptr %StrictaTask, ptr %t, i32 0, i32 7\n  %obj = load ptr, ptr %p7\n"
+        "  %ho = icmp ne ptr %obj, null\n  br i1 %ho, label %dfobj, label %freet\ndfobj:\n"
+        "  call void @free(ptr %obj)\n  br label %freet\nchkres:\n"
+        "  %p2 = getelementptr %StrictaTask, ptr %t, i32 0, i32 2\n  %hr = load i32, ptr %p2\n"
+        "  %p5 = getelementptr %StrictaTask, ptr %t, i32 0, i32 5\n  %df = load ptr, ptr %p5\n"
+        "  %b1 = icmp ne i32 %hr, 0\n  %b2 = icmp ne ptr %df, null\n  %do_drop = and i1 %b1, %b2\n"
+        "  br i1 %do_drop, label %dropres, label %freet\ndropres:\n"
+        "  %p3 = getelementptr %StrictaTask, ptr %t, i32 0, i32 3\n  %bits = load i64, ptr %p3\n"
+        "  call void %df(i64 %bits)\n  br label %freet\nfreet:\n"
+        "  call void @free(ptr %t)\n  br label %done\ndone:\n  ret void\n}\n\n");
+}
+
+static void emit_llvm_rt_bigint(StrBuf* b) {
+    sb_append(b,
+        "define internal void @_bi_strip(ptr %d, ptr %lenp) {\nentry:\n"
+        "  %l = load i32, ptr %lenp\n  %lm1 = sub i32 %l, 1\n  %ip = alloca i32\n  store i32 0, ptr %ip\n  br label %loop\nloop:\n"
+        "  %i = load i32, ptr %ip\n  %c1 = icmp slt i32 %i, %lm1\n  br i1 %c1, label %chk, label %done\nchk:\n"
+        "  %gp = getelementptr i8, ptr %d, i32 %i\n  %ch = load i8, ptr %gp\n  %z = icmp eq i8 %ch, 48\n"
+        "  br i1 %z, label %inc, label %done\ninc:\n"
+        "  %ni = add i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %loop\ndone:\n"
+        "  %fi = load i32, ptr %ip\n  %gt0 = icmp sgt i32 %fi, 0\n  br i1 %gt0, label %mv, label %retb\nmv:\n"
+        "  %fi64 = sext i32 %fi to i64\n  %src = getelementptr i8, ptr %d, i64 %fi64\n"
+        "  %nl = sub i32 %l, %fi\n  %n1 = add i32 %nl, 1\n  %n1_64 = sext i32 %n1 to i64\n"
+        "  call void @llvm.memmove.p0.p0.i64(ptr %d, ptr %src, i64 %n1_64, i1 false)\n"
+        "  store i32 %nl, ptr %lenp\n  br label %retb\nretb:\n  ret void\n}\n\n");
+    sb_append(b,
+        "define internal i32 @_bi_abs_cmp(ptr %a, i32 %al, ptr %b, i32 %bl) {\nentry:\n"
+        "  %neq = icmp ne i32 %al, %bl\n  br i1 %neq, label %by_len, label %by_mem\nby_len:\n"
+        "  %lt = icmp slt i32 %al, %bl\n  %r = select i1 %lt, i32 -1, i32 1\n  ret i32 %r\nby_mem:\n"
+        "  %al64 = sext i32 %al to i64\n  %mc = call i32 @memcmp(ptr %a, ptr %b, i64 %al64)\n  ret i32 %mc\n}\n\n");
+    sb_append(b,
+        "define internal ptr @_bi_add_abs(ptr %a, i32 %al, ptr %b, i32 %bl, ptr %olp) {\nentry:\n"
+        "  %mx = call i32 @llvm.smax.i32(i32 %al, i32 %bl)\n  %m1 = add i32 %mx, 2\n  %m64 = sext i32 %m1 to i64\n"
+        "  %rev = call ptr @stricta_alloc(i64 %m64)\n"
+        "  %ip = alloca i32\n  %jp = alloca i32\n  %cp = alloca i32\n  %kp = alloca i32\n"
+        "  %am1 = sub i32 %al, 1\n  %bm1 = sub i32 %bl, 1\n"
+        "  store i32 %am1, ptr %ip\n  store i32 %bm1, ptr %jp\n  store i32 0, ptr %cp\n  store i32 0, ptr %kp\n  br label %loop\nloop:\n"
+        "  %i = load i32, ptr %ip\n  %j = load i32, ptr %jp\n  %c = load i32, ptr %cp\n"
+        "  %ci = icmp sge i32 %i, 0\n  %cj = icmp sge i32 %j, 0\n  %cc = icmp ne i32 %c, 0\n"
+        "  %a1 = or i1 %ci, %cj\n  %go = or i1 %a1, %cc\n  br i1 %go, label %body, label %revl\nbody:\n"
+        "  %sp = alloca i32\n  store i32 %c, ptr %sp\n  br i1 %ci, label %adda, label %chkb\nadda:\n"
+        "  %ap = getelementptr i8, ptr %a, i32 %i\n  %ac = load i8, ptr %ap\n  %a32 = zext i8 %ac to i32\n"
+        "  %ad = sub i32 %a32, 48\n  %s0 = load i32, ptr %sp\n  %s1 = add i32 %s0, %ad\n  store i32 %s1, ptr %sp\n"
+        "  %ni = sub i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %chkb\nchkb:\n"
+        "  br i1 %cj, label %addb, label %putd\naddb:\n"
+        "  %bp = getelementptr i8, ptr %b, i32 %j\n  %bc = load i8, ptr %bp\n  %b32 = zext i8 %bc to i32\n"
+        "  %bd = sub i32 %b32, 48\n  %s2 = load i32, ptr %sp\n  %s3 = add i32 %s2, %bd\n  store i32 %s3, ptr %sp\n"
+        "  %nj = sub i32 %j, 1\n  store i32 %nj, ptr %jp\n  br label %putd\nputd:\n"
+        "  %s = load i32, ptr %sp\n  %rem = srem i32 %s, 10\n  %nc = sdiv i32 %s, 10\n  store i32 %nc, ptr %cp\n"
+        "  %d32 = add i32 %rem, 48\n  %d8 = trunc i32 %d32 to i8\n"
+        "  %k = load i32, ptr %kp\n  %rp = getelementptr i8, ptr %rev, i32 %k\n  store i8 %d8, ptr %rp\n"
+        "  %nk = add i32 %k, 1\n  store i32 %nk, ptr %kp\n  br label %loop\nrevl:\n"
+        "  %fk = load i32, ptr %kp\n  %fk1 = add i32 %fk, 1\n  %fk64 = sext i32 %fk1 to i64\n"
+        "  %res = call ptr @stricta_alloc(i64 %fk64)\n  %pp = alloca i32\n  store i32 0, ptr %pp\n  br label %rloop\nrloop:\n"
+        "  %p = load i32, ptr %pp\n  %c2 = icmp slt i32 %p, %fk\n  br i1 %c2, label %rbody, label %rdone\nrbody:\n"
+        "  %si = sub i32 %fk, 1\n  %si2 = sub i32 %si, %p\n"
+        "  %sp0 = getelementptr i8, ptr %rev, i32 %si2\n  %ch = load i8, ptr %sp0\n"
+        "  %dp0 = getelementptr i8, ptr %res, i32 %p\n  store i8 %ch, ptr %dp0\n"
+        "  %np = add i32 %p, 1\n  store i32 %np, ptr %pp\n  br label %rloop\nrdone:\n"
+        "  %end = getelementptr i8, ptr %res, i32 %fk\n  store i8 0, ptr %end\n"
+        "  call void @free(ptr %rev)\n  store i32 %fk, ptr %olp\n  ret ptr %res\n}\n\n");
+    sb_append(b,
+        "define internal ptr @_bi_sub_abs(ptr %a, i32 %al, ptr %b, i32 %bl, ptr %olp) {\nentry:\n"
+        "  %a1 = add i32 %al, 1\n  %a64 = sext i32 %a1 to i64\n"
+        "  %rev = call ptr @stricta_alloc(i64 %a64)\n"
+        "  %ip = alloca i32\n  %jp = alloca i32\n  %brp = alloca i32\n  %kp = alloca i32\n"
+        "  %am1 = sub i32 %al, 1\n  %bm1 = sub i32 %bl, 1\n"
+        "  store i32 %am1, ptr %ip\n  store i32 %bm1, ptr %jp\n  store i32 0, ptr %brp\n  store i32 0, ptr %kp\n  br label %loop\nloop:\n"
+        "  %i = load i32, ptr %ip\n  %j = load i32, ptr %jp\n"
+        "  %ci = icmp sge i32 %i, 0\n  %cj = icmp sge i32 %j, 0\n  %go = or i1 %ci, %cj\n"
+        "  br i1 %go, label %body, label %trim\nbody:\n"
+        "  %dp = alloca i32\n  %br0 = load i32, ptr %brp\n  store i32 %br0, ptr %dp\n"
+        "  br i1 %ci, label %adda, label %chkb\nadda:\n"
+        "  %ap = getelementptr i8, ptr %a, i32 %i\n  %ac = load i8, ptr %ap\n  %a32 = zext i8 %ac to i32\n"
+        "  %ad = sub i32 %a32, 48\n  %d0 = load i32, ptr %dp\n  %d1 = add i32 %d0, %ad\n  store i32 %d1, ptr %dp\n"
+        "  %ni = sub i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %chkb\nchkb:\n"
+        "  br i1 %cj, label %subb, label %putd\nsubb:\n"
+        "  %bp = getelementptr i8, ptr %b, i32 %j\n  %bc = load i8, ptr %bp\n  %b32 = zext i8 %bc to i32\n"
+        "  %bd = sub i32 %b32, 48\n  %d2 = load i32, ptr %dp\n  %d3 = sub i32 %d2, %bd\n  store i32 %d3, ptr %dp\n"
+        "  %nj = sub i32 %j, 1\n  store i32 %nj, ptr %jp\n  br label %putd\nputd:\n"
+        "  %d4 = load i32, ptr %dp\n  %lt0 = icmp slt i32 %d4, 0\n"
+        "  %d5 = add i32 %d4, 10\n  %fd = select i1 %lt0, i32 %d5, i32 %d4\n"
+        "  %nbr = select i1 %lt0, i32 -1, i32 0\n  store i32 %nbr, ptr %brp\n"
+        "  %c32 = add i32 %fd, 48\n  %c8 = trunc i32 %c32 to i8\n"
+        "  %k = load i32, ptr %kp\n  %rp = getelementptr i8, ptr %rev, i32 %k\n  store i8 %c8, ptr %rp\n"
+        "  %nk = add i32 %k, 1\n  store i32 %nk, ptr %kp\n  br label %loop\ntrim:\n"
+        "  %tk = load i32, ptr %kp\n  %gt1 = icmp sgt i32 %tk, 1\n  br i1 %gt1, label %tchk, label %revl\ntchk:\n"
+        "  %tm1 = sub i32 %tk, 1\n  %tp = getelementptr i8, ptr %rev, i32 %tm1\n  %tc = load i8, ptr %tp\n"
+        "  %isz = icmp eq i8 %tc, 48\n  br i1 %isz, label %tdec, label %revl\ntdec:\n"
+        "  store i32 %tm1, ptr %kp\n  br label %trim\nrevl:\n"
+        "  %fk = load i32, ptr %kp\n  %fk1 = add i32 %fk, 1\n  %fk64 = sext i32 %fk1 to i64\n"
+        "  %res = call ptr @stricta_alloc(i64 %fk64)\n  %pp = alloca i32\n  store i32 0, ptr %pp\n  br label %rloop\nrloop:\n"
+        "  %p = load i32, ptr %pp\n  %c2 = icmp slt i32 %p, %fk\n  br i1 %c2, label %rbody, label %rdone\nrbody:\n"
+        "  %si = sub i32 %fk, 1\n  %si2 = sub i32 %si, %p\n"
+        "  %sp0 = getelementptr i8, ptr %rev, i32 %si2\n  %ch = load i8, ptr %sp0\n"
+        "  %dp0 = getelementptr i8, ptr %res, i32 %p\n  store i8 %ch, ptr %dp0\n"
+        "  %np = add i32 %p, 1\n  store i32 %np, ptr %pp\n  br label %rloop\nrdone:\n"
+        "  %end = getelementptr i8, ptr %res, i32 %fk\n  store i8 0, ptr %end\n"
+        "  call void @free(ptr %rev)\n  store i32 %fk, ptr %olp\n  ret ptr %res\n}\n\n");
+    sb_append(b,
+        "define internal ptr @_bi_make(ptr %digits, i32 %len0, i32 %sign0) {\nentry:\n"
+        "  %lp = alloca i32\n  store i32 %len0, ptr %lp\n"
+        "  call void @_bi_strip(ptr %digits, ptr %lp)\n"
+        "  %len = load i32, ptr %lp\n"
+        "  %l1 = icmp eq i32 %len, 1\n  %c0 = load i8, ptr %digits\n  %z0 = icmp eq i8 %c0, 48\n"
+        "  %isz = and i1 %l1, %z0\n  %sign = select i1 %isz, i32 1, i32 %sign0\n"
+        "  %bsz = ptrtoint ptr getelementptr (%StrictaBigInt, ptr null, i32 1) to i64\n"
+        "  %bi = call ptr @stricta_alloc(i64 %bsz)\n"
+        "  %p0 = getelementptr %StrictaBigInt, ptr %bi, i32 0, i32 0\n  store i32 %len, ptr %p0\n"
+        "  %p1 = getelementptr %StrictaBigInt, ptr %bi, i32 0, i32 1\n  store i32 %sign, ptr %p1\n"
+        "  %p2 = getelementptr %StrictaBigInt, ptr %bi, i32 0, i32 2\n  store ptr %digits, ptr %p2\n"
+        "  ret ptr %bi\n}\n\n"
+        "define internal ptr @stricta_bigint_from_str(ptr %s0) {\nentry:\n"
+        "  %hs = icmp ne ptr %s0, null\n  br i1 %hs, label %chkc, label %mkz\nchkc:\n"
+        "  %c0 = load i8, ptr %s0\n  %nz = icmp ne i8 %c0, 0\n  br i1 %nz, label %parse, label %mkz\nmkz:\n"
+        "  %zd = call ptr @stricta_alloc(i64 2)\n  store i8 48, ptr %zd\n"
+        "  %z1 = getelementptr i8, ptr %zd, i32 1\n  store i8 0, ptr %z1\n"
+        "  %rz = call ptr @_bi_make(ptr %zd, i32 1, i32 1)\n  ret ptr %rz\nparse:\n"
+        "  %ism = icmp eq i8 %c0, 45\n  br i1 %ism, label %mneg, label %chkp\nmneg:\n"
+        "  %s1 = getelementptr i8, ptr %s0, i32 1\n  br label %copy\nchkp:\n"
+        "  %isp = icmp eq i8 %c0, 43\n  %s2 = getelementptr i8, ptr %s0, i32 1\n"
+        "  %s3 = select i1 %isp, ptr %s2, ptr %s0\n  br label %copy\ncopy:\n"
+        "  %s = phi ptr [ %s1, %mneg ], [ %s3, %chkp ]\n"
+        "  %sign = phi i32 [ -1, %mneg ], [ 1, %chkp ]\n"
+        "  %l64 = call i64 @strlen(ptr %s)\n  %l32 = trunc i64 %l64 to i32\n"
+        "  %asz = add i64 %l64, 1\n  %d = call ptr @stricta_alloc(i64 %asz)\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %d, ptr %s, i64 %asz, i1 false)\n"
+        "  %r = call ptr @_bi_make(ptr %d, i32 %l32, i32 %sign)\n  ret ptr %r\n}\n\n"
+        "define internal ptr @stricta_bigint_from_i64(i64 %v) {\nentry:\n"
+        "  %buf = alloca [32 x i8]\n"
+        "  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 32, ptr @.rt_fmt_lld, i64 %v)\n"
+        "  %r = call ptr @stricta_bigint_from_str(ptr %buf)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_bigint_add(ptr %a, ptr %b) {\nentry:\n"
+        "  %olp = alloca i32\n"
+        "  %asp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 1\n  %as = load i32, ptr %asp\n"
+        "  %bsp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 1\n  %bs = load i32, ptr %bsp\n"
+        "  %alp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 0\n  %al = load i32, ptr %alp\n"
+        "  %blp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 0\n  %bl = load i32, ptr %blp\n"
+        "  %adp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 2\n  %ad = load ptr, ptr %adp\n"
+        "  %bdp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 2\n  %bd = load ptr, ptr %bdp\n"
+        "  %eqs = icmp eq i32 %as, %bs\n  br i1 %eqs, label %same, label %diff\nsame:\n"
+        "  %d1 = call ptr @_bi_add_abs(ptr %ad, i32 %al, ptr %bd, i32 %bl, ptr %olp)\n"
+        "  %l1 = load i32, ptr %olp\n  %r1 = call ptr @_bi_make(ptr %d1, i32 %l1, i32 %as)\n  ret ptr %r1\ndiff:\n"
+        "  %c = call i32 @_bi_abs_cmp(ptr %ad, i32 %al, ptr %bd, i32 %bl)\n"
+        "  %c0 = icmp eq i32 %c, 0\n  br i1 %c0, label %ret0, label %chkgt\nret0:\n"
+        "  %r0 = call ptr @stricta_bigint_from_str(ptr @.rt_zero)\n  ret ptr %r0\nchkgt:\n"
+        "  %cgt = icmp sgt i32 %c, 0\n  br i1 %cgt, label %agtb, label %blta\nagtb:\n"
+        "  %d2 = call ptr @_bi_sub_abs(ptr %ad, i32 %al, ptr %bd, i32 %bl, ptr %olp)\n"
+        "  %l2 = load i32, ptr %olp\n  %r2 = call ptr @_bi_make(ptr %d2, i32 %l2, i32 %as)\n  ret ptr %r2\nblta:\n"
+        "  %d3 = call ptr @_bi_sub_abs(ptr %bd, i32 %bl, ptr %ad, i32 %al, ptr %olp)\n"
+        "  %l3 = load i32, ptr %olp\n  %r3 = call ptr @_bi_make(ptr %d3, i32 %l3, i32 %bs)\n  ret ptr %r3\n}\n\n"
+        "define internal ptr @stricta_bigint_sub(ptr %a, ptr %b) {\nentry:\n"
+        "  %nb = alloca %StrictaBigInt\n"
+        "  %bv = load %StrictaBigInt, ptr %b\n  store %StrictaBigInt %bv, ptr %nb\n"
+        "  %bsp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 1\n  %bs = load i32, ptr %bsp\n"
+        "  %nbs = sub i32 0, %bs\n"
+        "  %nbsp = getelementptr %StrictaBigInt, ptr %nb, i32 0, i32 1\n  store i32 %nbs, ptr %nbsp\n"
+        "  %r = call ptr @stricta_bigint_add(ptr %a, ptr %nb)\n  ret ptr %r\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_bigint_mul(ptr %a, ptr %b) {\nentry:\n"
+        "  %alp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 0\n  %al = load i32, ptr %alp\n"
+        "  %blp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 0\n  %bl = load i32, ptr %blp\n"
+        "  %asp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 1\n  %as = load i32, ptr %asp\n"
+        "  %bsp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 1\n  %bs = load i32, ptr %bsp\n"
+        "  %adp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 2\n  %ad = load ptr, ptr %adp\n"
+        "  %bdp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 2\n  %bd = load ptr, ptr %bdp\n"
+        "  %rl0 = add i32 %al, %bl\n  %rl4 = add i32 %rl0, 4\n  %rl4_64 = sext i32 %rl4 to i64\n"
+        "  %tmp = call ptr @stricta_calloc(i64 %rl4_64, i64 4)\n"
+        "  %ip = alloca i32\n  %jp = alloca i32\n"
+        "  %am1 = sub i32 %al, 1\n  store i32 %am1, ptr %ip\n  br label %l1\nl1:\n"
+        "  %i = load i32, ptr %ip\n  %ci = icmp sge i32 %i, 0\n  br i1 %ci, label %l2init, label %carryinit\nl2init:\n"
+        "  %bm1 = sub i32 %bl, 1\n  store i32 %bm1, ptr %jp\n  %ap = getelementptr i8, ptr %ad, i32 %i\n"
+        "  %ac = load i8, ptr %ap\n  %a32 = zext i8 %ac to i32\n  %av = sub i32 %a32, 48\n"
+        "  %ia = sub i32 %am1, %i\n  br label %l2\nl2:\n"
+        "  %j = load i32, ptr %jp\n  %cj = icmp sge i32 %j, 0\n  br i1 %cj, label %l2b, label %l1next\nl2b:\n"
+        "  %bp = getelementptr i8, ptr %bd, i32 %j\n  %bc = load i8, ptr %bp\n  %b32 = zext i8 %bc to i32\n"
+        "  %bv = sub i32 %b32, 48\n  %prod = mul i32 %av, %bv\n"
+        "  %jb = sub i32 %bm1, %j\n  %idx = add i32 %ia, %jb\n"
+        "  %tp = getelementptr i32, ptr %tmp, i32 %idx\n  %tv = load i32, ptr %tp\n"
+        "  %ntv = add i32 %tv, %prod\n  store i32 %ntv, ptr %tp\n"
+        "  %nj = sub i32 %j, 1\n  store i32 %nj, ptr %jp\n  br label %l2\nl1next:\n"
+        "  %ni = sub i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %l1\ncarryinit:\n"
+        "  %cp = alloca i32\n  %rlp = alloca i32\n"
+        "  store i32 0, ptr %cp\n  store i32 %rl0, ptr %rlp\n  store i32 0, ptr %ip\n  br label %cloop\ncloop:\n"
+        "  %k = load i32, ptr %ip\n  %ck = icmp slt i32 %k, %rl0\n  br i1 %ck, label %cbody, label %cdone\ncbody:\n"
+        "  %tp2 = getelementptr i32, ptr %tmp, i32 %k\n  %tv2 = load i32, ptr %tp2\n"
+        "  %c0 = load i32, ptr %cp\n  %t = add i32 %tv2, %c0\n"
+        "  %mod = srem i32 %t, 10\n  %nc = sdiv i32 %t, 10\n"
+        "  store i32 %mod, ptr %tp2\n  store i32 %nc, ptr %cp\n"
+        "  %nk = add i32 %k, 1\n  store i32 %nk, ptr %ip\n  br label %cloop\ncdone:\n"
+        "  %c1 = load i32, ptr %cp\n  %cgt0 = icmp sgt i32 %c1, 0\n  br i1 %cgt0, label %cpush, label %trim\ncpush:\n"
+        "  %crl = load i32, ptr %rlp\n  %tp3 = getelementptr i32, ptr %tmp, i32 %crl\n"
+        "  %cm = srem i32 %c1, 10\n  %cd = sdiv i32 %c1, 10\n  store i32 %cm, ptr %tp3\n"
+        "  %nrl = add i32 %crl, 1\n  store i32 %nrl, ptr %rlp\n  store i32 %cd, ptr %cp\n  br label %cdone\ntrim:\n"
+        "  %trl = load i32, ptr %rlp\n  %gt1 = icmp sgt i32 %trl, 1\n  br i1 %gt1, label %tchk, label %revinit\ntchk:\n"
+        "  %tm1 = sub i32 %trl, 1\n  %tp4 = getelementptr i32, ptr %tmp, i32 %tm1\n  %tv4 = load i32, ptr %tp4\n"
+        "  %isz = icmp eq i32 %tv4, 0\n  br i1 %isz, label %tdec, label %revinit\ntdec:\n"
+        "  store i32 %tm1, ptr %rlp\n  br label %trim\nrevinit:\n"
+        "  %frl = load i32, ptr %rlp\n  %frl1 = add i32 %frl, 1\n  %frl64 = sext i32 %frl1 to i64\n"
+        "  %res = call ptr @stricta_alloc(i64 %frl64)\n  store i32 0, ptr %ip\n  br label %rloop\nrloop:\n"
+        "  %p = load i32, ptr %ip\n  %cond = icmp slt i32 %p, %frl\n  br i1 %cond, label %rbody, label %rdone\nrbody:\n"
+        "  %si = sub i32 %frl, 1\n  %si2 = sub i32 %si, %p\n"
+        "  %tp5 = getelementptr i32, ptr %tmp, i32 %si2\n  %tv5 = load i32, ptr %tp5\n"
+        "  %d32 = add i32 %tv5, 48\n  %d8 = trunc i32 %d32 to i8\n"
+        "  %rp5 = getelementptr i8, ptr %res, i32 %p\n  store i8 %d8, ptr %rp5\n"
+        "  %np = add i32 %p, 1\n  store i32 %np, ptr %ip\n  br label %rloop\nrdone:\n"
+        "  %end = getelementptr i8, ptr %res, i32 %frl\n  store i8 0, ptr %end\n"
+        "  call void @free(ptr %tmp)\n"
+        "  %rsign = mul i32 %as, %bs\n"
+        "  %bi = call ptr @_bi_make(ptr %res, i32 %frl, i32 %rsign)\n  ret ptr %bi\n}\n\n");
+    sb_append(b,
+        "define internal ptr @stricta_bigint_div(ptr %a, ptr %b) {\nentry:\n"
+        "  %alp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 0\n  %al = load i32, ptr %alp\n"
+        "  %blp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 0\n  %bl = load i32, ptr %blp\n"
+        "  %asp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 1\n  %as = load i32, ptr %asp\n"
+        "  %bsp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 1\n  %bs = load i32, ptr %bsp\n"
+        "  %adp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 2\n  %ad = load ptr, ptr %adp\n"
+        "  %bdp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 2\n  %bd = load ptr, ptr %bdp\n"
+        "  %bl1 = icmp eq i32 %bl, 1\n  %bc0 = load i8, ptr %bd\n  %bz0 = icmp eq i8 %bc0, 48\n"
+        "  %bzero = and i1 %bl1, %bz0\n  br i1 %bzero, label %zdiv, label %chkfast\nzdiv:\n"
+        "  call void @stricta_set_exc(i32 3, ptr null, ptr @.rt_err_zdiv)\n"
+        "  call void @stricta_unhandled_exc()\n  unreachable\nchkfast:\n"
+        "  %ac0 = call i32 @_bi_abs_cmp(ptr %ad, i32 %al, ptr %bd, i32 %bl)\n"
+        "  %lt = icmp slt i32 %ac0, 0\n  br i1 %lt, label %fast, label %work\nfast:\n"
+        "  %eqs = icmp eq i32 %as, %bs\n  %al1 = icmp eq i32 %al, 1\n  %ach0 = load i8, ptr %ad\n  %az0 = icmp eq i8 %ach0, 48\n"
+        "  %ais0 = and i1 %al1, %az0\n  %retz = or i1 %eqs, %ais0\n"
+        "  br i1 %retz, label %ret_0, label %ret_m1\nret_0:\n"
+        "  %r0 = call ptr @stricta_bigint_from_str(ptr @.rt_zero)\n  ret ptr %r0\nret_m1:\n"
+        "  %rm1 = call ptr @stricta_bigint_from_str(ptr @.rt_neg_one)\n  ret ptr %rm1\nwork:\n"
+        "  %al1p = add i32 %al, 1\n  %al1_64 = sext i32 %al1p to i64\n"
+        "  %res = call ptr @stricta_calloc(i64 %al1_64, i64 1)\n"
+        "  %al2 = add i32 %al, 2\n  %ccap0 = sext i32 %al2 to i64\n"
+        "  %ccap_p = alloca i64\n  %cur_p = alloca ptr\n  %clp = alloca i32\n  %rip = alloca i32\n  %ip = alloca i32\n  %olp = alloca i32\n"
+        "  store i64 %ccap0, ptr %ccap_p\n  %cur0 = call ptr @stricta_alloc(i64 %ccap0)\n"
+        "  store ptr %cur0, ptr %cur_p\n  store i32 0, ptr %clp\n  store i32 0, ptr %rip\n  store i32 0, ptr %ip\n  br label %dloop\ndloop:\n"
+        "  %i = load i32, ptr %ip\n  %cond = icmp slt i32 %i, %al\n  br i1 %cond, label %dbody, label %dfin\ndbody:\n"
+        "  %cl = load i32, ptr %clp\n  %cl2 = add i32 %cl, 2\n  %cl2_64 = sext i32 %cl2 to i64\n"
+        "  %ccap = load i64, ptr %ccap_p\n  %needg = icmp ugt i64 %cl2_64, %ccap\n"
+        "  br i1 %needg, label %grow1, label %append\ngrow1:\n"
+        "  %cl16 = add i32 %cl, 16\n  %ncap1 = sext i32 %cl16 to i64\n"
+        "  %oc1 = load ptr, ptr %cur_p\n  %ncur1 = call ptr @stricta_realloc(ptr %oc1, i64 %ncap1)\n"
+        "  store ptr %ncur1, ptr %cur_p\n  store i64 %ncap1, ptr %ccap_p\n  br label %append\nappend:\n"
+        "  %cur1 = load ptr, ptr %cur_p\n  %ap = getelementptr i8, ptr %ad, i32 %i\n  %ch = load i8, ptr %ap\n"
+        "  %cp1 = getelementptr i8, ptr %cur1, i32 %cl\n  store i8 %ch, ptr %cp1\n"
+        "  %cln = add i32 %cl, 1\n  %cp2 = getelementptr i8, ptr %cur1, i32 %cln\n  store i8 0, ptr %cp2\n"
+        "  store i32 %cln, ptr %clp\n  call void @_bi_strip(ptr %cur1, ptr %clp)\n"
+        "  %cl_s = load i32, ptr %clp\n"
+        "  %cmp0 = call i32 @_bi_abs_cmp(ptr %cur1, i32 %cl_s, ptr %bd, i32 %bl)\n"
+        "  %islt = icmp slt i32 %cmp0, 0\n  br i1 %islt, label %pushz, label %qinit\npushz:\n"
+        "  %ri0 = load i32, ptr %rip\n  %rgt = icmp sgt i32 %ri0, 0\n  br i1 %rgt, label %pz2, label %dnext\npz2:\n"
+        "  %rpz = getelementptr i8, ptr %res, i32 %ri0\n  store i8 48, ptr %rpz\n"
+        "  %nri0 = add i32 %ri0, 1\n  store i32 %nri0, ptr %rip\n  br label %dnext\nqinit:\n"
+        "  %qp = alloca i32\n  %cmpp = alloca i32\n  store i32 0, ptr %qp\n  store i32 %cmp0, ptr %cmpp\n  br label %qloop\nqloop:\n"
+        "  %cm = load i32, ptr %cmpp\n  %ge0 = icmp sge i32 %cm, 0\n  br i1 %ge0, label %qbody, label %qdone\nqbody:\n"
+        "  %cur2 = load ptr, ptr %cur_p\n  %cl2b = load i32, ptr %clp\n"
+        "  %nc = call ptr @_bi_sub_abs(ptr %cur2, i32 %cl2b, ptr %bd, i32 %bl, ptr %olp)\n"
+        "  %nl = load i32, ptr %olp\n  store i32 %nl, ptr %clp\n"
+        "  %nl2 = add i32 %nl, 2\n  %nl2_64 = sext i32 %nl2 to i64\n"
+        "  %ccap2 = load i64, ptr %ccap_p\n  %ng2 = icmp ugt i64 %nl2_64, %ccap2\n"
+        "  br i1 %ng2, label %grow2, label %copync\ngrow2:\n"
+        "  %nl16 = add i32 %nl, 16\n  %ncap2 = sext i32 %nl16 to i64\n"
+        "  %ncur2 = call ptr @stricta_realloc(ptr %cur2, i64 %ncap2)\n"
+        "  store ptr %ncur2, ptr %cur_p\n  store i64 %ncap2, ptr %ccap_p\n  br label %copync\ncopync:\n"
+        "  %cur3 = load ptr, ptr %cur_p\n  %nl1 = add i32 %nl, 1\n  %nl1_64 = sext i32 %nl1 to i64\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %cur3, ptr %nc, i64 %nl1_64, i1 false)\n"
+        "  call void @free(ptr %nc)\n"
+        "  %qv = load i32, ptr %qp\n  %nqv = add i32 %qv, 1\n  store i32 %nqv, ptr %qp\n"
+        "  %ncmp = call i32 @_bi_abs_cmp(ptr %cur3, i32 %nl, ptr %bd, i32 %bl)\n"
+        "  store i32 %ncmp, ptr %cmpp\n  br label %qloop\nqdone:\n"
+        "  %fq = load i32, ptr %qp\n  %qd = add i32 %fq, 48\n  %q8 = trunc i32 %qd to i8\n"
+        "  %ri1 = load i32, ptr %rip\n  %rpq = getelementptr i8, ptr %res, i32 %ri1\n  store i8 %q8, ptr %rpq\n"
+        "  %nri1 = add i32 %ri1, 1\n  store i32 %nri1, ptr %rip\n  br label %dnext\ndnext:\n"
+        "  %ni = add i32 %i, 1\n  store i32 %ni, ptr %ip\n  br label %dloop\ndfin:\n"
+        "  %fcl = load i32, ptr %clp\n  %fcur = load ptr, ptr %cur_p\n"
+        "  %cl1 = icmp eq i32 %fcl, 1\n  %fc0 = load i8, ptr %fcur\n  %fz0 = icmp eq i8 %fc0, 48\n"
+        "  %remz = and i1 %cl1, %fz0\n  %hasrem = xor i1 %remz, true\n"
+        "  call void @free(ptr %fcur)\n"
+        "  %fri = load i32, ptr %rip\n  %riz = icmp eq i32 %fri, 0\n  br i1 %riz, label %setz, label %mkq\nsetz:\n"
+        "  store i8 48, ptr %res\n  store i32 1, ptr %rip\n  br label %mkq\nmkq:\n"
+        "  %fri2 = load i32, ptr %rip\n  %rpe = getelementptr i8, ptr %res, i32 %fri2\n  store i8 0, ptr %rpe\n"
+        "  %qsign = mul i32 %as, %bs\n"
+        "  %q = call ptr @_bi_make(ptr %res, i32 %fri2, i32 %qsign)\n"
+        "  %neqs = icmp ne i32 %as, %bs\n  %adj = and i1 %neqs, %hasrem\n"
+        "  br i1 %adj, label %doadj, label %retq\ndoadj:\n"
+        "  %one = call ptr @stricta_bigint_from_str(ptr @.rt_one)\n"
+        "  %qadj = call ptr @stricta_bigint_sub(ptr %q, ptr %one)\n"
+        "  call void @stricta_bigint_free(ptr %q)\n  call void @stricta_bigint_free(ptr %one)\n"
+        "  ret ptr %qadj\nretq:\n  ret ptr %q\n}\n\n");
+    sb_append(b,
+        "define internal void @stricta_bigint_free(ptr %a) {\nentry:\n"
+        "  %ok = icmp ne ptr %a, null\n  br i1 %ok, label %dofree, label %done\ndofree:\n"
+        "  %dp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 2\n  %d = load ptr, ptr %dp\n"
+        "  call void @free(ptr %d)\n  call void @free(ptr %a)\n  br label %done\ndone:\n  ret void\n}\n\n"
+        "define internal ptr @stricta_bigint_clone(ptr %a) {\nentry:\n"
+        "  %ok = icmp ne ptr %a, null\n  br i1 %ok, label %work, label %retn\nretn:\n  ret ptr null\nwork:\n"
+        "  %lp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %sp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 1\n  %sign = load i32, ptr %sp\n"
+        "  %dp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 2\n  %d0 = load ptr, ptr %dp\n"
+        "  %l1 = add i32 %len, 1\n  %l1_64 = sext i32 %l1 to i64\n"
+        "  %d = call ptr @stricta_alloc(i64 %l1_64)\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %d, ptr %d0, i64 %l1_64, i1 false)\n"
+        "  %r = call ptr @_bi_make(ptr %d, i32 %len, i32 %sign)\n  ret ptr %r\n}\n\n"
+        "define internal ptr @stricta_bigint_mod(ptr %a, ptr %b) {\nentry:\n"
+        "  %q = call ptr @stricta_bigint_div(ptr %a, ptr %b)\n"
+        "  %p = call ptr @stricta_bigint_mul(ptr %q, ptr %b)\n"
+        "  %r = call ptr @stricta_bigint_sub(ptr %a, ptr %p)\n"
+        "  call void @stricta_bigint_free(ptr %q)\n  call void @stricta_bigint_free(ptr %p)\n"
+        "  ret ptr %r\n}\n\n"
+        "define internal ptr @stricta_bigint_pow(ptr %a, ptr %b) {\nentry:\n"
+        "  %bsp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 1\n  %bs = load i32, ptr %bsp\n"
+        "  %neg = icmp slt i32 %bs, 0\n  br i1 %neg, label %ret0, label %init\nret0:\n"
+        "  %r0 = call ptr @stricta_bigint_from_str(ptr @.rt_zero)\n  ret ptr %r0\ninit:\n"
+        "  %bdp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 2\n  %bd = load ptr, ptr %bdp\n"
+        "  %e0 = call i64 @strtoll(ptr %bd, ptr null, i32 10)\n"
+        "  %ep = alloca i64\n  %rp = alloca ptr\n  %bp = alloca ptr\n"
+        "  store i64 %e0, ptr %ep\n"
+        "  %one = call ptr @stricta_bigint_from_str(ptr @.rt_one)\n  store ptr %one, ptr %rp\n"
+        "  %base0 = call ptr @stricta_bigint_clone(ptr %a)\n  store ptr %base0, ptr %bp\n"
+        "  br label %loop\nloop:\n"
+        "  %e = load i64, ptr %ep\n  %gt0 = icmp sgt i64 %e, 0\n  br i1 %gt0, label %body, label %done\nbody:\n"
+        "  %odd = and i64 %e, 1\n  %is1 = icmp ne i64 %odd, 0\n  br i1 %is1, label %mulr, label %sh\nmulr:\n"
+        "  %r1 = load ptr, ptr %rp\n  %b1 = load ptr, ptr %bp\n"
+        "  %nr = call ptr @stricta_bigint_mul(ptr %r1, ptr %b1)\n"
+        "  call void @stricta_bigint_free(ptr %r1)\n  store ptr %nr, ptr %rp\n  br label %sh\nsh:\n"
+        "  %ne = ashr i64 %e, 1\n  store i64 %ne, ptr %ep\n"
+        "  %gtn = icmp sgt i64 %ne, 0\n  br i1 %gtn, label %sqb, label %loop\nsqb:\n"
+        "  %b2 = load ptr, ptr %bp\n  %nb = call ptr @stricta_bigint_mul(ptr %b2, ptr %b2)\n"
+        "  call void @stricta_bigint_free(ptr %b2)\n  store ptr %nb, ptr %bp\n  br label %loop\ndone:\n"
+        "  %fb = load ptr, ptr %bp\n  call void @stricta_bigint_free(ptr %fb)\n"
+        "  %fr = load ptr, ptr %rp\n  ret ptr %fr\n}\n\n"
+        "define internal ptr @stricta_bigint_neg(ptr %a) {\nentry:\n"
+        "  %lp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %sp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 1\n  %sign = load i32, ptr %sp\n"
+        "  %dp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 2\n  %d0 = load ptr, ptr %dp\n"
+        "  %l1 = add i32 %len, 1\n  %l1_64 = sext i32 %l1 to i64\n"
+        "  %d = call ptr @stricta_alloc(i64 %l1_64)\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %d, ptr %d0, i64 %l1_64, i1 false)\n"
+        "  %ns = sub i32 0, %sign\n"
+        "  %r = call ptr @_bi_make(ptr %d, i32 %len, i32 %ns)\n  ret ptr %r\n}\n\n"
+        "define internal ptr @stricta_bigint_abs(ptr %a) {\nentry:\n"
+        "  %lp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %dp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 2\n  %d0 = load ptr, ptr %dp\n"
+        "  %l1 = add i32 %len, 1\n  %l1_64 = sext i32 %l1 to i64\n"
+        "  %d = call ptr @stricta_alloc(i64 %l1_64)\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %d, ptr %d0, i64 %l1_64, i1 false)\n"
+        "  %r = call ptr @_bi_make(ptr %d, i32 %len, i32 1)\n  ret ptr %r\n}\n\n"
+        "define internal i32 @stricta_bigint_cmp(ptr %a, ptr %b) {\nentry:\n"
+        "  %asp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 1\n  %as = load i32, ptr %asp\n"
+        "  %bsp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 1\n  %bs = load i32, ptr %bsp\n"
+        "  %neq = icmp ne i32 %as, %bs\n  br i1 %neq, label %bysign, label %byabs\nbysign:\n"
+        "  %lt = icmp slt i32 %as, %bs\n  %r1 = select i1 %lt, i32 -1, i32 1\n  ret i32 %r1\nbyabs:\n"
+        "  %alp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 0\n  %al = load i32, ptr %alp\n"
+        "  %blp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 0\n  %bl = load i32, ptr %blp\n"
+        "  %adp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 2\n  %ad = load ptr, ptr %adp\n"
+        "  %bdp = getelementptr %StrictaBigInt, ptr %b, i32 0, i32 2\n  %bd = load ptr, ptr %bdp\n"
+        "  %c = call i32 @_bi_abs_cmp(ptr %ad, i32 %al, ptr %bd, i32 %bl)\n"
+        "  %pos = icmp sgt i32 %as, 0\n  %nc = sub i32 0, %c\n  %r2 = select i1 %pos, i32 %c, i32 %nc\n  ret i32 %r2\n}\n\n"
+        "define internal ptr @stricta_bigint_to_str(ptr %a) {\nentry:\n"
+        "  %lp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 0\n  %len = load i32, ptr %lp\n"
+        "  %sp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 1\n  %sign = load i32, ptr %sp\n"
+        "  %dp = getelementptr %StrictaBigInt, ptr %a, i32 0, i32 2\n  %d = load ptr, ptr %dp\n"
+        "  %neg = icmp slt i32 %sign, 0\n  %l1 = icmp eq i32 %len, 1\n  %c0 = load i8, ptr %d\n"
+        "  %z0 = icmp eq i8 %c0, 48\n  %isz = and i1 %l1, %z0\n  %n0 = xor i1 %isz, true\n"
+        "  %isneg = and i1 %neg, %n0\n  br i1 %isneg, label %wneg, label %wpos\nwneg:\n"
+        "  %len2 = add i32 %len, 2\n  %l2_64 = sext i32 %len2 to i64\n"
+        "  %buf = call ptr @stricta_alloc(i64 %l2_64)\n  store i8 45, ptr %buf\n"
+        "  %dst = getelementptr i8, ptr %buf, i32 1\n"
+        "  %len1 = add i32 %len, 1\n  %l1_64 = sext i32 %len1 to i64\n"
+        "  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %d, i64 %l1_64, i1 false)\n"
+        "  %r1 = call ptr @stricta_str_new(ptr %buf, i32 %len1)\n"
+        "  call void @free(ptr %buf)\n  ret ptr %r1\nwpos:\n"
+        "  %r2 = call ptr @stricta_str_new(ptr %d, i32 %len)\n  ret ptr %r2\n}\n\n");
+}
+
 static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
     cg_init();
     analyze_can_raise();
 
-    /* Header: external runtime declarations & core structs */
+    /* Header: self-contained LLVM IR runtime & libc declarations (no external runtime.c needed) */
     sb_append(&g_cg.hdr, "; Stricta Static LLVM IR Compiler Output\n\n");
-    sb_append(&g_cg.hdr, "%StrictaStr = type { i32, i32, ptr, i32 }\n");
-    sb_append(&g_cg.hdr, "%StrictaBytes = type { i32, i32, ptr }\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_str_free(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_clone(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_bytes_free(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bytes_clone(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_bigint_free(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_clone(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_file_free(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_task_spawn(ptr, ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_task_args(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_task_finish(ptr, i64)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_task_capture_exc(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @stricta_task_await(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_task_free(ptr)\n");
-    sb_append(&g_cg.hdr, "@stricta_sys_argv = external global ptr\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_init_args(i32, ptr)\n");
-    sb_append(&g_cg.hdr, "declare noalias ptr @malloc(i64)\n");
-    sb_append(&g_cg.hdr, "declare noalias ptr @calloc(i64, i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @realloc(ptr, i64)\n");
-    sb_append(&g_cg.hdr, "declare void @free(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_alloc(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_calloc(i64, i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_realloc(ptr, i64)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_free(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_set_exc(i32, ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_clear_exc(i32)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_unhandled_exc()\n");
-    sb_append(&g_cg.hdr, "declare i32 @stricta_exc_type_id()\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_exc_obj()\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_exc_msg()\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_assert_fail(ptr, ptr, i32)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_bounds_fail(i64, i64, ptr, i32)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_concat(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_repeat(ptr, i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_slice(ptr, i64, i64)\n");
-    sb_append(&g_cg.hdr, "declare i64 @stricta_slice_adjust(i64, i64, i32, i64, i32, i64, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_slice_step(ptr, i64, i32, i64, i32, i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_char_at(ptr, i64)\n");
-    sb_append(&g_cg.hdr, "declare i32 @stricta_str_eq(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @stricta_str_cmp(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @stricta_str_hash(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @stricta_str_contains(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_split(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_join(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_upper(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_lower(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_replace(ptr, ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @stricta_str_find(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @stricta_str_index(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_strip(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_lstrip(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_str_rstrip(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @stricta_str_startswith(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @stricta_str_endswith(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @stricta_str_count(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_int_to_str(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_uint_to_str(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_float_to_str(double)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_float_fmt(double, i32)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bool_to_str(i32)\n");
-    sb_append(&g_cg.hdr, "declare i64 @stricta_str_to_int(ptr)\n");
-    sb_append(&g_cg.hdr, "declare double @stricta_str_to_float(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i64 @stricta_ord(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_chr(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_hex(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bin(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_oct(i64)\n");
-    sb_append(&g_cg.hdr, "declare i64 @stricta_pow_i64(i64, i64)\n");
-    sb_append(&g_cg.hdr, "declare double @pow(double, double)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bytes_new(ptr, i32)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bytes_slice(ptr, i64, i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bytes_slice_step(ptr, i64, i32, i64, i32, i64)\n");
-    sb_append(&g_cg.hdr, "declare i32 @stricta_bytes_eq(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_from_str(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_from_i64(i64)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_add(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_sub(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_mul(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_div(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_mod(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_pow(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_neg(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_abs(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @stricta_bigint_cmp(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_bigint_to_str(ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_open(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_file_read(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_file_write(ptr, ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_file_close(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_print_i64(i64)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_print_u64(i64)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_print_f64(double)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_print_bool(i32)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_print_str(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_print_cstr(ptr)\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_print_space()\n");
-    sb_append(&g_cg.hdr, "declare void @stricta_print_newline()\n");
-    sb_append(&g_cg.hdr, "declare ptr @stricta_input(ptr)\n");
-    sb_append(&g_cg.hdr, "declare i32 @llvm.smax.i32(i32, i32)\n");
-    sb_append(&g_cg.hdr, "declare i32 @llvm.smin.i32(i32, i32)\n");
-    sb_append(&g_cg.hdr, "declare i64 @llvm.smax.i64(i64, i64)\n");
-    sb_append(&g_cg.hdr, "declare i64 @llvm.smin.i64(i64, i64)\n");
-    sb_append(&g_cg.hdr, "declare double @llvm.floor.f64(double)\n");
-    sb_append(&g_cg.hdr, "declare float @llvm.floor.f32(float)\n");
-    sb_append(&g_cg.hdr, "declare double @llvm.round.f64(double)\n");
-    sb_append(&g_cg.hdr, "declare double @llvm.fabs.f64(double)\n");
-    sb_append(&g_cg.hdr, "declare float @llvm.fabs.f32(float)\n");
-    sb_append(&g_cg.hdr, "declare i64 @llvm.abs.i64(i64, i1)\n");
-    sb_append(&g_cg.hdr, "declare i32 @llvm.abs.i32(i32, i1)\n");
-    sb_append(&g_cg.hdr, "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n\n");
+    emit_llvm_rt_core(&g_cg.hdr);
+    emit_llvm_rt_str(&g_cg.hdr);
+    emit_llvm_rt_bytes_file_task(&g_cg.hdr);
+    emit_llvm_rt_bigint(&g_cg.hdr);
 
     /* Emit Class Structs & VTables */
     for (int i = 0; i < g_all_class_count; i++) {
@@ -14798,9 +16291,15 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
     }
     const char* ext_syms[256];
     int ext_cnt = 0;
-    ext_syms[ext_cnt++] = "@pow";
-    ext_syms[ext_cnt++] = "@stricta_alloc";
-    ext_syms[ext_cnt++] = "@stricta_free";
+    static const char* predeclared_syms[] = {
+        "@malloc", "@calloc", "@realloc", "@free", "@memcmp", "@strlen",
+        "@strstr", "@strchr", "@strtoll", "@strtod", "@printf", "@dprintf",
+        "@snprintf", "@putchar", "@getchar", "@fflush", "@fopen", "@fseek",
+        "@ftell", "@fread", "@fwrite", "@fclose", "@exit", "@pow",
+        "@pthread_create", "@pthread_join", "@stricta_alloc", "@stricta_free",
+        NULL
+    };
+    for (int k = 0; predeclared_syms[k]; k++) ext_syms[ext_cnt++] = predeclared_syms[k];
     for (int i = 0; i < g_all_func_count; i++) {
         FuncInfo* fn = g_all_funcs[i];
         if (!fn->is_extern) continue;
@@ -15013,32 +16512,6 @@ static bool ends_with(const char* s, const char* suf) {
     return sl >= sufl && strcmp(s + sl - sufl, suf) == 0;
 }
 
-static bool find_runtime_c(const char* argv0, char* out_buf, size_t cap) {
-    if (access("runtime.c", R_OK) == 0) {
-        snprintf(out_buf, cap, "runtime.c");
-        return true;
-    }
-    char* exe_copy = strdup(argv0);
-    char* dir = dirname(exe_copy);
-    snprintf(out_buf, cap, "%s/runtime.c", dir);
-    if (access(out_buf, R_OK) == 0) { free(exe_copy); return true; }
-    snprintf(out_buf, cap, "%s/../share/stricta/runtime.c", dir);
-    free(exe_copy);
-    if (access(out_buf, R_OK) == 0) return true;
-#ifdef STRICTA_DATA_DIR
-    snprintf(out_buf, cap, "%s/runtime.c", STRICTA_DATA_DIR);
-    if (access(out_buf, R_OK) == 0) return true;
-#endif
-    const char* home = getenv("HOME");
-    if (home && *home) {
-        snprintf(out_buf, cap, "%s/.local/share/stricta/runtime.c", home);
-        if (access(out_buf, R_OK) == 0) return true;
-    }
-    snprintf(out_buf, cap, "/usr/local/share/stricta/runtime.c");
-    if (access(out_buf, R_OK) == 0) return true;
-    return false;
-}
-
 int main(int argc, char** argv) {
     {
         char* ecopy = strdup(argv[0]);
@@ -15129,15 +16602,8 @@ int main(int argc, char** argv) {
     fclose(f);
     free(ir.data);
 
-    char rt_path[1024];
-    if (!find_runtime_c(argv[0], rt_path, sizeof(rt_path))) {
-        fprintf(stderr, "error: cannot locate runtime.c\n");
-        remove(tmp_ll);
-        return 1;
-    }
-
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "clang -O2 -Wno-override-module '%s' '%s' -lm -lpthread -o '%s'", tmp_ll, rt_path, output_file);
+    snprintf(cmd, sizeof(cmd), "clang -O2 -Wno-override-module '%s' -lm -lpthread -o '%s'", tmp_ll, output_file);
     int rc = system(cmd);
     remove(tmp_ll);
     return rc == 0 ? 0 : 1;
