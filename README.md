@@ -68,20 +68,21 @@ Benchmark suite (`perf/*.str`) comparing Python 3.14, memory-safe Stricta (`stri
 
 | Benchmark | Stricta (ms) | Python 3 (ms, ×) | C `clang -O2` (ms, ×) | Rust `-O2` (ms, ×) |
 |---|---:|---:|---:|---:|
-| `ackermann` | **7.58** | 1,490.75 (**196.7×**) | 6.40 (0.84×) | 8.56 (**1.13×**) |
-| `class_hierarchy` | **6.23** | 60.52 (**9.7×**) | 5.83 (0.94×) | 8.75 (**1.40×**) |
-| `collatz` | **101.89** | 5,126.51 (**50.3×**) | 102.04 (**1.00×**) | 104.32 (**1.02×**) |
-| `dict_manip` | **12.13** | 58.03 (**4.8×**) | 11.38 (0.94×) | 15.65 (**1.29×**) |
-| `fib_iterative` | **7.54** | 5,527.53 (**733.1×**) | 6.59 (0.87×) | 7.92 (**1.05×**) |
-| `fib_recursive` | **5.77** | 5,168.12 (**895.7×**) | 174.91 (**30.3×**) | 176.46 (**30.6×**) |
-| `leibniz` | **812.23** | 43,423.20 (**53.5×**) | 548.99 (0.68×) | 591.10 (0.73×) |
-| `matmult` | **26.90** | 5,390.25 (**200.4×**) | 5.61* (0.21×*) | 118.75 (**4.41×**) |
-| `pi_wallis` | **5.34** | 270.52 (**50.7×**) | 5.12 (0.96×) | 6.42 (**1.20×**) |
-| `set_ops` | **23.63** | 77.69 (**3.3×**) | 31.91 (**1.35×**) | 45.39 (**1.92×**) |
-| `sieve` | **11.92** | 143.22 (**12.0×**) | 11.98 (**1.01×**) | 13.07 (**1.10×**) |
-| `tree_structures` | **12.89** | 148.29 (**11.5×**) | 10.71 (0.83×) | 11.94 (0.93×) |
+| `ackermann` | **7.65** | 1,446.32 (**188.9×**) | 8.54 (**1.12×**) | 10.51 (**1.37×**) |
+| `class_hierarchy` | **7.54** | 63.93 (**8.5×**) | 8.29 (**1.10×**) | 9.61 (**1.27×**) |
+| `collatz` | **98.18** | 4,991.55 (**50.8×**) | 98.96 (**1.01×**) | 101.71 (**1.04×**) |
+| `dict_manip` | **12.22** | 57.95 (**4.7×**) | 12.14 (0.99×) | 17.71 (**1.45×**) |
+| `fib_iterative` | **8.30** | 5,229.56 (**630.3×**) | 7.15 (0.86×) | 8.49 (**1.02×**) |
+| `fib_recursive` | **157.50** | 5,139.58 (**32.6×**) | 158.58 (**1.01×**) | 160.06 (**1.02×**) |
+| `leibniz` | **526.92** | 42,341.75 (**80.4×**) | 526.15 (1.00×) | 548.39 (**1.04×**) |
+| `matmult` | **24.75** | 5,358.41 (**216.5×**) | 8.37* (0.34×*) | 116.26 (**4.70×**) |
+| `pi_wallis` | **7.53** | 270.66 (**35.9×**) | 7.50 (1.00×) | 9.52 (**1.26×**) |
+| `set_ops` | **21.66** | 76.65 (**3.5×**) | 28.97 (**1.34×**) | 43.16 (**1.99×**) |
+| `sieve` | **13.68** | 144.53 (**10.6×**) | 13.42 (0.98×) | 16.09 (**1.18×**) |
+| `tree_structures` | **14.03** | 149.50 (**10.7×**) | 13.98 (1.00×) | 16.01 (**1.14×**) |
+| **Total** | **899.96** | 65,270.39 (**72.5×**) | 892.05* (0.99×*) | 1,057.52 (**1.18×**) |
 
-*\*Note: `perf/matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (`5.61 ms`). Stricta executes the full loop-interchanged 512×512 multiplication in `26.90 ms` (`200.4×` faster than Python 3, `4.41×` faster than `perf/matmult.rs`).*
+*\*Note: `perf/matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (`8.37 ms`). Stricta executes the full loop-interchanged 512×512 multiplication in `24.75 ms` (`216.5×` faster than Python 3, `4.70×` faster than `perf/matmult.rs`).*
 
 **Memory Safety Performance Impact**: Compared against Stricta's prior unmanaged baseline (no drops, no bounds traps, `setjmp`/`longjmp` exceptions) on the same machine, adopting compile-time ownership/borrow checking, deterministic `@_drop_T` cleanup, bounds traps, and compiler-lowered `{ i1, T }` error propagation runs at **1.00× parity (~0.5% faster overall: `1,049.26 ms` vs `1,054.09 ms` across the 11 comparable benchmarks)**—gaining zero-leak memory safety with zero ARC or GC runtime overhead (`fib_iterative` +23%, `dict_manip` +12%, `pi_wallis` +53% from bounds-check elimination and stack-allocated drops).
 

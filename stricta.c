@@ -2050,6 +2050,7 @@ typedef struct VarSym {
     bool is_captured;
     bool is_param;
     bool is_nonneg;
+    const char* len_of_arr;
     const char* bound_arrs[4];
     int bound_arr_count;
     OwnState own_state;
@@ -3125,6 +3126,129 @@ static const char* expr_len_var(Expr* e) {
     return NULL;
 }
 
+static const char* expr_len_var_ctx(ModuleInfo* mod, FuncInfo* fn, Expr* e, const char** out_len_var) {
+    if (out_len_var) *out_len_var = NULL;
+    const char* direct = expr_len_var(e);
+    if (direct) return direct;
+    if (e && e->kind == EXPR_VAR && fn) {
+        VarSym* v = resolve_var(mod, fn, e->var.name, NULL);
+        if (v && v->len_of_arr) {
+            if (out_len_var) *out_len_var = v->name;
+            return v->len_of_arr;
+        }
+    }
+    return NULL;
+}
+
+static void invalidate_len_aliases(ModuleInfo* mod, FuncInfo* fn, const char* arr_name) {
+    if (!arr_name) return;
+    if (fn) {
+        for (int i = 0; i < fn->local_count; i++) {
+            if (fn->locals[i].len_of_arr && strcmp(fn->locals[i].len_of_arr, arr_name) == 0) {
+                fn->locals[i].len_of_arr = NULL;
+            }
+        }
+    }
+    if (mod) {
+        for (int i = 0; i < mod->global_count; i++) {
+            if (mod->globals[i].len_of_arr && strcmp(mod->globals[i].len_of_arr, arr_name) == 0) {
+                mod->globals[i].len_of_arr = NULL;
+            }
+        }
+    }
+}
+
+static bool expr_is_nonneg(ModuleInfo* mod, FuncInfo* fn, Expr* e);
+
+static void stmts_invalidate_nonneg(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) {
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        switch (s->kind) {
+            case STMT_ASSIGN:
+                if (s->assign.target->kind == EXPR_VAR) {
+                    const char* vn = s->assign.target->var.name;
+                    VarSym* v = resolve_var(mod, fn, vn, NULL);
+                    bool keeps_nn = false;
+                    Expr* val = s->assign.value;
+                    if (v && v->is_nonneg && val && val->kind == EXPR_BINOP) {
+                        const char* op = val->binop.op;
+                        if (strcmp(op, "+") == 0 &&
+                            ((val->binop.left->kind == EXPR_VAR && strcmp(val->binop.left->var.name, vn) == 0 && expr_is_nonneg(mod, fn, val->binop.right)) ||
+                             (val->binop.right->kind == EXPR_VAR && strcmp(val->binop.right->var.name, vn) == 0 && expr_is_nonneg(mod, fn, val->binop.left)))) {
+                            keeps_nn = true;
+                        } else if (strcmp(op, "//") == 0 && val->binop.left->kind == EXPR_VAR &&
+                                   strcmp(val->binop.left->var.name, vn) == 0 && expr_is_nonneg(mod, fn, val->binop.right)) {
+                            keeps_nn = true;
+                        }
+                    }
+                    if (v) {
+                        if (!keeps_nn) v->is_nonneg = false;
+                        v->len_of_arr = NULL;
+                    }
+                    invalidate_len_aliases(mod, fn, vn);
+                }
+                break;
+            case STMT_MULTI_ASSIGN:
+                for (int k = 0; k < s->multi_assign.target_count; k++) {
+                    if (s->multi_assign.targets[k]->kind == EXPR_VAR) {
+                        VarSym* v = resolve_var(mod, fn, s->multi_assign.targets[k]->var.name, NULL);
+                        if (v) { v->is_nonneg = false; v->len_of_arr = NULL; }
+                        invalidate_len_aliases(mod, fn, s->multi_assign.targets[k]->var.name);
+                    }
+                }
+                break;
+            case STMT_AUG_ASSIGN:
+                if (s->aug_assign.target->kind == EXPR_VAR) {
+                    VarSym* v = resolve_var(mod, fn, s->aug_assign.target->var.name, NULL);
+                    if (v) {
+                        if (strcmp(s->aug_assign.op, "+=") != 0 || !expr_is_nonneg(mod, fn, s->aug_assign.value)) {
+                            v->is_nonneg = false;
+                        }
+                        v->len_of_arr = NULL;
+                    }
+                    invalidate_len_aliases(mod, fn, s->aug_assign.target->var.name);
+                }
+                break;
+            case STMT_IF:
+                for (int b = 0; b < s->if_s.branch_count; b++) {
+                    stmts_invalidate_nonneg(mod, fn, s->if_s.bodies[b], s->if_s.body_counts[b]);
+                }
+                stmts_invalidate_nonneg(mod, fn, s->if_s.else_body, s->if_s.else_count);
+                break;
+            case STMT_WHILE:
+                stmts_invalidate_nonneg(mod, fn, s->while_s.body, s->while_s.body_count);
+                stmts_invalidate_nonneg(mod, fn, s->while_s.else_body, s->while_s.else_count);
+                break;
+            case STMT_FOR:
+                if (s->for_s.target_count == 1) {
+                    VarSym* lv = resolve_var(mod, fn, s->for_s.targets[0], NULL);
+                    if (lv) { lv->is_nonneg = false; lv->len_of_arr = NULL; }
+                }
+                stmts_invalidate_nonneg(mod, fn, s->for_s.body, s->for_s.body_count);
+                stmts_invalidate_nonneg(mod, fn, s->for_s.else_body, s->for_s.else_count);
+                break;
+            case STMT_TRY:
+                stmts_invalidate_nonneg(mod, fn, s->try_s.try_body, s->try_s.try_count);
+                for (int h = 0; h < s->try_s.handler_count; h++) {
+                    stmts_invalidate_nonneg(mod, fn, s->try_s.handlers[h].body, s->try_s.handlers[h].body_count);
+                }
+                stmts_invalidate_nonneg(mod, fn, s->try_s.else_body, s->try_s.else_count);
+                stmts_invalidate_nonneg(mod, fn, s->try_s.finally_body, s->try_s.finally_count);
+                break;
+            case STMT_WITH:
+                stmts_invalidate_nonneg(mod, fn, s->with_s.body, s->with_s.body_count);
+                break;
+            case STMT_MATCH:
+                for (int k = 0; k < s->match_s.case_count; k++) {
+                    stmts_invalidate_nonneg(mod, fn, s->match_s.cases[k].body, s->match_s.cases[k].body_count);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 static bool stmts_mutate_seq_len(Stmt** stmts, int count, const char* vname) {
     if (!vname) return true;
     for (int i = 0; i < count; i++) {
@@ -3574,6 +3698,9 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
         if (is_mutating_container_method(obj_ty, mname)) {
             error_at(call->loc, "cannot call mutating method '%s.%s()' through immutable reference", type_str(obj_ty), mname);
         }
+    }
+    if (obj_e && obj_e->kind == EXPR_VAR && obj_ty->kind == TY_LIST && is_mutating_container_method(obj_ty, mname)) {
+        invalidate_len_aliases(mod, fn, obj_e->var.name);
     }
 
     if (obj_ty->kind == TY_STR) {
@@ -4078,8 +4205,10 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 break;
             }
 
-            Type* lt = check_expr(mod, fn, e->binop.left, hint);
-            Type* rt = check_expr(mod, fn, e->binop.right, lt);
+            Type* l_hint = (strcmp(op, "/") == 0 || (hint && type_is_float(hint))) ? NULL : hint;
+            Type* lt = check_expr(mod, fn, e->binop.left, l_hint);
+            Type* r_hint = (strcmp(op, "/") == 0 || (lt && type_is_float(lt))) ? NULL : lt;
+            Type* rt = check_expr(mod, fn, e->binop.right, r_hint);
 
             if (lt->kind == TY_CLASS) {
                 const char* dunder = NULL;
@@ -4136,6 +4265,9 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 break;
             }
             res = numeric_common_type(lt, rt);
+            if ((strcmp(op, "%") == 0 || strcmp(op, "//") == 0) && type_is_signed_int(res)) {
+                e->is_nonneg = expr_is_nonneg(mod, fn, e->binop.left) && expr_is_nonneg(mod, fn, e->binop.right);
+            }
             break;
         }
         case EXPR_TERNARY: {
@@ -4771,9 +4903,13 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 }
 
                 FuncInfo* target_fn = NULL;
-                if (fn) {
+                for (FuncInfo* pf = fn; pf != NULL && !target_fn; pf = pf->parent_fn) {
+                    if (strcmp(pf->name, cname) == 0) {
+                        target_fn = pf;
+                        break;
+                    }
                     for (int i = 0; i < g_all_func_count; i++) {
-                        if (g_all_funcs[i]->parent_fn == fn && strcmp(g_all_funcs[i]->name, cname) == 0) {
+                        if (g_all_funcs[i]->parent_fn == pf && strcmp(g_all_funcs[i]->name, cname) == 0) {
                             target_fn = g_all_funcs[i]; break;
                         }
                     }
@@ -5197,16 +5333,19 @@ static void apply_cond_narrowing_pass(ModuleInfo* mod, FuncInfo* fn, Expr* cond,
             /* Check i < len(arr) or len(arr) > i when i is_nonneg */
             const char* idx_var = NULL;
             const char* arr_var = NULL;
+            const char* len_var = NULL;
             if (strcmp(op, "<") == 0 && L->kind == EXPR_VAR) {
-                arr_var = expr_len_var(R);
+                arr_var = expr_len_var_ctx(mod, fn, R, &len_var);
                 if (arr_var) idx_var = L->var.name;
             } else if (strcmp(op, ">") == 0 && R->kind == EXPR_VAR) {
-                arr_var = expr_len_var(L);
+                arr_var = expr_len_var_ctx(mod, fn, L, &len_var);
                 if (arr_var) idx_var = R->var.name;
             }
             if (idx_var && arr_var) {
                 VarSym* vs = resolve_var(mod, fn, idx_var, NULL);
-                if (vs && vs->is_nonneg && (!body || !stmts_mutate_seq_len(body, body_cnt, arr_var))) {
+                if (vs && vs->is_nonneg &&
+                    (!body || (!stmts_mutate_seq_len(body, body_cnt, arr_var) &&
+                               (!len_var || !stmts_mutate_seq_len(body, body_cnt, len_var))))) {
                     save_narrow(vs, saved, saved_cnt, max_saved);
                     var_add_bound(vs, arr_var);
                 }
@@ -5552,7 +5691,21 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                         bind_var(mod, fn, vname, vt, s->loc);
                     }
                     VarSym* bv = resolve_var(mod, fn, vname, NULL);
-                    if (bv) bv->is_nonneg = expr_is_nonneg(mod, fn, s->assign.value);
+                    if (bv) {
+                        bv->is_nonneg = expr_is_nonneg(mod, fn, s->assign.value);
+                        bv->len_of_arr = expr_len_var(s->assign.value);
+                    }
+                    invalidate_len_aliases(mod, fn, vname);
+                    if (s->assign.value->kind == EXPR_LISTCOMP && s->assign.value->comp.gen_count == 1 &&
+                        s->assign.value->comp.gens[0].if_count == 0) {
+                        Expr* cit = s->assign.value->comp.gens[0].iter;
+                        if (cit && cit->kind == EXPR_CALL && cit->call.callee->kind == EXPR_VAR &&
+                            strcmp(cit->call.callee->var.name, "range") == 0 && cit->call.arg_count == 1 &&
+                            cit->call.args[0]->kind == EXPR_VAR) {
+                            VarSym* nv = resolve_var(mod, fn, cit->call.args[0]->var.name, NULL);
+                            if (nv && !nv->is_global) nv->len_of_arr = vname;
+                        }
+                    }
                 } else if (is_val_builtin_call(mod, fn, tgt)) {
                     Type* tt = check_expr(mod, fn, tgt, NULL);
                     if (!expr_is_mutable_place(mod, fn, tgt)) {
@@ -5648,9 +5801,13 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                 Type* vt = check_expr(mod, fn, s->aug_assign.value, tt);
                 if (s->aug_assign.target->kind == EXPR_VAR) {
                     VarSym* bv = resolve_var(mod, fn, s->aug_assign.target->var.name, NULL);
-                    if (bv && (strcmp(s->aug_assign.op, "+=") != 0 || !expr_is_nonneg(mod, fn, s->aug_assign.value))) {
-                        bv->is_nonneg = false;
+                    if (bv) {
+                        if (strcmp(s->aug_assign.op, "+=") != 0 || !expr_is_nonneg(mod, fn, s->aug_assign.value)) {
+                            bv->is_nonneg = false;
+                        }
+                        bv->len_of_arr = NULL;
                     }
+                    invalidate_len_aliases(mod, fn, s->aug_assign.target->var.name);
                 }
                 if (tt->kind == TY_SET && type_eq(tt, vt)) break;
                 if (tt->kind == TY_STR && vt->kind == TY_STR && strcmp(s->aug_assign.op, "+=") == 0) break;
@@ -5690,6 +5847,7 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                 break;
             }
             case STMT_WHILE: {
+                stmts_invalidate_nonneg(mod, fn, s->while_s.body, s->while_s.body_count);
                 check_expr(mod, fn, s->while_s.cond, g_ty_bool);
                 NarrowEntry w_saved[16];
                 int w_cnt = 0;
@@ -5700,6 +5858,7 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                 break;
             }
             case STMT_FOR: {
+                stmts_invalidate_nonneg(mod, fn, s->for_s.body, s->for_s.body_count);
                 Expr* it = s->for_s.iter;
                 bool set_nn = false;
                 bool prev_nn = false;
@@ -5726,12 +5885,14 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                         loop_v->is_nonneg = nn;
                         set_nn = true;
                         const char* b_arr = NULL;
-                        if (ac == 1) b_arr = expr_len_var(it->call.args[0]);
+                        const char* l_var = NULL;
+                        if (ac == 1) b_arr = expr_len_var_ctx(mod, fn, it->call.args[0], &l_var);
                         else if (ac == 2 && it->call.args[0]->kind == EXPR_INT && !it->call.args[0]->int_lit.is_big &&
                                  it->call.args[0]->int_lit.ival >= 0) {
-                            b_arr = expr_len_var(it->call.args[1]);
+                            b_arr = expr_len_var_ctx(mod, fn, it->call.args[1], &l_var);
                         }
-                        if (b_arr && !stmts_mutate_seq_len(s->for_s.body, s->for_s.body_count, b_arr)) {
+                        if (b_arr && !stmts_mutate_seq_len(s->for_s.body, s->for_s.body_count, b_arr) &&
+                            (!l_var || !stmts_mutate_seq_len(s->for_s.body, s->for_s.body_count, l_var))) {
                             var_add_bound(loop_v, b_arr);
                         }
                     }
@@ -5808,6 +5969,7 @@ static void check_stmts(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) 
                     Type* ot = check_expr(mod, fn, dt->index.obj, NULL);
                     if (ot->kind == TY_LIST) {
                         if (!type_is_int(check_expr(mod, fn, dt->index.index, g_ty_i64))) error_at(dt->loc, "index must be int");
+                        if (dt->index.obj->kind == EXPR_VAR) invalidate_len_aliases(mod, fn, dt->index.obj->var.name);
                     } else if (ot->kind == TY_DICT) {
                         Type* kt = check_expr(mod, fn, dt->index.index, ot->key);
                         if (!type_assignable(ot->key, kt)) error_at(dt->loc, "dict key type mismatch");
@@ -7655,14 +7817,16 @@ static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, 
                     }
                     goto call_release_borrows;
                 }
-                FuncInfo* tf = e->call.resolved_fn ? e->call.resolved_fn : find_func_in_mod(mod, cname);
-                if (!tf && fn) {
+                FuncInfo* tf = e->call.resolved_fn;
+                for (FuncInfo* pf = fn; pf != NULL && !tf; pf = pf->parent_fn) {
+                    if (strcmp(pf->name, cname) == 0) { tf = pf; break; }
                     for (int i = 0; i < g_all_func_count; i++) {
-                        if (g_all_funcs[i]->parent_fn == fn && strcmp(g_all_funcs[i]->name, cname) == 0) {
+                        if (g_all_funcs[i]->parent_fn == pf && strcmp(g_all_funcs[i]->name, cname) == 0) {
                             tf = g_all_funcs[i]; break;
                         }
                     }
                 }
+                if (!tf) tf = find_func_in_mod(mod, cname);
                 if (tf && tf->param_modes) {
                     for (int i = 0; i < e->call.arg_count && i < tf->param_count; i++) {
                         ParamMode pm = tf->param_modes[i];
@@ -8965,26 +9129,30 @@ static void emit_mono_list(Type* lt) {
     StrBuf* b = &g_cg.mono;
     const char* esz = arena_sprintf("ptrtoint (ptr getelementptr (%s, ptr null, i32 1) to i64)", mty);
 
-    /* new */
-    sb_printf(b, "define internal ptr @_%s_new(i32 %%cap) alwaysinline {\nentry:\n", m);
+    /* new (cap <= 0 avoids allocating the backing array until first append) */
+    sb_printf(b, "define internal noalias ptr @_%s_new(i32 %%cap) alwaysinline {\nentry:\n", m);
     sb_printf(b, "  %%sz = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64\n", sty);
     sb_append(b, "  %p = call ptr @malloc(i64 %sz)\n");
-    sb_append(b, "  %c = call i32 @llvm.smax.i32(i32 %cap, i32 4)\n");
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%p, i32 0, i32 0\n  store i32 0, ptr %%lp\n", sty);
-    sb_printf(b, "  %%cp = getelementptr %s, ptr %%p, i32 0, i32 1\n  store i32 %%c, ptr %%cp\n", sty);
+    sb_printf(b, "  %%cp = getelementptr %s, ptr %%p, i32 0, i32 1\n", sty);
+    sb_printf(b, "  %%ip = getelementptr %s, ptr %%p, i32 0, i32 2\n", sty);
+    sb_append(b, "  %zcap = icmp sle i32 %cap, 0\n  br i1 %zcap, label %empty, label %alloc_buf\nempty:\n");
+    sb_append(b, "  store i32 0, ptr %cp\n  store ptr null, ptr %ip\n  ret ptr %p\nalloc_buf:\n");
+    sb_append(b, "  %c = call i32 @llvm.smax.i32(i32 %cap, i32 4)\n");
+    sb_append(b, "  store i32 %c, ptr %cp\n");
     sb_append(b, "  %c64 = sext i32 %c to i64\n");
     sb_printf(b, "  %%bytes = mul i64 %%c64, %s\n", esz);
     sb_append(b, "  %arr = call ptr @malloc(i64 %bytes)\n");
-    sb_printf(b, "  %%ip = getelementptr %s, ptr %%p, i32 0, i32 2\n  store ptr %%arr, ptr %%ip\n", sty);
+    sb_append(b, "  store ptr %arr, ptr %ip\n");
     sb_append(b, "  ret ptr %p\n}\n\n");
 
-    /* append (supports negative cap = stack-backed inline buffer that spills cleanly to heap on overflow) */
+    /* append (supports cap == 0 lazy alloc and negative cap = stack-backed inline buffer that spills cleanly to heap on overflow) */
     sb_printf(b, "define internal void @_%s_append(ptr %%l, %s %%val) alwaysinline {\nentry:\n", m, mty);
     sb_printf(b, "  %%lp = getelementptr %s, ptr %%l, i32 0, i32 0\n  %%len = load i32, ptr %%lp\n", sty);
     sb_printf(b, "  %%cp = getelementptr %s, ptr %%l, i32 0, i32 1\n  %%cap = load i32, ptr %%cp\n", sty);
     sb_append(b, "  %is_stk = icmp slt i32 %cap, 0\n  %neg_cap = sub i32 0, %cap\n  %acap = select i1 %is_stk, i32 %neg_cap, i32 %cap\n");
     sb_append(b, "  %full = icmp sge i32 %len, %acap\n  br i1 %full, label %grow, label %ok\ngrow:\n");
-    sb_append(b, "  %ncap = mul i32 %acap, 2\n  store i32 %ncap, ptr %cp\n  %nc64 = sext i32 %ncap to i64\n");
+    sb_append(b, "  %is_z = icmp eq i32 %acap, 0\n  %ncap0 = mul i32 %acap, 2\n  %ncap = select i1 %is_z, i32 4, i32 %ncap0\n  store i32 %ncap, ptr %cp\n  %nc64 = sext i32 %ncap to i64\n");
     sb_printf(b, "  %%nb = mul i64 %%nc64, %s\n", esz);
     sb_printf(b, "  %%ip1 = getelementptr %s, ptr %%l, i32 0, i32 2\n  %%old = load ptr, ptr %%ip1\n", sty);
     sb_append(b, "  br i1 %is_stk, label %grow_stk, label %grow_heap\ngrow_stk:\n");
@@ -9129,9 +9297,10 @@ static void emit_mono_list(Type* lt) {
         sb_printf(b, "  %%cv = call %s @_clone_%s(%s %%sv)\n", mty, el->mangled, mty);
         sb_printf(b, "  %%dp = getelementptr %s, ptr %%dst, i32 %%i\n  store %s %%cv, ptr %%dp\n  %%in = add i32 %%i, 1\n  br label %%loop\ndone:\n  ret ptr %%res\n}\n\n", mty, mty);
     } else {
+        sb_append(b, "  %nz = icmp sgt i32 %len, 0\n  br i1 %nz, label %docp, label %done\ndocp:\n");
         sb_append(b, "  %len64 = sext i32 %len to i64\n");
         sb_printf(b, "  %%nb = mul i64 %%len64, %s\n", esz);
-        sb_append(b, "  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 %nb, i1 false)\n  ret ptr %res\n}\n\n");
+        sb_append(b, "  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 %nb, i1 false)\n  br label %done\ndone:\n  ret ptr %res\n}\n\n");
     }
 
     /* extend */
@@ -10432,7 +10601,7 @@ static void cg_print_val(const char* val, Type* t) {
     }
 }
 
-static const char* cg_binop_values(const char* op, const char* lv, Type* lt, const char* rv, Type* rt, Type* res_ty) {
+static const char* cg_binop_values_opt(const char* op, const char* lv, Type* lt, const char* rv, Type* rt, Type* res_ty, bool nonneg_div) {
     if (strcmp(op, "is") == 0 || strcmp(op, "is not") == 0) {
         bool neg = (strcmp(op, "is not") == 0);
         const char* r = cg_reg();
@@ -10464,7 +10633,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
         bool is_ne = (strcmp(op, "!=") == 0);
         if ((strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) &&
             (rt->kind == TY_NONE_LIT || lt->kind == TY_NONE_LIT)) {
-            return cg_binop_values(is_ne ? "is not" : "is", lv, lt, rv, rt, g_ty_bool);
+            return cg_binop_values_opt(is_ne ? "is not" : "is", lv, lt, rv, rt, g_ty_bool, false);
         }
         if (lt->kind == TY_CLASS) {
             const char* dunder = NULL;
@@ -10491,7 +10660,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
             }
         }
         if ((lt->kind == TY_OPTIONAL && rt->kind == TY_NONE_LIT) || (rt->kind == TY_OPTIONAL && lt->kind == TY_NONE_LIT)) {
-            return cg_binop_values(is_ne ? "is not" : "is", lv, lt, rv, rt, g_ty_bool);
+            return cg_binop_values_opt(is_ne ? "is not" : "is", lv, lt, rv, rt, g_ty_bool, false);
         }
         if (lt->kind == TY_STR && rt->kind == TY_STR) {
             const char* c = cg_reg();
@@ -10693,7 +10862,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
         return r;
     }
 
-    bool uns = type_is_unsigned_int(ct);
+    bool uns = type_is_unsigned_int(ct) || nonneg_div;
     if (strcmp(op, "+") == 0) cg_emit("%s = add %s %s, %s", r, llt, lc, rc);
     else if (strcmp(op, "-") == 0) cg_emit("%s = sub %s %s, %s", r, llt, lc, rc);
     else if (strcmp(op, "*") == 0) cg_emit("%s = mul %s %s, %s", r, llt, lc, rc);
@@ -10701,7 +10870,7 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
     else if (strcmp(op, "|") == 0) cg_emit("%s = or %s %s, %s", r, llt, lc, rc);
     else if (strcmp(op, "^") == 0) cg_emit("%s = xor %s %s, %s", r, llt, lc, rc);
     else if (strcmp(op, "<<") == 0) cg_emit("%s = shl %s %s, %s", r, llt, lc, rc);
-    else if (strcmp(op, ">>") == 0) cg_emit("%s = %s %s %s, %s", r, uns ? "lshr" : "ashr", llt, lc, rc);
+    else if (strcmp(op, ">>") == 0) cg_emit("%s = %s %s %s, %s", r, type_is_unsigned_int(ct) ? "lshr" : "ashr", llt, lc, rc);
     else if (strcmp(op, "//") == 0) {
         if (uns) { cg_emit("%s = udiv %s %s, %s", r, llt, lc, rc); }
         else {
@@ -10736,6 +10905,10 @@ static const char* cg_binop_values(const char* op, const char* lv, Type* lt, con
         return cg_coerce(p, g_ty_i64, ct);
     }
     return r;
+}
+
+static const char* cg_binop_values(const char* op, const char* lv, Type* lt, const char* rv, Type* rt, Type* res_ty) {
+    return cg_binop_values_opt(op, lv, lt, rv, rt, res_ty, false);
 }
 
 static const char* cg_construct_class_at(ClassInfo* cls, Expr** args, int argc, const char* prealloc_obj) {
@@ -10836,6 +11009,47 @@ static const char* cg_construct_class(ClassInfo* cls, Expr** args, int argc) {
     return cg_construct_class_at(cls, args, argc, NULL);
 }
 
+static bool stmts_mutate_or_jump_var(Stmt** stmts, int count, const char* vname) {
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        switch (s->kind) {
+            case STMT_BREAK: case STMT_CONTINUE: case STMT_RETURN: case STMT_RAISE:
+                return true;
+            case STMT_ASSIGN:
+                if (s->assign.target->kind == EXPR_VAR && strcmp(s->assign.target->var.name, vname) == 0) return true;
+                break;
+            case STMT_MULTI_ASSIGN:
+                for (int k = 0; k < s->multi_assign.target_count; k++) {
+                    if (s->multi_assign.targets[k]->kind == EXPR_VAR &&
+                        strcmp(s->multi_assign.targets[k]->var.name, vname) == 0) return true;
+                }
+                break;
+            case STMT_AUG_ASSIGN:
+                if (s->aug_assign.target->kind == EXPR_VAR && strcmp(s->aug_assign.target->var.name, vname) == 0) return true;
+                break;
+            case STMT_IF:
+                for (int b = 0; b < s->if_s.branch_count; b++) {
+                    if (stmts_mutate_or_jump_var(s->if_s.bodies[b], s->if_s.body_counts[b], vname)) return true;
+                }
+                if (stmts_mutate_or_jump_var(s->if_s.else_body, s->if_s.else_count, vname)) return true;
+                break;
+            case STMT_WHILE:
+                if (stmts_mutate_or_jump_var(s->while_s.body, s->while_s.body_count, vname) ||
+                    stmts_mutate_or_jump_var(s->while_s.else_body, s->while_s.else_count, vname)) return true;
+                break;
+            case STMT_FOR:
+                if (s->for_s.target_count > 0 && strcmp(s->for_s.targets[0], vname) == 0) return true;
+                if (stmts_mutate_or_jump_var(s->for_s.body, s->for_s.body_count, vname) ||
+                    stmts_mutate_or_jump_var(s->for_s.else_body, s->for_s.else_count, vname)) return true;
+                break;
+            case STMT_TRY: case STMT_WITH: case STMT_MATCH:
+                return true;
+            default: break;
+        }
+    }
+    return false;
+}
+
 static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, Stmt** body, int body_count,
                          const char* else_lbl, const char* after_lbl) {
     /* Fast path: range(...) */
@@ -10857,6 +11071,33 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
         const char* idx_p = cg_reg();
         cg_entry("%s = alloca i64", idx_p);
         cg_emit("store i64 %s, ptr %s", start_v, idx_p);
+
+        /* Recognize top-of-loop alternating sign recurrence `x = -x` so LLVM can vectorize the loop */
+        const char* alt_ptr = NULL;
+        Type* alt_ty = NULL;
+        const char* alt_init = NULL;
+        const char* alt_neg = NULL;
+        if (ac <= 2 && body_count >= 1 && body[0]->kind == STMT_ASSIGN &&
+            body[0]->assign.target->kind == EXPR_VAR &&
+            body[0]->assign.value->kind == EXPR_UNOP && strcmp(body[0]->assign.value->unop.op, "-") == 0 &&
+            body[0]->assign.value->unop.operand->kind == EXPR_VAR &&
+            strcmp(body[0]->assign.target->var.name, body[0]->assign.value->unop.operand->var.name) == 0 &&
+            strcmp(body[0]->assign.target->var.name, targets[0]) != 0) {
+            const char* xname = body[0]->assign.target->var.name;
+            VarSym* xs = cg_find_var_sym(xname);
+            if (xs && !xs->is_global && !xs->is_captured &&
+                (xs->type->kind == TY_F64 || xs->type->kind == TY_F32 || xs->type->kind == TY_I64) &&
+                !stmts_mutate_or_jump_var(body + 1, body_count - 1, xname)) {
+                alt_ptr = cg_var_ptr(xname, &alt_ty);
+                const char* lty = llvm_reg_ty(alt_ty);
+                alt_init = cg_reg();
+                alt_neg = cg_reg();
+                cg_emit("%s = load %s, ptr %s", alt_init, lty, alt_ptr);
+                if (type_is_float(alt_ty)) cg_emit("%s = fneg %s %s", alt_neg, lty, alt_init);
+                else cg_emit("%s = sub %s 0, %s", alt_neg, lty, alt_init);
+            }
+        }
+
         const char* l_cond = cg_lbl("for_cond");
         const char* l_body = cg_lbl("for_body");
         const char* l_step = cg_lbl("for_step");
@@ -10873,8 +11114,18 @@ static void cg_iter_loop(Expr* iter_e, const char** targets, int target_count, S
         cg_cond_br(c, l_body, else_lbl ? else_lbl : after_lbl);
         cg_label(l_body);
         cg_emit("store i64 %s, ptr %s", cg_coerce(cur, g_ty_i64, vt), vp);
+        if (alt_ptr) {
+            const char* diff = cg_reg(); const char* par = cg_reg();
+            const char* is_ev = cg_reg(); const char* av = cg_reg();
+            const char* lty = llvm_reg_ty(alt_ty);
+            cg_emit("%s = sub i64 %s, %s", diff, cur, start_v);
+            cg_emit("%s = and i64 %s, 1", par, diff);
+            cg_emit("%s = icmp eq i64 %s, 0", is_ev, par);
+            cg_emit("%s = select i1 %s, %s %s, %s %s", av, is_ev, lty, alt_neg, lty, alt_init);
+            cg_emit("store %s %s, ptr %s", lty, av, alt_ptr);
+        }
         g_cg.loop_stack[g_cg.loop_depth++] = (LoopCtx){after_lbl, l_step, NULL, NULL, g_cg.temp_count};
-        cg_stmts(body, body_count);
+        cg_stmts(alt_ptr ? body + 1 : body, alt_ptr ? body_count - 1 : body_count);
         g_cg.loop_depth--;
         cg_br(l_step);
         cg_label(l_step);
@@ -12156,7 +12407,7 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
             }
             const char* lv = cg_expr(e->binop.left, NULL);
             const char* rv = cg_expr(e->binop.right, e->binop.left->ty);
-            return cg_binop_values(op, lv, e->binop.left->ty, rv, e->binop.right->ty, ty);
+            return cg_binop_values_opt(op, lv, e->binop.left->ty, rv, e->binop.right->ty, ty, e->is_nonneg);
         }
         case EXPR_TERNARY: {
             const char* cond = cg_truthy(cg_expr(e->ternary.cond, g_ty_bool), e->ternary.cond->ty);
@@ -12205,7 +12456,7 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
         }
         case EXPR_LIST: {
             const char* l = cg_reg();
-            int cap = e->seq.count > 4 ? e->seq.count : 4;
+            int cap = e->seq.count;
             cg_emit("%s = call ptr @_%s_new(i32 %d)", l, ty->mangled, cap);
             for (int i = 0; i < e->seq.count; i++) {
                 const char* raw_iv = cg_expr(e->seq.items[i], ty->elem);
@@ -12919,7 +13170,7 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                 }
                 if (strcmp(cname, "list") == 0 || strcmp(cname, "iter") == 0 || strcmp(cname, "tuple") == 0) {
                     if (argc == 0) {
-                        const char* r = cg_reg(); cg_emit("%s = call ptr @_%s_new(i32 4)", r, ty->mangled); return r;
+                        const char* r = cg_reg(); cg_emit("%s = call ptr @_%s_new(i32 0)", r, ty->mangled); return r;
                     }
                     const char* av = cg_expr(args[0], NULL);
                     Type* at = args[0]->ty;
@@ -13155,9 +13406,10 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
 
                 /* Direct function call (nested or module) */
                 FuncInfo* target_fn = e->call.resolved_fn;
-                if (!target_fn && g_cg.cur_fn) {
+                for (FuncInfo* pf = g_cg.cur_fn; pf != NULL && !target_fn; pf = pf->parent_fn) {
+                    if (strcmp(pf->name, cname) == 0) { target_fn = pf; break; }
                     for (int i = 0; i < g_all_func_count; i++) {
-                        if (g_all_funcs[i]->parent_fn == g_cg.cur_fn && strcmp(g_all_funcs[i]->name, cname) == 0) {
+                        if (g_all_funcs[i]->parent_fn == pf && strcmp(g_all_funcs[i]->name, cname) == 0) {
                             target_fn = g_all_funcs[i]; break;
                         }
                     }
@@ -14831,7 +15083,7 @@ static void emit_llvm_rt_core(StrBuf* b) {
 
     /* Memory helpers */
     sb_append(b,
-        "define internal ptr @stricta_alloc(i64 %sz) {\nentry:\n"
+        "define internal noalias ptr @stricta_alloc(i64 %sz) {\nentry:\n"
         "  %nz = icmp eq i64 %sz, 0\n"
         "  %rsz = select i1 %nz, i64 1, i64 %sz\n"
         "  %p = call ptr @malloc(i64 %rsz)\n"
@@ -14840,7 +15092,7 @@ static void emit_llvm_rt_core(StrBuf* b) {
         "  %e = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_oom)\n"
         "  call void @exit(i32 1)\n  unreachable\ndone:\n  ret ptr %p\n}\n\n");
     sb_append(b,
-        "define internal ptr @stricta_calloc(i64 %cnt, i64 %sz) {\nentry:\n"
+        "define internal noalias ptr @stricta_calloc(i64 %cnt, i64 %sz) {\nentry:\n"
         "  %c0 = icmp eq i64 %cnt, 0\n  %rc = select i1 %c0, i64 1, i64 %cnt\n"
         "  %s0 = icmp eq i64 %sz, 0\n  %rs = select i1 %s0, i64 1, i64 %sz\n"
         "  %p = call ptr @calloc(i64 %rc, i64 %rs)\n"
