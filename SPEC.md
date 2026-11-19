@@ -25,7 +25,7 @@ Stricta enforces strict static types on all bindings, parameters, fields, and co
 - `tuple[T1, T2, ...]` (`Tuple[...]`): Unboxed LLVM value struct (`%Tuple_...`).
 - `T | None` (`Optional[T]`): Nullable pointer for reference types (`str`, classes, containers, pointers), or `{ i8, T }` tagged struct for value types.
 - `Callable[[ArgTypes...], RetType]`: Typed function pointer.
-- `Task[T]`: Concurrent `pthread`-backed async task handle returned by `async def` functions and consumed via `await`.
+- `Task[T]`: Stackless LLVM coroutine handle (`presplitcoroutine` + `llvm.coro.*`) returned by `async def` functions and consumed via `await`.
 - **Safe References & Raw Addresses** *(Stricta extensions beyond Python)*:
   - `ref[T]` (also written `ref[const T]`): Non-null shared immutable reference to a `T`.
   - `mut_ref[T]` (also written `ref[mut T]`): Non-null exclusive mutable reference to a `T`.
@@ -42,7 +42,7 @@ Stricta adds several zero-overhead static types that do not exist in standard Py
 | `f32`, `f64` | `f32(x)`, `f64(x)` | IEEE-754 single-precision (`float` in LLVM) and double-precision (`double`, `float` alias) floats. |
 | `bigint` | `bigint(x)` | Heap-allocated arbitrary-precision signed integer (`+`, `-`, `*`, `//`, `%`, `**`, `abs`, comparisons, `str`). |
 | `File` | `open(path, mode="r")` | Owned file handle supporting `.read()`, `.write()`, `.close()`, and `with open(...) as f:`. |
-| `Task[T]` | `async def` + `await` | Owned concurrency handle; spawns a `pthread` worker taking ownership (`MOVE`) of owned arguments and returns `T` on `await` (or joins/drops deterministically if un-awaited). |
+| `Task[T]` | `async def` + `await` | Owned LLVM coroutine handle (`presplitcoroutine`); takes ownership (`MOVE`) of owned arguments, suspends cooperatively at `await` / `_coro_yield()`, steps via `_task_step()` / `_task_is_done()` for event loops (`asyncio` in `strlib`), returns `T` on `await`, and destroys/drops locals deterministically via `llvm.coro.destroy` if un-awaited. |
 | `ref[T]` | `x.ref` | Non-null shared immutable reference checked by the borrow checker (multiple `ref[T]` allowed; no mutation while live; cannot outlive local stack/owner). |
 | `mut_ref[T]` / `ref[mut T]` | `x.mut_ref` | Non-null exclusive mutable reference (move-only on assignment, reborrowed across calls; forbids aliasing or accessing the owner while live; cannot outlive local stack/owner). |
 | `addr[T]` | `x.addr` | Raw address/pointer (`addr[const T]` / `addr[mut T]` accepted). Not borrow-checked and storable in class fields and containers (`list[addr[T]]`), convertible to integers via `int(p)` / `u64(p)` and formatted as hex via `str(p)` / `hex(p)`. |
@@ -101,7 +101,7 @@ Because values have a single owner and cannot be implicitly aliased across mutab
 
 ## 5. Compiler Architecture
 
-- **`stricta.c`**: Single-file C11 compiler containing the arena allocator, indentation lexer, recursive-descent parser, strict semantic/type analyzer, ownership/borrow checker, monomorphization registry, and self-contained LLVM IR code generator (emitting runtime primitives for UTF-8 strings, `bytes`, `bigint`, `File` I/O, thread-local exceptions, bounds traps, and `pthread` tasks directly against libc, with zero NaN-boxing, ARC, or GC).
+- **`stricta.c`**: Single-file C11 compiler containing the arena allocator, indentation lexer, recursive-descent parser, strict semantic/type analyzer, ownership/borrow checker, monomorphization registry, and self-contained LLVM IR code generator (emitting runtime primitives for UTF-8 strings, `bytes`, `bigint`, `File` I/O, thread-local exceptions, bounds traps, and LLVM coroutines directly against libc, with zero NaN-boxing, ARC, or GC).
 - **Build & Test**:
   ```bash
   make       # builds ./stricta from stricta.c

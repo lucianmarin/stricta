@@ -4828,6 +4828,17 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                     if (argc == 1 && check_expr(mod, fn, args[0], g_ty_str)->kind != TY_STR) error_at(args[0]->loc, "prompt must be str");
                     res = g_ty_str; break;
                 }
+                if (strcmp(cname, "_coro_yield") == 0) {
+                    if (argc != 0) error_at(e->loc, "_coro_yield() takes 0 arguments");
+                    if (!fn || !fn->is_async) error_at(e->loc, "_coro_yield() can only be used inside async def");
+                    res = g_ty_void; break;
+                }
+                if (strcmp(cname, "_task_step") == 0 || strcmp(cname, "_task_is_done") == 0) {
+                    if (argc != 1) error_at(e->loc, "%s() takes 1 argument", cname);
+                    Type* tt = check_expr(mod, fn, args[0], NULL);
+                    if (!tt || tt->kind != TY_TASK) error_at(args[0]->loc, "%s() argument must be a Task", cname);
+                    res = g_ty_bool; break;
+                }
                 if (strcmp(cname, "isinstance") == 0) {
                     if (argc != 2) error_at(e->loc, "isinstance() takes 2 arguments");
                     check_expr(mod, fn, args[0], NULL);
@@ -12316,7 +12327,29 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
             cg_consume_expr(e->await_e.expr, tv);
             Type* inner = e->ty;
             const char* bits = cg_reg();
-            cg_emit("%s = call i64 @stricta_task_await(ptr %s)", bits, tv);
+            if (g_cg.cur_fn && g_cg.cur_fn->is_async) {
+                const char* l_loop = cg_lbl("await_loop");
+                const char* l_susp = cg_lbl("await_susp");
+                const char* l_canc = cg_lbl("await_canc");
+                const char* l_done = cg_lbl("await_done");
+                cg_br(l_loop);
+                cg_label(l_loop);
+                const char* done_r = cg_reg();
+                cg_emit("%s = call i1 @stricta_task_step(ptr %s)", done_r, tv);
+                cg_cond_br(done_r, l_done, l_susp);
+                cg_label(l_susp);
+                const char* sw = cg_reg();
+                cg_emit("%s = call i8 @llvm.coro.suspend(token none, i1 false)", sw);
+                cg_emit("switch i8 %s, label %%__coro_suspend [i8 0, label %%%s i8 1, label %%%s]", sw, l_loop, l_canc);
+                g_cg.block_terminated = true;
+                cg_label(l_canc);
+                cg_emit("call void @stricta_task_free(ptr %s)", tv);
+                cg_br("__coro_cleanup");
+                cg_label(l_done);
+                cg_emit("%s = call i64 @stricta_task_take_result(ptr %s)", bits, tv);
+            } else {
+                cg_emit("%s = call i64 @stricta_task_await(ptr %s)", bits, tv);
+            }
             const char* tid = cg_reg();
             cg_emit("%s = call i32 @stricta_exc_type_id()", tid);
             const char* has_e = cg_reg();
@@ -13379,6 +13412,29 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                     const char* p = (argc == 1) ? cg_expr(args[0], g_ty_str) : "null";
                     const char* r = cg_reg(); cg_emit("%s = call ptr @stricta_input(ptr %s)", r, p); return r;
                 }
+                if (strcmp(cname, "_coro_yield") == 0) {
+                    if (g_cg.cur_fn && g_cg.cur_fn->is_async) {
+                        const char* sw = cg_reg();
+                        const char* l_res = cg_lbl("coro_res");
+                        cg_emit("%s = call i8 @llvm.coro.suspend(token none, i1 false)", sw);
+                        cg_emit("switch i8 %s, label %%__coro_suspend [i8 0, label %%%s i8 1, label %%__coro_cleanup]", sw, l_res);
+                        g_cg.block_terminated = true;
+                        cg_label(l_res);
+                    }
+                    return "0";
+                }
+                if (strcmp(cname, "_task_step") == 0) {
+                    const char* tv = cg_expr(args[0], NULL);
+                    const char* r = cg_reg();
+                    cg_emit("%s = call i1 @stricta_task_step(ptr %s)", r, tv);
+                    return r;
+                }
+                if (strcmp(cname, "_task_is_done") == 0) {
+                    const char* tv = cg_expr(args[0], NULL);
+                    const char* r = cg_reg();
+                    cg_emit("%s = call i1 @stricta_task_is_done(ptr %s)", r, tv);
+                    return r;
+                }
                 if (strcmp(cname, "isinstance") == 0) {
                     const char* ov = cg_expr(args[0], NULL);
                     ClassInfo* target = find_class_in_mod(g_cg.cur_mod, args[1]->var.name);
@@ -13706,7 +13762,47 @@ static void cg_stmts(Stmt** stmts, int count) {
                 }
                 cg_flush_temps_preserve(0);
                 cg_drop_all_fn_locals(g_cg.cur_fn);
-                if (g_cg.cur_fn->can_raise) {
+                if (g_cg.cur_fn->is_async) {
+                    if (!rt || rt->kind == TY_VOID) {
+                        cg_emit("call void @stricta_task_finish(ptr %%__task, i64 0)");
+                    } else if (rt->kind == TY_BOOL) {
+                        const char* bits = cg_reg();
+                        cg_emit("%s = zext i1 %s to i64", bits, rv);
+                        cg_emit("call void @stricta_task_finish(ptr %%__task, i64 %s)", bits);
+                    } else if (type_is_int(rt)) {
+                        if (rt->kind == TY_I64 || rt->kind == TY_U64) {
+                            cg_emit("call void @stricta_task_finish(ptr %%__task, i64 %s)", rv);
+                        } else {
+                            const char* bits = cg_reg();
+                            const char* ext = type_is_unsigned_int(rt) ? "zext" : "sext";
+                            cg_emit("%s = %s %s %s to i64", bits, ext, llvm_reg_ty(rt), rv);
+                            cg_emit("call void @stricta_task_finish(ptr %%__task, i64 %s)", bits);
+                        }
+                    } else if (rt->kind == TY_F64) {
+                        const char* bits = cg_reg();
+                        cg_emit("%s = bitcast double %s to i64", bits, rv);
+                        cg_emit("call void @stricta_task_finish(ptr %%__task, i64 %s)", bits);
+                    } else if (rt->kind == TY_F32) {
+                        const char* d = cg_reg(); const char* bits = cg_reg();
+                        cg_emit("%s = fpext float %s to double", d, rv);
+                        cg_emit("%s = bitcast double %s to i64", bits, d);
+                        cg_emit("call void @stricta_task_finish(ptr %%__task, i64 %s)", bits);
+                    } else if (rt->kind == TY_TUPLE || (rt->kind == TY_OPTIONAL && !type_is_heap_ref(rt->elem)) ||
+                               (rt->kind == TY_CLASS && rt->cls->is_value_type)) {
+                        const char* mty = llvm_mem_ty(rt);
+                        const char* sz = cg_reg(); const char* box = cg_reg(); const char* bits = cg_reg();
+                        cg_emit("%s = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64", sz, mty);
+                        cg_emit("%s = call ptr @stricta_alloc(i64 %s)", box, sz);
+                        cg_emit("store %s %s, ptr %s", mty, rv, box);
+                        cg_emit("%s = ptrtoint ptr %s to i64", bits, box);
+                        cg_emit("call void @stricta_task_finish(ptr %%__task, i64 %s)", bits);
+                    } else {
+                        const char* bits = cg_reg();
+                        cg_emit("%s = ptrtoint ptr %s to i64", bits, rv);
+                        cg_emit("call void @stricta_task_finish(ptr %%__task, i64 %s)", bits);
+                    }
+                    cg_br("__coro_final");
+                } else if (g_cg.cur_fn->can_raise) {
                     if (rt->kind == TY_VOID) {
                         cg_emit("ret i1 false");
                     } else {
@@ -14489,9 +14585,14 @@ static void emit_func_ir(FuncInfo* fn) {
 
     StrBuf sig; sb_init(&sig);
     int arg_idx = 0;
-    if (fn->has_captures) {
-        sb_append(&sig, "ptr %__env");
+    if (fn->is_async) {
+        sb_append(&sig, "ptr %__task");
         arg_idx = 1;
+    }
+    if (fn->has_captures) {
+        if (arg_idx > 0) sb_append(&sig, ", ");
+        sb_append(&sig, "ptr %__env");
+        arg_idx++;
     }
     for (int i = 0; i < fn->param_count; i++) {
         if (arg_idx > 0 || i > 0) sb_append(&sig, ", ");
@@ -14527,6 +14628,17 @@ static void emit_func_ir(FuncInfo* fn) {
         }
     }
 
+    if (fn->is_async) {
+        cg_emit("%%__coro_id = call token @llvm.coro.id(i32 0, ptr null, ptr null, ptr null)");
+        cg_emit("%%__coro_sz = call i64 @llvm.coro.size.i64()");
+        cg_emit("%%__coro_mem = call ptr @stricta_alloc(i64 %%__coro_sz)");
+        cg_emit("%%__coro_hdl = call ptr @llvm.coro.begin(token %%__coro_id, ptr %%__coro_mem)");
+        cg_emit("%%__coro_s0 = call i8 @llvm.coro.suspend(token none, i1 false)");
+        cg_emit("switch i8 %%__coro_s0, label %%__coro_suspend [i8 0, label %%__coro_start i8 1, label %%__coro_cleanup]");
+        g_cg.block_terminated = true;
+        cg_label("__coro_start");
+    }
+
     if (fn->is_generator) {
         g_cg.yield_list_reg = "%__yield_list";
         cg_emit("%s = call ptr @_%s_new(i32 8)", g_cg.yield_list_reg, fn->ret_type->mangled);
@@ -14560,7 +14672,10 @@ static void emit_func_ir(FuncInfo* fn) {
     if (!g_cg.block_terminated) {
         cg_flush_temps(0);
         cg_drop_all_fn_locals(fn);
-        if (fn->can_raise) {
+        if (fn->is_async) {
+            cg_emit("call void @stricta_task_finish(ptr %%__task, i64 0)");
+            cg_br("__coro_final");
+        } else if (fn->can_raise) {
             if (fn->is_generator) {
                 const char* rty = llvm_fn_ret_ty(fn);
                 const char* pkt = cg_reg();
@@ -14585,14 +14700,34 @@ static void emit_func_ir(FuncInfo* fn) {
     if (fn->can_raise && g_cg.fn_unwind_lbl) {
         cg_label(g_cg.fn_unwind_lbl);
         cg_drop_all_fn_locals(fn);
-        if (fn->ret_type->kind == TY_VOID) {
+        if (fn->is_async) {
+            cg_emit("call void @stricta_task_capture_exc(ptr %%__task)");
+            cg_br("__coro_final");
+        } else if (fn->ret_type->kind == TY_VOID) {
             cg_emit("ret i1 true");
         } else {
             cg_emit("ret %s { i1 true, %s %s }", llvm_fn_ret_ty(fn), llvm_reg_ty(fn->ret_type), llvm_zero(fn->ret_type));
         }
     }
 
-    sb_printf(&g_cg.funcs, "define %s %s(%s) {\nentry:\n", llvm_fn_ret_ty(fn), fn->llvm_name, sig.data);
+    if (fn->is_async) {
+        cg_label("__coro_final");
+        cg_emit("%%__coro_sf = call i8 @llvm.coro.suspend(token none, i1 true)");
+        cg_emit("switch i8 %%__coro_sf, label %%__coro_suspend [i8 1, label %%__coro_cleanup]");
+        g_cg.block_terminated = true;
+        cg_label("__coro_cleanup");
+        cg_drop_all_fn_locals(fn);
+        cg_emit("%%__coro_fmem = call ptr @llvm.coro.free(token %%__coro_id, ptr %%__coro_hdl)");
+        cg_emit("call void @stricta_free(ptr %%__coro_fmem)");
+        cg_br("__coro_suspend");
+        cg_label("__coro_suspend");
+        cg_emit("%%__coro_end = call i1 @llvm.coro.end(ptr %%__coro_hdl, i1 false, token none)");
+        cg_emit("ret ptr %%__coro_hdl");
+        g_cg.block_terminated = true;
+        sb_printf(&g_cg.funcs, "define internal ptr %s(%s) presplitcoroutine {\nentry:\n", fn->llvm_name, sig.data);
+    } else {
+        sb_printf(&g_cg.funcs, "define %s %s(%s) {\nentry:\n", llvm_fn_ret_ty(fn), fn->llvm_name, sig.data);
+    }
     sb_append_n(&g_cg.funcs, g_cg.cur_entry.data, g_cg.cur_entry.len);
     sb_append_n(&g_cg.funcs, g_cg.cur_body.data, g_cg.cur_body.len);
     sb_append(&g_cg.funcs, "}\n\n");
@@ -14643,114 +14778,22 @@ static void emit_async_wrappers(FuncInfo* fn) {
     const char* drop_fn = emit_async_drop_for_type(fn->ret_type);
     StrBuf* b = &g_cg.funcs;
 
-    if (fn->param_count > 0) {
-        sb_printf(b, "%%AsyncArgs_%s = type { ", bare);
-        for (int i = 0; i < fn->param_count; i++) {
-            if (i > 0) sb_append(b, ", ");
-            sb_append(b, llvm_mem_ty(fn->param_types[i]));
-        }
-        sb_append(b, " }\n\n");
-    }
-
-    /* Worker entry point: ptr @_async_entry_<bare>(ptr %task) */
-    sb_printf(b, "define internal ptr @_async_entry_%s(ptr %%task) {\nentry:\n", bare);
-    StrBuf call_args;
-    sb_init(&call_args);
-    if (fn->param_count > 0) {
-        sb_append(b, "  %ab = call ptr @stricta_task_args(ptr %task)\n");
-        for (int i = 0; i < fn->param_count; i++) {
-            Type* pt = fn->param_types[i];
-            const char* rty = llvm_reg_ty(pt);
-            const char* mty = llvm_mem_ty(pt);
-            sb_printf(b, "  %%ap_%d = getelementptr %%AsyncArgs_%s, ptr %%ab, i32 0, i32 %d\n", i, bare, i);
-            sb_printf(b, "  %%am_%d = load %s, ptr %%ap_%d\n", i, mty, i);
-            if (pt->kind == TY_BOOL) {
-                sb_printf(b, "  %%ar_%d = trunc i8 %%am_%d to i1\n", i, i);
-                if (i > 0) sb_append(&call_args, ", ");
-                sb_printf(&call_args, "i1 %%ar_%d", i);
-            } else {
-                if (i > 0) sb_append(&call_args, ", ");
-                sb_printf(&call_args, "%s %%am_%d", rty, i);
-            }
-        }
-        sb_append(b, "  call void @stricta_free(ptr %ab)\n");
-    }
-    const char* frty = llvm_fn_ret_ty(fn);
-    if (strcmp(frty, "void") == 0) {
-        sb_printf(b, "  call void %s(%s)\n", fn->llvm_name, call_args.data);
-    } else {
-        sb_printf(b, "  %%raw = call %s %s(%s)\n", frty, fn->llvm_name, call_args.data);
-    }
-    free(call_args.data);
-
-    if (fn->can_raise) {
-        if (fn->ret_type->kind == TY_VOID) {
-            sb_append(b, "  br i1 %raw, label %l_exc, label %l_ok\n");
-        } else {
-            sb_append(b, "  %is_exc = extractvalue ");
-            sb_printf(b, "%s %%raw, 0\n  br i1 %%is_exc, label %%l_exc, label %%l_ok\n", frty);
-        }
-        sb_append(b, "l_exc:\n  call void @stricta_task_capture_exc(ptr %task)\n  ret ptr null\nl_ok:\n");
-        if (fn->ret_type->kind != TY_VOID) {
-            sb_printf(b, "  %%rv = extractvalue %s %%raw, 1\n", frty);
-        }
-    } else if (fn->ret_type->kind != TY_VOID) {
-        sb_append(b, "  br label %l_ok\nl_ok:\n");
-    }
-
-    const char* rv_name = fn->can_raise ? "%rv" : "%raw";
-    Type* rt = fn->ret_type;
-    if (!rt || rt->kind == TY_VOID) {
-        sb_append(b, "  call void @stricta_task_finish(ptr %task, i64 0)\n  ret ptr null\n}\n\n");
-    } else if (rt->kind == TY_BOOL) {
-        sb_printf(b, "  %%bits = zext i1 %s to i64\n  call void @stricta_task_finish(ptr %%task, i64 %%bits)\n  ret ptr null\n}\n\n", rv_name);
-    } else if (type_is_int(rt)) {
-        if (rt->kind == TY_I64 || rt->kind == TY_U64) {
-            sb_printf(b, "  call void @stricta_task_finish(ptr %%task, i64 %s)\n  ret ptr null\n}\n\n", rv_name);
-        } else {
-            const char* ext = type_is_unsigned_int(rt) ? "zext" : "sext";
-            sb_printf(b, "  %%bits = %s %s %s to i64\n  call void @stricta_task_finish(ptr %%task, i64 %%bits)\n  ret ptr null\n}\n\n",
-                      ext, llvm_reg_ty(rt), rv_name);
-        }
-    } else if (rt->kind == TY_F64) {
-        sb_printf(b, "  %%bits = bitcast double %s to i64\n  call void @stricta_task_finish(ptr %%task, i64 %%bits)\n  ret ptr null\n}\n\n", rv_name);
-    } else if (rt->kind == TY_F32) {
-        sb_printf(b, "  %%d = fpext float %s to double\n  %%bits = bitcast double %%d to i64\n  call void @stricta_task_finish(ptr %%task, i64 %%bits)\n  ret ptr null\n}\n\n", rv_name);
-    } else if (type_needs_async_box(rt)) {
-        const char* mty = llvm_mem_ty(rt);
-        sb_printf(b, "  %%sz = ptrtoint ptr getelementptr (%s, ptr null, i32 1) to i64\n", mty);
-        sb_append(b, "  %box = call ptr @stricta_alloc(i64 %sz)\n");
-        sb_printf(b, "  store %s %s, ptr %%box\n", mty, rv_name);
-        sb_append(b, "  %bits = ptrtoint ptr %box to i64\n  call void @stricta_task_finish(ptr %task, i64 %bits)\n  ret ptr null\n}\n\n");
-    } else {
-        sb_printf(b, "  %%bits = ptrtoint ptr %s to i64\n  call void @stricta_task_finish(ptr %%task, i64 %%bits)\n  ret ptr null\n}\n\n", rv_name);
-    }
-
     /* Spawn wrapper: ptr @_async_spawn_<bare>(params...) */
     StrBuf ssig; sb_init(&ssig);
+    StrBuf cargs; sb_init(&cargs);
+    sb_append(&cargs, "ptr %t");
     for (int i = 0; i < fn->param_count; i++) {
         if (i > 0) sb_append(&ssig, ", ");
         sb_printf(&ssig, "%s %%arg_%d", llvm_reg_ty(fn->param_types[i]), i);
+        sb_printf(&cargs, ", %s %%arg_%d", llvm_reg_ty(fn->param_types[i]), i);
     }
     sb_printf(b, "define internal ptr @_async_spawn_%s(%s) {\nentry:\n", bare, ssig.data);
+    sb_printf(b, "  %%t = call ptr @stricta_task_new(ptr %s)\n", drop_fn);
+    sb_printf(b, "  %%h = call ptr %s(%s)\n", fn->llvm_name, cargs.data);
+    sb_append(b, "  call void @stricta_task_set_hdl(ptr %t, ptr %h)\n");
+    sb_append(b, "  ret ptr %t\n}\n\n");
     free(ssig.data);
-    if (fn->param_count > 0) {
-        sb_printf(b, "  %%sz = ptrtoint ptr getelementptr (%%AsyncArgs_%s, ptr null, i32 1) to i64\n", bare);
-        sb_append(b, "  %ab = call ptr @stricta_alloc(i64 %sz)\n");
-        for (int i = 0; i < fn->param_count; i++) {
-            Type* pt = fn->param_types[i];
-            sb_printf(b, "  %%sp_%d = getelementptr %%AsyncArgs_%s, ptr %%ab, i32 0, i32 %d\n", i, bare, i);
-            if (pt->kind == TY_BOOL) {
-                sb_printf(b, "  %%bx_%d = zext i1 %%arg_%d to i8\n", i, i);
-                sb_printf(b, "  store i8 %%bx_%d, ptr %%sp_%d\n", i, i);
-            } else {
-                sb_printf(b, "  store %s %%arg_%d, ptr %%sp_%d\n", llvm_mem_ty(pt), i, i);
-            }
-        }
-        sb_printf(b, "  %%t = call ptr @stricta_task_spawn(ptr @_async_entry_%s, ptr %%ab, ptr %s)\n  ret ptr %%t\n}\n\n", bare, drop_fn);
-    } else {
-        sb_printf(b, "  %%t = call ptr @stricta_task_spawn(ptr @_async_entry_%s, ptr null, ptr %s)\n  ret ptr %%t\n}\n\n", bare, drop_fn);
-    }
+    free(cargs.data);
 }
 
 static bool expr_can_raise(FuncInfo* cur_fn, Expr* e, bool in_catch_all) {
@@ -15000,7 +15043,7 @@ static void emit_llvm_rt_core(StrBuf* b) {
     sb_append(b, "%StrictaPtrList = type { i32, i32, ptr }\n");
     sb_append(b, "%StrictaBigInt = type { i32, i32, ptr }\n");
     sb_append(b, "%StrictaFile = type { ptr }\n");
-    sb_append(b, "%StrictaTask = type { i64, i32, i32, i64, ptr, ptr, i32, ptr, ptr }\n\n");
+    sb_append(b, "%StrictaTask = type { ptr, i32, i32, i64, ptr, i32, ptr, ptr }\n\n");
 
     sb_append(b, "@stricta_sys_argv = internal global ptr null\n");
     sb_append(b, "@_exc_type_id = internal thread_local global i32 0\n");
@@ -15065,8 +15108,14 @@ static void emit_llvm_rt_core(StrBuf* b) {
     sb_append(b, "declare i32 @fclose(ptr)\n");
     sb_append(b, "declare void @exit(i32)\n");
     sb_append(b, "declare double @pow(double, double)\n");
-    sb_append(b, "declare i32 @pthread_create(ptr, ptr, ptr, ptr)\n");
-    sb_append(b, "declare i32 @pthread_join(i64, ptr)\n");
+    sb_append(b, "declare token @llvm.coro.id(i32, ptr, ptr, ptr)\n");
+    sb_append(b, "declare i64 @llvm.coro.size.i64()\n");
+    sb_append(b, "declare ptr @llvm.coro.begin(token, ptr)\n");
+    sb_append(b, "declare i8 @llvm.coro.suspend(token, i1)\n");
+    sb_append(b, "declare ptr @llvm.coro.free(token, ptr)\n");
+    sb_append(b, "declare i1 @llvm.coro.end(ptr, i1, token)\n");
+    sb_append(b, "declare void @llvm.coro.resume(ptr)\n");
+    sb_append(b, "declare void @llvm.coro.destroy(ptr)\n");
     sb_append(b, "declare i32 @llvm.smax.i32(i32, i32)\n");
     sb_append(b, "declare i32 @llvm.smin.i32(i32, i32)\n");
     sb_append(b, "declare i64 @llvm.smax.i64(i64, i64)\n");
@@ -16052,64 +16101,78 @@ static void emit_llvm_rt_bytes_file_task(StrBuf* b) {
         "  %hf = icmp ne ptr %f, null\n  br i1 %hf, label %work, label %done\nwork:\n"
         "  call void @stricta_file_close(ptr %f)\n  call void @free(ptr %f)\n  br label %done\ndone:\n  ret void\n}\n\n");
 
-    /* Async Tasks */
+    /* Async Tasks (LLVM Coroutines) */
     sb_append(b,
-        "define internal ptr @stricta_task_spawn(ptr %entry_fn, ptr %arg_block, ptr %drop_res) {\nentry:\n"
+        "define internal ptr @stricta_task_new(ptr %drop_res) {\nentry:\n"
         "  %tsz = ptrtoint ptr getelementptr (%StrictaTask, ptr null, i32 1) to i64\n"
         "  %t = call ptr @stricta_calloc(i64 1, i64 %tsz)\n"
-        "  %p4 = getelementptr %StrictaTask, ptr %t, i32 0, i32 4\n  store ptr %arg_block, ptr %p4\n"
-        "  %p5 = getelementptr %StrictaTask, ptr %t, i32 0, i32 5\n  store ptr %drop_res, ptr %p5\n"
-        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n"
-        "  %rc = call i32 @pthread_create(ptr %p0, ptr null, ptr %entry_fn, ptr %t)\n"
-        "  %ok = icmp eq i32 %rc, 0\n  br i1 %ok, label %done, label %fail\nfail:\n"
-        "  %r = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.rt_err_task, i32 %rc)\n"
-        "  call void @exit(i32 1)\n  unreachable\ndone:\n  ret ptr %t\n}\n\n"
-        "define internal ptr @stricta_task_args(ptr %t) {\nentry:\n"
-        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %get, label %ret0\nget:\n"
-        "  %p4 = getelementptr %StrictaTask, ptr %t, i32 0, i32 4\n  %ab = load ptr, ptr %p4\n  ret ptr %ab\nret0:\n  ret ptr null\n}\n\n"
+        "  %p4 = getelementptr %StrictaTask, ptr %t, i32 0, i32 4\n  store ptr %drop_res, ptr %p4\n"
+        "  ret ptr %t\n}\n\n"
+        "define internal void @stricta_task_set_hdl(ptr %t, ptr %hdl) {\nentry:\n"
+        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n  store ptr %hdl, ptr %p0\n"
+        "  ret void\n}\n\n"
         "define internal void @stricta_task_finish(ptr %t, i64 %bits) {\nentry:\n"
         "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %set, label %done\nset:\n"
         "  %p3 = getelementptr %StrictaTask, ptr %t, i32 0, i32 3\n  store i64 %bits, ptr %p3\n"
-        "  %p2 = getelementptr %StrictaTask, ptr %t, i32 0, i32 2\n  store i32 1, ptr %p2\n  br label %done\ndone:\n  ret void\n}\n\n"
+        "  %p2 = getelementptr %StrictaTask, ptr %t, i32 0, i32 2\n  store i32 1, ptr %p2\n"
+        "  %p1 = getelementptr %StrictaTask, ptr %t, i32 0, i32 1\n  store i32 1, ptr %p1\n"
+        "  br label %done\ndone:\n  ret void\n}\n\n"
         "define internal void @stricta_task_capture_exc(ptr %t) {\nentry:\n"
         "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %cap, label %done\ncap:\n"
         "  %tid = load i32, ptr @_exc_type_id\n  %obj = load ptr, ptr @_exc_obj\n  %msg = load ptr, ptr @_exc_msg\n"
-        "  %p6 = getelementptr %StrictaTask, ptr %t, i32 0, i32 6\n  store i32 %tid, ptr %p6\n"
-        "  %p7 = getelementptr %StrictaTask, ptr %t, i32 0, i32 7\n  store ptr %obj, ptr %p7\n"
-        "  %p8 = getelementptr %StrictaTask, ptr %t, i32 0, i32 8\n  store ptr %msg, ptr %p8\n"
-        "  store i32 0, ptr @_exc_type_id\n  store ptr null, ptr @_exc_obj\n  store ptr null, ptr @_exc_msg\n  br label %done\ndone:\n  ret void\n}\n\n");
+        "  %p5 = getelementptr %StrictaTask, ptr %t, i32 0, i32 5\n  store i32 %tid, ptr %p5\n"
+        "  %p6 = getelementptr %StrictaTask, ptr %t, i32 0, i32 6\n  store ptr %obj, ptr %p6\n"
+        "  %p7 = getelementptr %StrictaTask, ptr %t, i32 0, i32 7\n  store ptr %msg, ptr %p7\n"
+        "  %p1 = getelementptr %StrictaTask, ptr %t, i32 0, i32 1\n  store i32 1, ptr %p1\n"
+        "  store i32 0, ptr @_exc_type_id\n  store ptr null, ptr @_exc_obj\n  store ptr null, ptr @_exc_msg\n"
+        "  br label %done\ndone:\n  ret void\n}\n\n");
     sb_append(b,
-        "define internal i64 @stricta_task_await(ptr %t) {\nentry:\n"
-        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %chkj, label %ret0\nret0:\n  ret i64 0\nchkj:\n"
-        "  %p1 = getelementptr %StrictaTask, ptr %t, i32 0, i32 1\n  %j = load i32, ptr %p1\n"
-        "  %nj = icmp eq i32 %j, 0\n  br i1 %nj, label %dojoin, label %chkexc\ndojoin:\n"
-        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n  %th = load i64, ptr %p0\n"
-        "  %jr = call i32 @pthread_join(i64 %th, ptr null)\n  store i32 1, ptr %p1\n  br label %chkexc\nchkexc:\n"
-        "  %p6 = getelementptr %StrictaTask, ptr %t, i32 0, i32 6\n  %tid = load i32, ptr %p6\n"
+        "define internal i1 @stricta_task_is_done(ptr %t) {\nentry:\n"
+        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %chk, label %ret1\nret1:\n  ret i1 true\nchk:\n"
+        "  %p1 = getelementptr %StrictaTask, ptr %t, i32 0, i32 1\n  %d = load i32, ptr %p1\n"
+        "  %b = icmp ne i32 %d, 0\n  ret i1 %b\n}\n\n"
+        "define internal i1 @stricta_task_step(ptr %t) {\nentry:\n"
+        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %chk, label %ret1\nret1:\n  ret i1 true\nchk:\n"
+        "  %p1 = getelementptr %StrictaTask, ptr %t, i32 0, i32 1\n  %d = load i32, ptr %p1\n"
+        "  %isd = icmp ne i32 %d, 0\n  br i1 %isd, label %ret1, label %res\nres:\n"
+        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n  %h = load ptr, ptr %p0\n"
+        "  %hh = icmp ne ptr %h, null\n  br i1 %hh, label %dores, label %ret1\ndores:\n"
+        "  call void @llvm.coro.resume(ptr %h)\n"
+        "  %d2 = load i32, ptr %p1\n  %b2 = icmp ne i32 %d2, 0\n  ret i1 %b2\n}\n\n"
+        "define internal i64 @stricta_task_take_result(ptr %t) {\nentry:\n"
+        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %destr, label %ret0\nret0:\n  ret i64 0\ndestr:\n"
+        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n  %h = load ptr, ptr %p0\n"
+        "  %hh = icmp ne ptr %h, null\n  br i1 %hh, label %dodestr, label %chkexc\ndodestr:\n"
+        "  call void @llvm.coro.destroy(ptr %h)\n  store ptr null, ptr %p0\n  br label %chkexc\nchkexc:\n"
+        "  %p5 = getelementptr %StrictaTask, ptr %t, i32 0, i32 5\n  %tid = load i32, ptr %p5\n"
         "  %he = icmp ne i32 %tid, 0\n  br i1 %he, label %rethrow, label %okret\nrethrow:\n"
         "  call void @stricta_clear_exc(i32 0)\n"
-        "  %p7 = getelementptr %StrictaTask, ptr %t, i32 0, i32 7\n  %obj = load ptr, ptr %p7\n"
-        "  %p8 = getelementptr %StrictaTask, ptr %t, i32 0, i32 8\n  %msg = load ptr, ptr %p8\n"
+        "  %p6 = getelementptr %StrictaTask, ptr %t, i32 0, i32 6\n  %obj = load ptr, ptr %p6\n"
+        "  %p7 = getelementptr %StrictaTask, ptr %t, i32 0, i32 7\n  %msg = load ptr, ptr %p7\n"
         "  store i32 %tid, ptr @_exc_type_id\n  store ptr %obj, ptr @_exc_obj\n  store ptr %msg, ptr @_exc_msg\n"
         "  call void @free(ptr %t)\n  ret i64 0\nokret:\n"
         "  %p3 = getelementptr %StrictaTask, ptr %t, i32 0, i32 3\n  %bits = load i64, ptr %p3\n"
         "  call void @free(ptr %t)\n  ret i64 %bits\n}\n\n"
+        "define internal i64 @stricta_task_await(ptr %t) {\nentry:\n"
+        "  br label %loop\nloop:\n"
+        "  %d = call i1 @stricta_task_step(ptr %t)\n"
+        "  br i1 %d, label %done, label %loop\ndone:\n"
+        "  %r = call i64 @stricta_task_take_result(ptr %t)\n  ret i64 %r\n}\n\n"
         "define internal void @stricta_task_free(ptr %t) {\nentry:\n"
-        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %chkj, label %done\nchkj:\n"
-        "  %p1 = getelementptr %StrictaTask, ptr %t, i32 0, i32 1\n  %j = load i32, ptr %p1\n"
-        "  %nj = icmp eq i32 %j, 0\n  br i1 %nj, label %dojoin, label %chkexc\ndojoin:\n"
-        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n  %th = load i64, ptr %p0\n"
-        "  %jr = call i32 @pthread_join(i64 %th, ptr null)\n  store i32 1, ptr %p1\n  br label %chkexc\nchkexc:\n"
-        "  %p6 = getelementptr %StrictaTask, ptr %t, i32 0, i32 6\n  %tid = load i32, ptr %p6\n"
+        "  %ok = icmp ne ptr %t, null\n  br i1 %ok, label %destr, label %done\ndestr:\n"
+        "  %p0 = getelementptr %StrictaTask, ptr %t, i32 0, i32 0\n  %h = load ptr, ptr %p0\n"
+        "  %hh = icmp ne ptr %h, null\n  br i1 %hh, label %dodestr, label %chkexc\ndodestr:\n"
+        "  call void @llvm.coro.destroy(ptr %h)\n  store ptr null, ptr %p0\n  br label %chkexc\nchkexc:\n"
+        "  %p5 = getelementptr %StrictaTask, ptr %t, i32 0, i32 5\n  %tid = load i32, ptr %p5\n"
         "  %he = icmp ne i32 %tid, 0\n  br i1 %he, label %dropexc, label %chkres\ndropexc:\n"
-        "  %p8 = getelementptr %StrictaTask, ptr %t, i32 0, i32 8\n  %msg = load ptr, ptr %p8\n"
+        "  %p7 = getelementptr %StrictaTask, ptr %t, i32 0, i32 7\n  %msg = load ptr, ptr %p7\n"
         "  %hm = icmp ne ptr %msg, null\n  br i1 %hm, label %fmsg, label %fobj\nfmsg:\n"
         "  call void @stricta_str_free(ptr %msg)\n  br label %fobj\nfobj:\n"
-        "  %p7 = getelementptr %StrictaTask, ptr %t, i32 0, i32 7\n  %obj = load ptr, ptr %p7\n"
+        "  %p6 = getelementptr %StrictaTask, ptr %t, i32 0, i32 6\n  %obj = load ptr, ptr %p6\n"
         "  %ho = icmp ne ptr %obj, null\n  br i1 %ho, label %dfobj, label %freet\ndfobj:\n"
         "  call void @free(ptr %obj)\n  br label %freet\nchkres:\n"
         "  %p2 = getelementptr %StrictaTask, ptr %t, i32 0, i32 2\n  %hr = load i32, ptr %p2\n"
-        "  %p5 = getelementptr %StrictaTask, ptr %t, i32 0, i32 5\n  %df = load ptr, ptr %p5\n"
+        "  %p4 = getelementptr %StrictaTask, ptr %t, i32 0, i32 4\n  %df = load ptr, ptr %p4\n"
         "  %b1 = icmp ne i32 %hr, 0\n  %b2 = icmp ne ptr %df, null\n  %do_drop = and i1 %b1, %b2\n"
         "  br i1 %do_drop, label %dropres, label %freet\ndropres:\n"
         "  %p3 = getelementptr %StrictaTask, ptr %t, i32 0, i32 3\n  %bits = load i64, ptr %p3\n"
@@ -16557,7 +16620,7 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
         "@strstr", "@strchr", "@strtoll", "@strtod", "@printf", "@dprintf",
         "@snprintf", "@putchar", "@getchar", "@fflush", "@fopen", "@fseek",
         "@ftell", "@fread", "@fwrite", "@fclose", "@exit", "@pow",
-        "@pthread_create", "@pthread_join", "@stricta_alloc", "@stricta_free",
+        "@stricta_alloc", "@stricta_free",
         NULL
     };
     for (int k = 0; predeclared_syms[k]; k++) ext_syms[ext_cnt++] = predeclared_syms[k];

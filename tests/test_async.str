@@ -37,8 +37,13 @@ async def maybe_val(flag: bool) -> int | None:
         return 99
     return None
 
+async def async_sleep(secs: float) -> None:
+    deadline: float = c_mono() + secs
+    while c_mono() < deadline:
+        _coro_yield()
+
 async def slow_step(val: int, delay: float) -> int:
-    c_sleep(delay)
+    await async_sleep(delay)
     return val * 10
 
 async def might_fail(fail: bool) -> str:
@@ -76,10 +81,16 @@ def main() -> None:
     assert mv1 is not None and mv1 == 99
     assert mv2 is None
 
-    # 2. True concurrency: two 0.08s sleeps run in parallel (< 0.14s total)
+    # 2. Cooperative concurrency on a single thread: two 0.08s async sleeps interleave (< 0.14s total)
     t0: float = c_mono()
     ta: Task[int] = slow_step(3, 0.08)
     tb: Task[int] = slow_step(4, 0.08)
+    while not _task_is_done(ta) or not _task_is_done(tb):
+        if not _task_is_done(ta):
+            _task_step(ta)
+        if not _task_is_done(tb):
+            _task_step(tb)
+        c_sleep(0.001)
     ra: int = await ta
     rb: int = await tb
     elapsed: float = c_mono() - t0
