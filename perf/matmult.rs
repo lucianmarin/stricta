@@ -7,7 +7,7 @@ impl Rng {
     }
 }
 
-fn multiply_matrices(size: usize) {
+fn multiply_matrices(size: usize) -> f64 {
     let mut rng = Rng(1234567);
     let a: Vec<Vec<f64>> = (0..size)
         .map(|_| (0..size).map(|_| rng.next_f64()).collect())
@@ -26,9 +26,17 @@ fn multiply_matrices(size: usize) {
             c[i][j] = s;
         }
     }
+
+    let mut checksum = 0.0;
+    for i in 0..size {
+        for j in 0..size {
+            checksum += c[i][j];
+        }
+    }
+    checksum
 }
 
 fn main() {
     println!("Multiply matrices");
-    multiply_matrices(1 << 9);
+    println!("{:.17}", multiply_matrices(1 << 9));
 }

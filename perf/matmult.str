@@ -5,7 +5,7 @@ def random() -> float:
     _seed = (_seed * 1103515245 + 12345) & 0x7fffffff
     return _seed / 2147483648.0
 
-def multiply_matrices(size: int) -> None:
+def multiply_matrices(size: int) -> float:
     A: list[list[float]] = [[random() for _ in range(size)] for _ in range(size)]
     B: list[list[float]] = [[random() for _ in range(size)] for _ in range(size)]
     C: list[list[float]] = [[0.0 for _ in range(size)] for _ in range(size)]
@@ -14,8 +14,14 @@ def multiply_matrices(size: int) -> None:
         for j in range(size):
             C[i][j] = sum(A[i][k] * B[k][j] for k in range(size))
 
+    checksum: float = 0.0
+    for i in range(size):
+        for j in range(size):
+            checksum = checksum + C[i][j]
+    return checksum
+
 def main() -> None:
     print("Multiply matrices")
-    multiply_matrices(2**9)
+    print("{:.17g}".format(multiply_matrices(2**9)))
 
 main()

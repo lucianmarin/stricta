@@ -12,7 +12,7 @@ fn main() {
     println!("Ackermann function");
     let mut total: i64 = 0;
     for _ in 0..400 {
-        total += ackermann(3, 6);
+        total += ackermann(3, std::hint::black_box(6));
     }
     println!("{}", total);
 }

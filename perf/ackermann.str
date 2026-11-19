@@ -1,3 +1,7 @@
+@extern("getpid")
+def _getpid() -> int:
+    pass
+
 def ackermann(m: int, n: int) -> int:
     if m == 0:
         return n + 1
@@ -9,7 +13,10 @@ def main() -> None:
     print("Ackermann function")
     total: int = 0
     for _ in range(400):
-        total = total + ackermann(3, 6)
+        # Runtime-opaque zero: keeps the call in the loop without adding a
+        # per-recursion counter.
+        salt: int = _getpid() - _getpid()
+        total = total + ackermann(3, 6 + salt)
     print(total)
 
 main()

@@ -1,11 +1,12 @@
-def fibonacci_iterative(n: int) -> None:
+def fibonacci_iterative(n: int) -> int:
     first: int = 0
     second: int = 1
     for _ in range(2, n):
         first, second = second, first + second
+    return second
 
 def main() -> None:
     print("Calculate Fibonacci numbers iteratively")
-    fibonacci_iterative(2**19 + 2**18)
+    print(fibonacci_iterative(2**19 + 2**18) & 0xFFFFFFFF)
 
 main()

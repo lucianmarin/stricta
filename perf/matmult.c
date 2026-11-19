@@ -8,7 +8,7 @@ double lcg_rand(void) {
     return _seed / 2147483648.0;
 }
 
-void multiply_matrices(int size) {
+double multiply_matrices(int size) {
     double *A = malloc(size * size * sizeof(double));
     double *B = malloc(size * size * sizeof(double));
     double *C = malloc(size * size * sizeof(double));
@@ -16,6 +16,10 @@ void multiply_matrices(int size) {
     for (int i = 0; i < size; i++) {
         for (int j = 0; j < size; j++) {
             A[i * size + j] = lcg_rand();
+        }
+    }
+    for (int i = 0; i < size; i++) {
+        for (int j = 0; j < size; j++) {
             B[i * size + j] = lcg_rand();
             C[i * size + j] = 0;
         }
@@ -31,13 +35,21 @@ void multiply_matrices(int size) {
         }
     }
 
+    double checksum = 0;
+    for (int i = 0; i < size; i++) {
+        for (int j = 0; j < size; j++) {
+            checksum += C[i * size + j];
+        }
+    }
+
     free(A);
     free(B);
     free(C);
+    return checksum;
 }
 
 int main(void) {
     printf("Multiply matrices\n");
-    multiply_matrices(1 << 9);
+    printf("%.17g\n", multiply_matrices(1 << 9));
     return 0;
 }

@@ -1,14 +1,16 @@
-def fibonacci_recursive(n: int) -> None:
-    def fibonacci(k: int) -> int:
-        if k <= 1:
-            return 1
-        else:
-            return fibonacci(k - 1) + fibonacci(k - 2)
+def fibonacci(k: int) -> int:
+    if k <= 1:
+        return 1
+    return fibonacci(k - 1) + fibonacci(k - 2)
+
+def fibonacci_recursive(n: int) -> int:
+    total: int = 0
     for i in range(1, n):
-        fibonacci(i)
+        total = total + fibonacci(i)
+    return total
 
 def main() -> None:
     print("Calculate Fibonacci numbers recursively")
-    fibonacci_recursive(2**5 + 2**2 + 2 + 1)
+    print(fibonacci_recursive(2**5 + 2**2 + 2 + 1))
 
 main()
