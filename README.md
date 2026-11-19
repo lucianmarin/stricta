@@ -21,7 +21,13 @@ Stricta is a **strict, safe, compiled version of Python** (`.str` extension)—a
 
 ## 🚀 Quick Start
 
-### Prerequisites
+### Install with Homebrew
+
+```bash
+brew install --HEAD lucianmarin/tap/stricta
+```
+
+### Prerequisites (Building from Source)
 * `clang` (with LLVM IR support) and `make`.
 
 ### Build & Run All Tests
