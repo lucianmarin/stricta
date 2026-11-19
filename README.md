@@ -63,26 +63,26 @@ Stricta's ecosystem centers on two companion projects:
 
 ---
 
-## 📊 Performance: Stricta vs Python 3 vs C (`clang -O2`) vs Rust (`-O2`) vs Nim (`-O2`)
+## 📊 Performance: Stricta vs Python 3 vs C (`clang -O2`) vs Rust (`-O2`) vs Nim (`-O2`) vs Swift (`-O`)
 
-Benchmark suite (`perf/*.str`, `perf/*.c`, `perf/*.rs`, `perf/*.nim`) comparing Python 3.14, memory-safe Stricta (`stricta.c` → LLVM IR → `clang -O2`), hand-written C (`clang -O2`), idiomatic Rust (`rustc 1.100.0 -C opt-level=2`), and idiomatic Nim (`nim 2.4.2` with `-d:release --opt:speed --mm:orc`; LLVM machine outliner disabled to keep the `fib_recursive` code layout stable). All tests are work-preserving: results are returned, printed, or checksummed so the timed work cannot be deleted by an optimizing compiler. Medians are 5–7 native runs and 2–3 Python runs on an Apple M1 (macOS 27.2.1).
+Benchmark suite (`perf/*.str`, `perf/*.c`, `perf/*.rs`, `perf/*.nim`, `perf/*.swift`) comparing Python 3.14, memory-safe Stricta (`stricta.c` → LLVM IR → `clang -O2`), hand-written C (`clang -O2`), idiomatic Rust (`rustc 1.100.0 -C opt-level=2`), idiomatic Nim (`nim 2.4.2` with `-d:release --opt:speed --mm:orc`; LLVM machine outliner disabled to keep the `fib_recursive` code layout stable), and idiomatic Swift (`swiftc 6.4.2 -O`). All tests are work-preserving: results are returned, printed, or checksummed so the timed work cannot be deleted by an optimizing compiler. Medians are 5–7 native runs and 2–3 Python runs on an Apple M1 (macOS 27.2.1).
 
-| Benchmark | Stricta (ms) | Python 3 (ms, ×) | C `clang -O2` (ms, ×) | Rust `-O2` (ms, ×) | Nim `-O2` (ms, ×) |
-|---|---:|---:|---:|---:|---:|
-| `ackermann` | **176.89** | 1,527.32 (**8.63×**) | 176.23 (**1.00×**) | 174.85 (**0.99×**) | 206.02 (**1.16×**) |
-| `async_tasks` | **10.47** | 1,069.54 (**102.2×**) | 10.99 (**1.05×**) | 9.50 (**0.91×**) | 10.36 (**0.99×**) |
-| `class_hierarchy` | **6.48** | 53.04 (**8.19×**) | 6.31 (**0.97×**) | 10.85 (**1.67×**) | 13.58 (**2.10×**) |
-| `collatz` | **102.28** | 5,292.30 (**51.7×**) | 107.72 (**1.05×**) | 110.74 (**1.08×**) | 186.20 (**1.82×**) |
-| `dict_manip` | **13.07** | 53.60 (**4.10×**) | 10.14 (**0.78×**) | 14.10 (**1.08×**) | 14.55 (**1.11×**) |
-| `fib_iterative` | **6.06** | 5,689.39 (**938.8×**) | 3.93 (**0.65×**) | 7.91 (**1.31×**) | 10.65 (**1.76×**) |
-| `fib_recursive` | **177.28** | 4,836.16 (**27.3×**) | 183.33 (**1.03×**) | 184.27 (**1.04×**) | 610.84 (**3.45×**) |
-| `leibniz` | **594.55** | 44,617.83 (**75.0×**) | 644.40 (**1.08×**) | 619.22 (**1.04×**) | 821.94 (**1.38×**) |
-| `matmult` | **25.69** | 5,611.90 (**218.4×**) | 113.03 (**4.40×**) | 120.26 (**4.68×**) | 126.74 (**4.93×**) |
-| `pi_wallis` | **16.30** | 275.36 (**16.9×**) | 10.67 (**0.65×**) | 13.29 (**0.82×**) | 13.67 (**0.84×**) |
-| `set_ops` | **23.24** | 73.35 (**3.16×**) | 32.76 (**1.41×**) | 47.85 (**2.06×**) | 47.69 (**2.05×**) |
-| `sieve` | **12.85** | 142.70 (**11.1×**) | 13.36 (**1.04×**) | 15.03 (**1.17×**) | 15.65 (**1.22×**) |
-| `tree_structures` | **17.52** | 152.82 (**8.72×**) | 16.83 (**0.96×**) | 15.16 (**0.87×**) | 18.38 (**1.05×**) |
-| **Total** | **1,182.68** | 69,395.31 (**58.7×**) | 1,329.70 (**1.12×**) | 1,343.03 (**1.14×**) | 2,096.27 (**1.77×**) |
+| Benchmark | Stricta (ms) | Python 3 (ms, ×) | C `clang -O2` (ms, ×) | Rust `-O2` (ms, ×) | Nim `-O2` (ms, ×) | Swift `-O` (ms, ×) |
+|---|---:|---:|---:|---:|---:|---:|
+| `ackermann` | **176.89** | 1,527.32 (**8.63×**) | 176.23 (**1.00×**) | 174.85 (**0.99×**) | 206.02 (**1.16×**) | 191.57 (**1.08×**) |
+| `async_tasks` | **10.47** | 1,069.54 (**102.2×**) | 10.99 (**1.05×**) | 9.50 (**0.91×**) | 10.36 (**0.99×**) | 421.73 (**40.3×**) |
+| `class_hierarchy` | **6.48** | 53.04 (**8.19×**) | 6.31 (**0.97×**) | 10.85 (**1.67×**) | 13.58 (**2.10×**) | 18.76 (**2.90×**) |
+| `collatz` | **102.28** | 5,292.30 (**51.7×**) | 107.72 (**1.05×**) | 110.74 (**1.08×**) | 186.20 (**1.82×**) | 164.26 (**1.61×**) |
+| `dict_manip` | **13.07** | 53.60 (**4.10×**) | 10.14 (**0.78×**) | 14.10 (**1.08×**) | 14.55 (**1.11×**) | 24.02 (**1.84×**) |
+| `fib_iterative` | **6.06** | 5,689.39 (**938.8×**) | 3.93 (**0.65×**) | 7.91 (**1.31×**) | 10.65 (**1.76×**) | 11.99 (**1.98×**) |
+| `fib_recursive` | **177.28** | 4,836.16 (**27.3×**) | 183.33 (**1.03×**) | 184.27 (**1.04×**) | 610.84 (**3.45×**) | 313.56 (**1.77×**) |
+| `leibniz` | **594.55** | 44,617.83 (**75.0×**) | 644.40 (**1.08×**) | 619.22 (**1.04×**) | 821.94 (**1.38×**) | 573.69 (**0.96×**) |
+| `matmult` | **25.69** | 5,611.90 (**218.4×**) | 113.03 (**4.40×**) | 120.26 (**4.68×**) | 126.74 (**4.93×**) | 157.34 (**6.12×**) |
+| `pi_wallis` | **16.30** | 275.36 (**16.9×**) | 10.67 (**0.65×**) | 13.29 (**0.82×**) | 13.67 (**0.84×**) | 11.12 (**0.68×**) |
+| `set_ops` | **23.24** | 73.35 (**3.16×**) | 32.76 (**1.41×**) | 47.85 (**2.06×**) | 47.69 (**2.05×**) | 43.74 (**1.88×**) |
+| `sieve` | **12.85** | 142.70 (**11.1×**) | 13.36 (**1.04×**) | 15.03 (**1.17×**) | 15.65 (**1.22×**) | 12.55 (**0.98×**) |
+| `tree_structures` | **17.52** | 152.82 (**8.72×**) | 16.83 (**0.96×**) | 15.16 (**0.87×**) | 18.38 (**1.05×**) | 40.80 (**2.33×**) |
+| **Total** | **1,182.68** | 69,395.31 (**58.7×**) | 1,329.70 (**1.12×**) | 1,343.03 (**1.14×**) | 2,096.27 (**1.77×**) | 1,985.13 (**1.68×**) |
 
 *`perf/ackermann.py` is the Python version of the `ackermann` test; the Stricta source uses `@extern("getpid")` for runtime opacity. `perf/leibniz.c` loops `10^9` times while the other implementations loop `10^9 + 1`, so its printed value differs in the last digits. Stricta's `matmult` is faster because its lowering interchanges the i-j-k loop nest for cache locality; all implementations compute and checksum the full 512×512 product.*
 
