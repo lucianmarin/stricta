@@ -562,7 +562,7 @@ struct Expr {
         struct { bool bval; } bool_lit;
         struct { const char* text; size_t len; } str_lit;
         struct { FStrPart* parts; int count; } fstr;
-        struct { const char* name; } var;
+        struct { const char* name; FuncInfo* resolved_fn; } var;
         struct { const char* op; Expr* left; Expr* right; } binop;
         struct { const char* op; Expr* operand; } unop;
         struct { Expr* callee; Expr** args; const char** kw_names; int arg_count; FuncInfo* resolved_fn; } call;
@@ -2033,6 +2033,9 @@ struct ClassInfo {
     bool is_value_type;
     bool has_unimpl_abstract;
     bool analyzed;
+    bool is_generic;
+    ClassInfo** mono_specs;
+    int mono_spec_count;
     int type_id;
     uint64_t ancestors_mask;
     ClassInfo** subclasses;
@@ -2881,6 +2884,9 @@ static void apply_cond_narrowing(ModuleInfo* mod, FuncInfo* fn, Expr* cond, bool
                                  Stmt** body, int body_cnt, NarrowEntry* saved, int* saved_cnt, int max_saved);
 static void restore_narrowing(NarrowEntry* saved, int saved_cnt);
 static FuncInfo* instantiate_generic_fn(FuncInfo* tmpl, Type** arg_types, int argc, SrcLoc call_loc);
+static ClassInfo* instantiate_generic_class(ClassInfo* tmpl, Type** arg_types, int argc, SrcLoc call_loc);
+static void add_field_to_class(ClassInfo* cls, const char* name, Type* type, Expr* def_e, SrcLoc loc);
+static void infer_class_fields_from_stmts(ModuleInfo* mod, ClassInfo* cls, FuncInfo* mf, Stmt** stmts, int count);
 
 static Expr* clone_expr(Expr* e);
 static Stmt* clone_stmt(Stmt* s);
@@ -3096,6 +3102,9 @@ static Stmt* clone_stmt(Stmt* s) {
                     c->match_s.cases[k].body = clone_stmts(s->match_s.cases[k].body, s->match_s.cases[k].body_count);
                 }
             }
+            break;
+        case STMT_CLASS:
+            c->class_s.body = clone_stmts(s->class_s.body, s->class_s.body_count);
             break;
         default:
             break;
@@ -3341,10 +3350,86 @@ static bool expr_is_nonneg(ModuleInfo* mod, FuncInfo* fn, Expr* e) {
     }
 }
 
+static bool expr_mentions_name(Expr* e, const char* name) {
+    if (!e || !name) return false;
+    switch (e->kind) {
+        case EXPR_VAR: return strcmp(e->var.name, name) == 0;
+        case EXPR_UNOP: return expr_mentions_name(e->unop.operand, name);
+        case EXPR_AWAIT: return expr_mentions_name(e->await_e.expr, name);
+        case EXPR_BINOP: return expr_mentions_name(e->binop.left, name) || expr_mentions_name(e->binop.right, name);
+        case EXPR_TERNARY: return expr_mentions_name(e->ternary.cond, name) || expr_mentions_name(e->ternary.then_e, name) || expr_mentions_name(e->ternary.else_e, name);
+        case EXPR_CALL:
+            if (expr_mentions_name(e->call.callee, name)) return true;
+            for (int i = 0; i < e->call.arg_count; i++) if (expr_mentions_name(e->call.args[i], name)) return true;
+            return false;
+        case EXPR_ATTR: return expr_mentions_name(e->attr.obj, name);
+        case EXPR_INDEX: return expr_mentions_name(e->index.obj, name) || expr_mentions_name(e->index.index, name);
+        case EXPR_SLICE: return expr_mentions_name(e->slice.obj, name) || expr_mentions_name(e->slice.start, name) || expr_mentions_name(e->slice.stop, name) || expr_mentions_name(e->slice.step, name);
+        case EXPR_LIST: case EXPR_TUPLE: case EXPR_SET:
+            for (int i = 0; i < e->seq.count; i++) if (expr_mentions_name(e->seq.items[i], name)) return true;
+            return false;
+        case EXPR_DICT:
+            for (int i = 0; i < e->dict.count; i++) if (expr_mentions_name(e->dict.keys[i], name) || expr_mentions_name(e->dict.vals[i], name)) return true;
+            return false;
+        default: return false;
+    }
+}
+
+static Type* prescan_nonrecursive_return(ModuleInfo* mod, FuncInfo* fn, Stmt** stmts, int count) {
+    for (int i = 0; i < count; i++) {
+        Stmt* s = stmts[i];
+        if (!s) continue;
+        if (s->kind == STMT_RETURN && s->ret.expr && !expr_mentions_name(s->ret.expr, fn->name)) {
+            Type* rt = check_expr(mod, fn, s->ret.expr, NULL);
+            if (rt && rt->kind != TY_NONE_LIT && rt->kind != TY_VOID) return rt;
+        } else if (s->kind == STMT_IF) {
+            for (int k = 0; k < s->if_s.branch_count; k++) {
+                Type* t = prescan_nonrecursive_return(mod, fn, s->if_s.bodies[k], s->if_s.body_counts[k]);
+                if (t) return t;
+            }
+            Type* t = prescan_nonrecursive_return(mod, fn, s->if_s.else_body, s->if_s.else_count);
+            if (t) return t;
+        } else if (s->kind == STMT_WHILE) {
+            Type* t = prescan_nonrecursive_return(mod, fn, s->while_s.body, s->while_s.body_count);
+            if (t) return t;
+            t = prescan_nonrecursive_return(mod, fn, s->while_s.else_body, s->while_s.else_count);
+            if (t) return t;
+        } else if (s->kind == STMT_FOR) {
+            Type* t = prescan_nonrecursive_return(mod, fn, s->for_s.body, s->for_s.body_count);
+            if (t) return t;
+            t = prescan_nonrecursive_return(mod, fn, s->for_s.else_body, s->for_s.else_count);
+            if (t) return t;
+        } else if (s->kind == STMT_TRY) {
+            Type* t = prescan_nonrecursive_return(mod, fn, s->try_s.try_body, s->try_s.try_count);
+            if (t) return t;
+            for (int h = 0; h < s->try_s.handler_count; h++) {
+                t = prescan_nonrecursive_return(mod, fn, s->try_s.handlers[h].body, s->try_s.handlers[h].body_count);
+                if (t) return t;
+            }
+            t = prescan_nonrecursive_return(mod, fn, s->try_s.else_body, s->try_s.else_count);
+            if (t) return t;
+            t = prescan_nonrecursive_return(mod, fn, s->try_s.finally_body, s->try_s.finally_count);
+            if (t) return t;
+        } else if (s->kind == STMT_WITH) {
+            Type* t = prescan_nonrecursive_return(mod, fn, s->with_s.body, s->with_s.body_count);
+            if (t) return t;
+        } else if (s->kind == STMT_MATCH) {
+            for (int c = 0; c < s->match_s.case_count; c++) {
+                Type* t = prescan_nonrecursive_return(mod, fn, s->match_s.cases[c].body, s->match_s.cases[c].body_count);
+                if (t) return t;
+            }
+        }
+    }
+    return NULL;
+}
+
 static Type* ensure_func_ret_type(FuncInfo* callee, SrcLoc loc) {
     if (!callee) return g_ty_void;
     if (callee->infer_ret && !callee->body_checked) {
         if (callee->checking_body) {
+            if (!callee->inferred_ret_type && callee->ast) {
+                callee->inferred_ret_type = prescan_nonrecursive_return(callee->mod, callee, callee->ast->def_s.body, callee->ast->def_s.body_count);
+            }
             if (callee->inferred_ret_type) return callee->is_async ? make_task_type(callee->inferred_ret_type) : callee->inferred_ret_type;
             error_at(loc, "cannot infer return type of recursive function '%s' before a return statement; add '-> ReturnType'", callee->name);
         }
@@ -4042,28 +4127,54 @@ static Type* check_method_call(ModuleInfo* mod, FuncInfo* fn, Expr* call, Expr* 
     return g_ty_void;
 }
 
+static void check_int_lit_range(int64_t val, bool is_neg, Type* target, SrcLoc loc) {
+    if (!target) return;
+    if (is_neg) {
+        if (target->kind == TY_U8 || target->kind == TY_U16 || target->kind == TY_U32 || target->kind == TY_U64) {
+            if (val > 0) error_at(loc, "negative integer literal '-%lld' out of range for '%s'", (long long)val, type_str(target));
+            return;
+        }
+        if (target->kind == TY_I8 && val > 128LL) error_at(loc, "integer literal '-%lld' out of range for 'i8'", (long long)val);
+        if (target->kind == TY_I16 && val > 32768LL) error_at(loc, "integer literal '-%lld' out of range for 'i16'", (long long)val);
+        if (target->kind == TY_I32 && val > 2147483648LL) error_at(loc, "integer literal '-%lld' out of range for 'i32'", (long long)val);
+        return;
+    }
+    if (target->kind == TY_I8 && (val < -128LL || val > 127LL)) error_at(loc, "integer literal '%lld' out of range for 'i8'", (long long)val);
+    if (target->kind == TY_I16 && (val < -32768LL || val > 32767LL)) error_at(loc, "integer literal '%lld' out of range for 'i16'", (long long)val);
+    if (target->kind == TY_I32 && (val < -2147483648LL || val > 2147483647LL)) error_at(loc, "integer literal '%lld' out of range for 'i32'", (long long)val);
+    if (target->kind == TY_U8 && (val < 0 || val > 255LL)) error_at(loc, "integer literal '%lld' out of range for 'u8'", (long long)val);
+    if (target->kind == TY_U16 && (val < 0 || val > 65535LL)) error_at(loc, "integer literal '%lld' out of range for 'u16'", (long long)val);
+    if (target->kind == TY_U32 && (val < 0 || val > 4294967295LL)) error_at(loc, "integer literal '%lld' out of range for 'u32'", (long long)val);
+    if (target->kind == TY_U64 && val < 0) error_at(loc, "integer literal '%lld' out of range for 'u64'", (long long)val);
+}
+
 static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
     if (!e) return g_ty_void;
     Type* res = NULL;
 
     switch (e->kind) {
-        case EXPR_INT:
+        case EXPR_INT: {
+            Type* nhint = (hint && hint->kind == TY_OPTIONAL) ? hint->elem : hint;
             if (e->int_lit.is_big) {
-                if (hint && hint->kind == TY_BIGINT) res = g_ty_bigint;
+                if (nhint && nhint->kind == TY_BIGINT) res = g_ty_bigint;
                 else error_at(e->loc, "integer literal exceeds 64-bit signed range; annotate as 'bigint'");
-            } else if (hint && type_is_int(hint)) {
-                res = hint;
-            } else if (hint && type_is_float(hint)) {
-                res = hint;
-            } else if (hint && hint->kind == TY_BIGINT) {
+            } else if (nhint && type_is_int(nhint)) {
+                check_int_lit_range(e->int_lit.ival, false, nhint, e->loc);
+                res = nhint;
+            } else if (nhint && type_is_float(nhint)) {
+                res = nhint;
+            } else if (nhint && nhint->kind == TY_BIGINT) {
                 res = g_ty_bigint;
             } else {
                 res = g_ty_i64;
             }
             break;
-        case EXPR_FLOAT:
-            res = (hint && hint->kind == TY_F32) ? g_ty_f32 : g_ty_f64;
+        }
+        case EXPR_FLOAT: {
+            Type* fhint = (hint && hint->kind == TY_OPTIONAL) ? hint->elem : hint;
+            res = (fhint && fhint->kind == TY_F32) ? g_ty_f32 : g_ty_f64;
             break;
+        }
         case EXPR_BOOL:
             res = g_ty_bool;
             break;
@@ -4102,7 +4213,17 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
             if (ci) { res = ci->type; break; }
             FuncInfo* fi = find_func_in_mod(mod, n);
             if (fi) {
-                if (fi->is_generic) error_at(e->loc, "generic function '%s' cannot be used as a first-class value without parameter annotations", n);
+                if (fi->is_generic) {
+                    Type* fhint = (hint && hint->kind == TY_OPTIONAL) ? hint->elem : hint;
+                    if (fhint && fhint->kind == TY_FUNC) {
+                        FuncInfo* spec = instantiate_generic_fn(fi, fhint->func_params, fhint->func_param_count, e->loc);
+                        e->var.resolved_fn = spec;
+                        ensure_func_ret_type(spec, e->loc);
+                        res = spec->type;
+                        break;
+                    }
+                    error_at(e->loc, "generic function '%s' cannot be used as a first-class value without parameter annotations", n);
+                }
                 ensure_func_ret_type(fi, e->loc); res = fi->type; break;
             }
             if (is_builtin_fn_name(n)) { res = g_ty_void; break; }
@@ -4121,6 +4242,13 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 check_expr(mod, fn, e->unop.operand, NULL);
                 res = g_ty_bool;
             } else if (strcmp(op, "-") == 0 || strcmp(op, "+") == 0) {
+                Type* nhint = (hint && hint->kind == TY_OPTIONAL) ? hint->elem : hint;
+                if (strcmp(op, "-") == 0 && e->unop.operand->kind == EXPR_INT && !e->unop.operand->int_lit.is_big && nhint && type_is_int(nhint)) {
+                    check_int_lit_range(e->unop.operand->int_lit.ival, true, nhint, e->loc);
+                    e->unop.operand->ty = nhint;
+                    res = nhint;
+                    break;
+                }
                 Type* ot = check_expr(mod, fn, e->unop.operand, hint);
                 if (!type_is_numeric(ot) && ot->kind != TY_BIGINT && ot->kind != TY_BOOL) {
                     error_at(e->loc, "unary '%s' invalid for type '%s'", op, type_str(ot));
@@ -4341,10 +4469,17 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
             Type* shint = (hint && hint->kind == TY_OPTIONAL) ? hint->elem : hint;
             Type* ehint = (shint && shint->kind == TY_SET) ? shint->elem : NULL;
             Type* first = check_expr(mod, fn, e->seq.items[0], ehint);
+            if (ehint && ehint->kind == TY_OPTIONAL && first->kind == TY_NONE_LIT) first = ehint;
             for (int i = 1; i < e->seq.count; i++) {
                 Type* it = check_expr(mod, fn, e->seq.items[i], first);
-                if (!type_assignable(first, it)) error_at(e->seq.items[i]->loc, "set element type mismatch");
+                if (first->kind == TY_NONE_LIT && it->kind != TY_NONE_LIT) first = make_optional_type(it);
+                else if (first->kind != TY_NONE_LIT && first->kind != TY_OPTIONAL && it->kind == TY_NONE_LIT) first = make_optional_type(first);
+                else if (!type_assignable(first, it)) {
+                    if (type_assignable(it, first)) first = it;
+                    else error_at(e->seq.items[i]->loc, "set element type mismatch");
+                }
             }
+            if (first->kind == TY_NONE_LIT) error_at(e->loc, "cannot infer element type of set containing only None; add a type annotation");
             if (type_has_ref(first)) error_at(e->loc, "cannot store borrowed reference '%s' in set; use 'addr[...]' for raw pointers", type_str(first));
             res = make_set_type(first);
             break;
@@ -4363,10 +4498,16 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
             for (int i = 1; i < e->dict.count; i++) {
                 Type* k2 = check_expr(mod, fn, e->dict.keys[i], kt);
                 Type* v2 = check_expr(mod, fn, e->dict.vals[i], vt);
-                if (!type_assignable(kt, k2)) error_at(e->dict.keys[i]->loc, "dict key type mismatch");
+                if (!type_assignable(kt, k2)) {
+                    if (type_assignable(k2, kt)) kt = k2;
+                    else error_at(e->dict.keys[i]->loc, "dict key type mismatch");
+                }
                 if (vt->kind == TY_NONE_LIT && v2->kind != TY_NONE_LIT) vt = make_optional_type(v2);
                 else if (vt->kind != TY_NONE_LIT && vt->kind != TY_OPTIONAL && v2->kind == TY_NONE_LIT) vt = make_optional_type(vt);
-                else if (!type_assignable(vt, v2)) error_at(e->dict.vals[i]->loc, "dict value type mismatch");
+                else if (!type_assignable(vt, v2)) {
+                    if (type_assignable(v2, vt)) vt = v2;
+                    else error_at(e->dict.vals[i]->loc, "dict value type mismatch");
+                }
             }
             if (vt->kind == TY_NONE_LIT) error_at(e->loc, "cannot infer dict value type from None; add a type annotation");
             if (type_has_ref(kt) || type_has_ref(vt)) error_at(e->loc, "cannot store borrowed reference in dict; use 'addr[...]' for raw pointers");
@@ -4869,6 +5010,28 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                 VarSym* gsym = find_global_in_mod(mod, cname);
                 if (!ci && gsym && gsym->type && gsym->type->kind == TY_CLASS) ci = gsym->type->cls;
                 if (ci) {
+                    if (ci->is_generic) {
+                        FuncInfo* init_tmpl = find_method_in_class_exact(ci, "__init__");
+                        normalize_call_args(e, init_tmpl->param_names, init_tmpl->param_defaults, init_tmpl->param_count, 1, arena_sprintf("%s()", ci->name));
+                        args = e->call.args; argc = e->call.arg_count;
+                        int max_a = init_tmpl->param_count - 1;
+                        int min_a = max_a;
+                        for (int i = init_tmpl->param_count - 1; i >= 1; i--) {
+                            if (init_tmpl->param_defaults[i]) min_a--; else break;
+                        }
+                        if (argc < min_a || argc > max_a) {
+                            error_at(e->loc, "%s() expects %d..%d arguments, got %d", ci->name, min_a, max_a, argc);
+                        }
+                        Type* arg_tys[64];
+                        for (int i = 0; i < argc && i < 64; i++) {
+                            Param* pr = &init_tmpl->ast->def_s.params[i + 1];
+                            Type* ph = pr->type_ann ? resolve_type_expr(ci->mod, pr->type_ann) : NULL;
+                            arg_tys[i] = check_expr(mod, fn, args[i], ph);
+                        }
+                        ClassInfo* spec = instantiate_generic_class(ci, arg_tys, argc, e->loc);
+                        res = spec->type;
+                        break;
+                    }
                     FuncInfo* init_fn = find_method_in_class(ci, "__init__");
                     if (init_fn) {
                         normalize_call_args(e, init_fn->param_names, init_fn->param_defaults, init_fn->param_count, 1, arena_sprintf("%s()", ci->name));
@@ -5010,11 +5173,23 @@ static Type* resolve_param_type(ModuleInfo* mod, FuncInfo* ctx_fn, Param* pr, co
     return NULL;
 }
 
+static bool expr_is_untyped_default(Expr* e) {
+    if (!e) return false;
+    if (e->kind == EXPR_NONE) return true;
+    if (e->kind == EXPR_LIST && e->seq.count == 0) return true;
+    if (e->kind == EXPR_DICT && e->dict.count == 0) return true;
+    if (e->kind == EXPR_CALL && e->call.arg_count == 0 && e->call.callee->kind == EXPR_VAR) {
+        const char* cn = e->call.callee->var.name;
+        if (strcmp(cn, "list") == 0 || strcmp(cn, "dict") == 0 || strcmp(cn, "set") == 0) return true;
+    }
+    return false;
+}
+
 static bool def_has_unannotated_params(Stmt* def_s, bool is_method, bool is_static) {
     int start_p = (is_method && !is_static) ? 1 : 0;
     for (int i = start_p; i < def_s->def_s.param_count; i++) {
         Param* pr = &def_s->def_s.params[i];
-        if (!pr->type_ann && !pr->default_val) return true;
+        if (!pr->type_ann && (!pr->default_val || expr_is_untyped_default(pr->default_val))) return true;
     }
     return false;
 }
@@ -5136,8 +5311,15 @@ static FuncInfo* instantiate_generic_fn(FuncInfo* tmpl, Type** arg_types, int ar
             if (arg_types[aidx]->kind == TY_NONE_LIT) {
                 error_at(call_loc, "cannot pass None to unannotated parameter '%s' of '%s'", pr->name, tmpl->name);
             }
-            concrete_params[i] = arg_types[aidx];
+            if (pr->default_val && pr->default_val->kind == EXPR_NONE && arg_types[aidx]->kind != TY_OPTIONAL) {
+                concrete_params[i] = make_optional_type(arg_types[aidx]);
+            } else {
+                concrete_params[i] = arg_types[aidx];
+            }
         } else {
+            if (expr_is_untyped_default(pr->default_val)) {
+                error_at(call_loc, "parameter '%s' of '%s' with untyped default requires a type annotation or an explicit argument", pr->name, tmpl->name);
+            }
             Type* dt = check_expr(tmpl->mod, tmpl->parent_fn, pr->default_val, NULL);
             if (!dt || dt->kind == TY_NONE_LIT) {
                 error_at(pr->loc, "parameter '%s' of '%s' with default None requires a type annotation", pr->name, tmpl->name);
@@ -5190,6 +5372,165 @@ static FuncInfo* instantiate_generic_fn(FuncInfo* tmpl, Type** arg_types, int ar
     g_all_funcs[g_all_func_count++] = spec;
 
     check_func_body(spec->mod, spec);
+    return spec;
+}
+
+static ClassInfo* instantiate_generic_class(ClassInfo* tmpl, Type** arg_types, int argc, SrcLoc call_loc) {
+    FuncInfo* init_tmpl = find_method_in_class_exact(tmpl, "__init__");
+    if (!init_tmpl) error_at(call_loc, "generic class '%s' has no __init__", tmpl->name);
+
+    Type* concrete_params[64];
+    for (int i = 1; i < init_tmpl->param_count && i < 64; i++) {
+        Param* pr = &init_tmpl->ast->def_s.params[i];
+        int aidx = i - 1;
+        if (pr->type_ann) {
+            Type* pt = resolve_type_expr(tmpl->mod, pr->type_ann);
+            if (aidx < argc && !type_assignable(pt, arg_types[aidx])) {
+                error_at(call_loc, "arg %d of %s(): expected '%s', got '%s'",
+                         aidx + 1, tmpl->name, type_str(pt), type_str(arg_types[aidx]));
+            }
+            concrete_params[i] = pt;
+        } else if (aidx < argc) {
+            if (arg_types[aidx]->kind == TY_NONE_LIT) {
+                error_at(call_loc, "cannot pass None to unannotated parameter '%s' of '%s.__init__'", pr->name, tmpl->name);
+            }
+            if (pr->default_val && pr->default_val->kind == EXPR_NONE && arg_types[aidx]->kind != TY_OPTIONAL) {
+                concrete_params[i] = make_optional_type(arg_types[aidx]);
+            } else {
+                concrete_params[i] = arg_types[aidx];
+            }
+        } else {
+            if (expr_is_untyped_default(pr->default_val)) {
+                error_at(call_loc, "parameter '%s' of '%s.__init__' with untyped default requires a type annotation or an explicit argument", pr->name, tmpl->name);
+            }
+            Type* dt = check_expr(tmpl->mod, NULL, pr->default_val, NULL);
+            if (!dt || dt->kind == TY_NONE_LIT) {
+                error_at(pr->loc, "parameter '%s' of '%s.__init__' with default None requires a type annotation", pr->name, tmpl->name);
+            }
+            concrete_params[i] = dt;
+        }
+    }
+
+    for (int s = 0; s < tmpl->mono_spec_count; s++) {
+        ClassInfo* sp = tmpl->mono_specs[s];
+        FuncInfo* sp_init = find_method_in_class_exact(sp, "__init__");
+        if (!sp_init || sp_init->param_count != init_tmpl->param_count) continue;
+        bool match = true;
+        for (int i = 1; i < init_tmpl->param_count; i++) {
+            if (!type_eq(sp_init->param_types[i], concrete_params[i])) { match = false; break; }
+        }
+        if (match) return sp;
+    }
+
+    ModuleInfo* mod = tmpl->mod;
+    ClassInfo* spec = (ClassInfo*)arena_alloc(sizeof(ClassInfo));
+    spec->name = arena_sprintf("%s__m%d", tmpl->name, tmpl->mono_spec_count + 1);
+    spec->llvm_name = arena_sprintf("%%Class_%s%s", mod->prefix, spec->name);
+    spec->mod = mod;
+    spec->ast = clone_stmt(tmpl->ast);
+    spec->type_id = g_next_class_id++;
+    spec->mro = (ClassInfo**)arena_alloc(sizeof(ClassInfo*));
+    spec->mro[0] = spec;
+    spec->mro_count = 1;
+    if (spec->type_id < 64) spec->ancestors_mask = (1ULL << spec->type_id);
+    Type* ct = (Type*)arena_alloc(sizeof(Type));
+    ct->kind = TY_CLASS;
+    ct->cls = spec;
+    ct->mangled = arena_sprintf("C_%s%s", mod->prefix, spec->name);
+    spec->type = ct;
+
+    Stmt* cs = spec->ast;
+    for (int j = 0; j < cs->class_s.body_count; j++) {
+        Stmt* bs = cs->class_s.body[j];
+        if (bs->kind == STMT_ASSIGN && bs->assign.target->kind == EXPR_VAR) {
+            const char* fname = bs->assign.target->var.name;
+            Type* ft = bs->assign.type_ann ? resolve_type_expr(mod, bs->assign.type_ann) : NULL;
+            if (bs->assign.value) {
+                Type* vt = check_expr(mod, NULL, bs->assign.value, ft);
+                if (!ft) ft = vt;
+                else if (!type_assignable(ft, vt)) error_at(bs->loc, "field '%s.%s' default type mismatch", spec->name, fname);
+            }
+            if (!ft) error_at(bs->loc, "field '%s.%s' requires type annotation", spec->name, fname);
+            if (bs->assign.type_ann) add_field_to_class(spec, fname, ft, bs->assign.value, bs->loc);
+            else {
+                spec->class_attrs = (FieldInfo*)realloc(spec->class_attrs, sizeof(FieldInfo) * (size_t)(spec->class_attr_count + 1));
+                spec->class_attrs[spec->class_attr_count++] = (FieldInfo){fname, ft, bs->assign.value, -1, bs->loc};
+            }
+        } else if (bs->kind == STMT_DEF) {
+            FuncInfo* mf = (FuncInfo*)arena_alloc(sizeof(FuncInfo));
+            mf->name = bs->def_s.name;
+            mf->llvm_name = arena_sprintf("@%s%s__%s", mod->prefix, spec->name, mf->name);
+            mf->mod = mod;
+            mf->owner_cls = spec;
+            mf->ast = bs;
+            mf->is_method = true;
+            mf->is_static = expr_has_decorator(bs->def_s.decorators, bs->def_s.deco_count, "staticmethod");
+            mf->is_classmethod = expr_has_decorator(bs->def_s.decorators, bs->def_s.deco_count, "classmethod");
+            mf->is_property = expr_has_decorator(bs->def_s.decorators, bs->def_s.deco_count, "property");
+            mf->is_async = bs->def_s.is_async;
+            mf->param_count = bs->def_s.param_count;
+            mf->param_names = mf->param_count ? (const char**)arena_alloc(sizeof(char*) * (size_t)mf->param_count) : NULL;
+            mf->param_types = mf->param_count ? (Type**)arena_alloc(sizeof(Type*) * (size_t)mf->param_count) : NULL;
+            mf->param_defaults = mf->param_count ? (Expr**)arena_alloc(sizeof(Expr*) * (size_t)mf->param_count) : NULL;
+            bool is_init = (strcmp(mf->name, "__init__") == 0);
+            mf->is_generic = is_init ? false : def_has_unannotated_params(bs, !mf->is_static, mf->is_static);
+            const char* mdesc = arena_sprintf("'%s.%s'", spec->name, mf->name);
+            if (is_init) {
+                for (int p = 0; p < mf->param_count; p++) {
+                    Param* pr = &bs->def_s.params[p];
+                    mf->param_names[p] = pr->name;
+                    mf->param_defaults[p] = pr->default_val;
+                    mf->param_types[p] = (p == 0) ? spec->type : concrete_params[p];
+                    add_local_in_fn(mf, pr->name, mf->param_types[p], true, pr->loc);
+                }
+            } else if (!mf->is_generic) {
+                for (int p = 0; p < mf->param_count; p++) {
+                    Param* pr = &bs->def_s.params[p];
+                    mf->param_names[p] = pr->name;
+                    mf->param_defaults[p] = pr->default_val;
+                    mf->param_types[p] = (p == 0 && !mf->is_static) ? spec->type : resolve_param_type(mod, NULL, pr, mdesc);
+                    add_local_in_fn(mf, pr->name, mf->param_types[p], true, pr->loc);
+                }
+            } else {
+                for (int p = 0; p < mf->param_count; p++) {
+                    Param* pr = &bs->def_s.params[p];
+                    mf->param_names[p] = pr->name;
+                    mf->param_defaults[p] = pr->default_val;
+                }
+            }
+            mf->ret_type = bs->def_s.ret_type ? resolve_type_expr(mod, bs->def_s.ret_type) : g_ty_void;
+            mf->infer_ret = (bs->def_s.ret_type == NULL && !is_init);
+            mf->type = mf->is_generic ? NULL : make_func_type(mf->param_types, mf->param_count, mf->is_async ? make_task_type(mf->ret_type) : mf->ret_type);
+            spec->methods = (FuncInfo**)realloc(spec->methods, sizeof(FuncInfo*) * (size_t)(spec->method_count + 1));
+            spec->methods[spec->method_count++] = mf;
+            g_all_funcs = (FuncInfo**)realloc(g_all_funcs, sizeof(FuncInfo*) * (size_t)(g_all_func_count + 1));
+            g_all_funcs[g_all_func_count++] = mf;
+        }
+    }
+
+    FuncInfo* sp_init = find_method_in_class_exact(spec, "__init__");
+    if (sp_init) infer_class_fields_from_stmts(mod, spec, sp_init, sp_init->ast->def_s.body, sp_init->ast->def_s.body_count);
+    for (int m = 0; m < spec->method_count; m++) {
+        FuncInfo* cm = spec->methods[m];
+        if (cm != sp_init && !cm->is_generic && cm->ast) {
+            infer_class_fields_from_stmts(mod, spec, cm, cm->ast->def_s.body, cm->ast->def_s.body_count);
+        }
+    }
+    for (int f = 0; f < spec->field_count; f++) {
+        spec->fields[f].slot_index = f;
+    }
+    spec->analyzed = true;
+
+    tmpl->mono_specs = (ClassInfo**)realloc(tmpl->mono_specs, sizeof(ClassInfo*) * (size_t)(tmpl->mono_spec_count + 1));
+    tmpl->mono_specs[tmpl->mono_spec_count++] = spec;
+    mod->classes = (ClassInfo**)realloc(mod->classes, sizeof(ClassInfo*) * (size_t)(mod->class_count + 1));
+    mod->classes[mod->class_count++] = spec;
+    g_all_classes = (ClassInfo**)realloc(g_all_classes, sizeof(ClassInfo*) * (size_t)(g_all_class_count + 1));
+    g_all_classes[g_all_class_count++] = spec;
+
+    for (int m = 0; m < spec->method_count; m++) {
+        if (!spec->methods[m]->is_generic) check_func_body(mod, spec->methods[m]);
+    }
     return spec;
 }
 
@@ -6429,7 +6770,10 @@ static void analyze_module(ModuleInfo* mod) {
                 mf->param_types = mf->param_count ? (Type**)arena_alloc(sizeof(Type*) * (size_t)mf->param_count) : NULL;
                 mf->param_defaults = mf->param_count ? (Expr**)arena_alloc(sizeof(Expr*) * (size_t)mf->param_count) : NULL;
                 mf->is_generic = def_has_unannotated_params(bs, !mf->is_static, mf->is_static);
-                if (mf->is_generic && (cls->has_subclasses || cls->base_count > 0 || cls->is_abc ||
+                if (mf->is_generic && strcmp(mf->name, "__init__") == 0 &&
+                    !cls->has_subclasses && cls->base_count == 0 && !cls->is_abc && !cls->is_dataclass) {
+                    cls->is_generic = true;
+                } else if (mf->is_generic && (cls->has_subclasses || cls->base_count > 0 || cls->is_abc ||
                                        mf->is_property || mf->is_abstract || strcmp(mf->name, "__init__") == 0)) {
                     error_at(bs->loc, "method '%s.%s' requires parameter type annotations", cls->name, mf->name);
                 }
@@ -6463,6 +6807,10 @@ static void analyze_module(ModuleInfo* mod) {
             }
         }
 
+        if (cls->is_generic) {
+            for (int m = 0; m < cls->method_count; m++) cls->methods[m]->is_generic = true;
+            continue;
+        }
         FuncInfo* init_fn = find_method_in_class_exact(cls, "__init__");
         if (init_fn) {
             infer_class_fields_from_stmts(mod, cls, init_fn, init_fn->ast->def_s.body, init_fn->ast->def_s.body_count);
@@ -7817,6 +8165,7 @@ static void own_check_expr(ModuleInfo* mod, FuncInfo* fn, OwnCtx* ctx, Expr* e, 
             if (ce->kind == EXPR_VAR) {
                 const char* cname = ce->var.name;
                 ClassInfo* ci = find_class_in_mod(mod, cname);
+                if (ci && ci->is_generic && e->ty && e->ty->kind == TY_CLASS) ci = e->ty->cls;
                 if (ci) {
                     FuncInfo* init_fn = find_method_in_class(ci, "__init__");
                     for (int i = 0; i < e->call.arg_count; i++) {
@@ -12278,6 +12627,7 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                 }
                 return rv;
             }
+            if (e->var.resolved_fn) return e->var.resolved_fn->llvm_name;
             FuncInfo* fi = find_func_in_mod(g_cg.cur_mod, n);
             if (fi) return fi->llvm_name;
             return "null";
@@ -13458,6 +13808,7 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                 ClassInfo* ci = find_class_in_mod(g_cg.cur_mod, cname);
                 VarSym* gsym = find_global_in_mod(g_cg.cur_mod, cname);
                 if (!ci && gsym && gsym->type && gsym->type->kind == TY_CLASS) ci = gsym->type->cls;
+                if (ci && ci->is_generic && e->ty && e->ty->kind == TY_CLASS) ci = e->ty->cls;
                 if (ci) return cg_construct_class(ci, args, argc);
 
                 /* Direct function call (nested or module) */
@@ -16557,7 +16908,7 @@ static void emit_program_llvm(ModuleInfo* main_mod, StrBuf* out) {
     /* Emit Class Structs & VTables */
     for (int i = 0; i < g_all_class_count; i++) {
         ClassInfo* cls = g_all_classes[i];
-        if (!cls->ast) continue;
+        if (!cls->ast || cls->is_generic) continue;
         sb_printf(&g_cg.hdr, "%s = type { ", cls->llvm_name);
         int cnt = 0;
         if (cls->needs_vtable) { sb_append(&g_cg.hdr, "ptr"); cnt++; }

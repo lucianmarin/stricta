@@ -280,6 +280,86 @@ def test_extended_inference():
     assert all(x >= 0 for x in sq)
     assert not all(x > 0 for x in sq)
 
+# 11. Generic monomorphized classes
+class GenBox:
+    def __init__(self, v):
+        self.v = v
+
+    def get(self):
+        return self.v
+
+class GenPair:
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+
+    def first(self):
+        return self.a
+
+# 12. Call-site monomorphization for None / empty-container defaults
+def unwrap_or_default(x = None, fallback = 0):
+    if x is not None:
+        return x
+    return fallback
+
+def push_and_len(xs = [], item = 0):
+    xs.append(item)
+    return len(xs)
+
+# 13. First-class generic function with bidirectional Callable hint
+def inc_any(x):
+    return x + 1
+
+# 14. Order-independent recursive return inference (recursive call before base case)
+def fact_rev(n: int):
+    if n > 1:
+        return n * fact_rev(n - 1)
+    return 1
+
+def test_new_inference():
+    # 1. Generic monomorphized classes
+    bi = GenBox(42)
+    bf = GenBox(3.5)
+    assert bi.get() == 42
+    assert bf.get() == 3.5
+    p1 = GenPair(10, "ok")
+    p2 = GenPair(3.5, True)
+    assert p1.first() == 10 and p1.b == "ok"
+    assert p2.first() == 3.5 and p2.b == True
+
+    # 2. Call-site monomorphization for None / empty defaults
+    assert unwrap_or_default(7, 99) == 7
+    opt_i: int | None = None
+    assert unwrap_or_default(opt_i, 99) == 99
+    assert push_and_len([1, 2], 3) == 3
+
+    # 3. First-class generic functions with bidirectional hints
+    assert apply_fn(inc_any, 41) == 42
+    fn_ref: Callable[[int], int] = inc_any
+    assert fn_ref(9) == 10
+
+    # 4. Mixed None & widening in dict/set literals
+    dm = {"a": None, "b": 42}
+    assert len(dm) == 2
+    assert dm["a"] is None
+    sm = {None, 5}
+    assert len(sm) == 2
+
+    # 5. Contextual numeric literal typing (including optional hints & negative signed bounds)
+    b_u8: u8 = 255
+    b_i8: i8 = -128
+    opt_u8: u8 | None = 12
+    opt_f32: f32 | None = 1.5
+    u8_list: list[u8] = [0, 1, 255]
+    assert b_u8 == u8(255)
+    assert b_i8 == i8(-128)
+    assert opt_u8 is not None and opt_f32 is not None
+    assert len(u8_list) == 3
+
+    # 6. Order-independent recursive return inference
+    assert fact_rev(5) == 120
+
 test_all()
 test_extended_inference()
+test_new_inference()
 print("inference tests passed")
