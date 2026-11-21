@@ -3521,6 +3521,9 @@ static bool is_builtin_fn_name(const char* n) {
         "open", "input", "isinstance", "list", "set", "dict", "tuple",
         "iter", "next", "super", "map", "filter", "bigint", "val",
         "unbin", "sys_argv",
+        "atomic_load", "atomic_store", "atomic_cas", "atomic_xchg",
+        "atomic_add", "atomic_sub", "atomic_and", "atomic_or", "atomic_xor",
+        "atomic_fence",
         "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
         NULL
     };
@@ -4751,6 +4754,91 @@ static Type* check_expr(ModuleInfo* mod, FuncInfo* fn, Expr* e, Type* hint) {
                     }
                     e->is_ptr_take = true;
                     res = pt;
+                    break;
+                }
+                if (strcmp(cname, "atomic_fence") == 0) {
+                    reject_unexpected_kwargs(e, "atomic_fence()");
+                    if (argc != 0) error_at(e->loc, "atomic_fence() takes no arguments");
+                    res = g_ty_void;
+                    break;
+                }
+                if (strcmp(cname, "atomic_load") == 0) {
+                    reject_unexpected_kwargs(e, "atomic_load()");
+                    if (argc != 1) error_at(e->loc, "atomic_load() takes 1 argument");
+                    Type* pt = check_expr(mod, fn, args[0], NULL);
+                    if (!type_is_ptr(pt)) error_at(args[0]->loc, "atomic_load() requires a pointer (addr/ref/mut_ref), got '%s'", type_str(pt));
+                    Type* et = pt->elem;
+                    if (!type_is_int(et) && et->kind != TY_BOOL && et->kind != TY_ADDR) {
+                        error_at(args[0]->loc, "atomic_load() unsupported element type '%s'", type_str(et));
+                    }
+                    res = et;
+                    break;
+                }
+                if (strcmp(cname, "atomic_store") == 0) {
+                    reject_unexpected_kwargs(e, "atomic_store()");
+                    if (argc != 2) error_at(e->loc, "atomic_store() takes 2 arguments");
+                    Type* pt = check_expr(mod, fn, args[0], NULL);
+                    if (!pt || (pt->kind != TY_ADDR && pt->kind != TY_MUT_REF)) {
+                        error_at(args[0]->loc, "atomic_store() requires a mutable pointer (addr/mut_ref), got '%s'", type_str(pt));
+                    }
+                    Type* et = pt->elem;
+                    if (!type_is_int(et) && et->kind != TY_BOOL && et->kind != TY_ADDR) {
+                        error_at(args[0]->loc, "atomic_store() unsupported element type '%s'", type_str(et));
+                    }
+                    Type* vt = check_expr(mod, fn, args[1], et);
+                    if (!type_assignable(et, vt)) {
+                        error_at(args[1]->loc, "atomic_store() value type '%s' does not match '%s'", type_str(vt), type_str(et));
+                    }
+                    res = g_ty_void;
+                    break;
+                }
+                if (strcmp(cname, "atomic_cas") == 0) {
+                    reject_unexpected_kwargs(e, "atomic_cas()");
+                    if (argc != 3) error_at(e->loc, "atomic_cas() takes 3 arguments (ptr, expected, desired)");
+                    Type* pt = check_expr(mod, fn, args[0], NULL);
+                    if (!pt || (pt->kind != TY_ADDR && pt->kind != TY_MUT_REF)) {
+                        error_at(args[0]->loc, "atomic_cas() requires a mutable pointer (addr/mut_ref), got '%s'", type_str(pt));
+                    }
+                    Type* et = pt->elem;
+                    if (!type_is_int(et) && et->kind != TY_BOOL && et->kind != TY_ADDR) {
+                        error_at(args[0]->loc, "atomic_cas() unsupported element type '%s'", type_str(et));
+                    }
+                    Type* exp_t = check_expr(mod, fn, args[1], et);
+                    if (!type_assignable(et, exp_t)) {
+                        error_at(args[1]->loc, "atomic_cas() expected type '%s' does not match '%s'", type_str(exp_t), type_str(et));
+                    }
+                    Type* des_t = check_expr(mod, fn, args[2], et);
+                    if (!type_assignable(et, des_t)) {
+                        error_at(args[2]->loc, "atomic_cas() desired type '%s' does not match '%s'", type_str(des_t), type_str(et));
+                    }
+                    res = g_ty_bool;
+                    break;
+                }
+                if (strcmp(cname, "atomic_xchg") == 0 || strcmp(cname, "atomic_add") == 0 ||
+                    strcmp(cname, "atomic_sub") == 0 || strcmp(cname, "atomic_and") == 0 ||
+                    strcmp(cname, "atomic_or") == 0 || strcmp(cname, "atomic_xor") == 0) {
+                    reject_unexpected_kwargs(e, cname);
+                    if (argc != 2) error_at(e->loc, "%s() takes 2 arguments", cname);
+                    Type* pt = check_expr(mod, fn, args[0], NULL);
+                    if (!pt || (pt->kind != TY_ADDR && pt->kind != TY_MUT_REF)) {
+                        error_at(args[0]->loc, "%s() requires a mutable pointer (addr/mut_ref), got '%s'", cname, type_str(pt));
+                    }
+                    Type* et = pt->elem;
+                    bool is_xchg = (strcmp(cname, "atomic_xchg") == 0);
+                    if (is_xchg) {
+                        if (!type_is_int(et) && et->kind != TY_BOOL && et->kind != TY_ADDR) {
+                            error_at(args[0]->loc, "%s() unsupported element type '%s'", cname, type_str(et));
+                        }
+                    } else {
+                        if (!type_is_int(et)) {
+                            error_at(args[0]->loc, "%s() requires integer element type, got '%s'", cname, type_str(et));
+                        }
+                    }
+                    Type* vt = check_expr(mod, fn, args[1], et);
+                    if (!type_assignable(et, vt)) {
+                        error_at(args[1]->loc, "%s() value type '%s' does not match '%s'", cname, type_str(vt), type_str(et));
+                    }
+                    res = et;
                     break;
                 }
                 if (strcmp(cname, "str") == 0 || strcmp(cname, "repr") == 0) {
@@ -13136,6 +13224,63 @@ static const char* cg_expr_inner(Expr* e, Type* hint) {
                     const char* mv = cg_reg();
                     cg_emit("%s = load %s, ptr %s", mv, llvm_mem_ty(ty), lp);
                     return cg_mem_to_reg(mv, ty);
+                }
+                if (strcmp(cname, "atomic_fence") == 0) {
+                    cg_emit("fence seq_cst");
+                    return "0";
+                }
+                if (strcmp(cname, "atomic_load") == 0) {
+                    const char* pv = cg_expr(args[0], NULL);
+                    Type* et = args[0]->ty->elem;
+                    const char* mty = llvm_mem_ty(et);
+                    int al = (et->kind == TY_BOOL || et->kind == TY_I8 || et->kind == TY_U8) ? 1 :
+                             (et->kind == TY_I16 || et->kind == TY_U16) ? 2 :
+                             (et->kind == TY_I32 || et->kind == TY_U32) ? 4 : 8;
+                    const char* mv = cg_reg();
+                    cg_emit("%s = load atomic %s, ptr %s seq_cst, align %d", mv, mty, pv, al);
+                    return cg_mem_to_reg(mv, et);
+                }
+                if (strcmp(cname, "atomic_store") == 0) {
+                    const char* pv = cg_expr(args[0], NULL);
+                    Type* et = args[0]->ty->elem;
+                    const char* vv = cg_coerce(cg_expr(args[1], et), args[1]->ty, et);
+                    const char* mv = cg_reg_to_mem(vv, et);
+                    const char* mty = llvm_mem_ty(et);
+                    int al = (et->kind == TY_BOOL || et->kind == TY_I8 || et->kind == TY_U8) ? 1 :
+                             (et->kind == TY_I16 || et->kind == TY_U16) ? 2 :
+                             (et->kind == TY_I32 || et->kind == TY_U32) ? 4 : 8;
+                    cg_emit("store atomic %s %s, ptr %s seq_cst, align %d", mty, mv, pv, al);
+                    return "0";
+                }
+                if (strcmp(cname, "atomic_cas") == 0) {
+                    const char* pv = cg_expr(args[0], NULL);
+                    Type* et = args[0]->ty->elem;
+                    const char* ev = cg_reg_to_mem(cg_coerce(cg_expr(args[1], et), args[1]->ty, et), et);
+                    const char* dv = cg_reg_to_mem(cg_coerce(cg_expr(args[2], et), args[2]->ty, et), et);
+                    const char* mty = llvm_mem_ty(et);
+                    int al = (et->kind == TY_BOOL || et->kind == TY_I8 || et->kind == TY_U8) ? 1 :
+                             (et->kind == TY_I16 || et->kind == TY_U16) ? 2 :
+                             (et->kind == TY_I32 || et->kind == TY_U32) ? 4 : 8;
+                    const char* cmpr = cg_reg();
+                    const char* ok = cg_reg();
+                    cg_emit("%s = cmpxchg ptr %s, %s %s, %s %s seq_cst seq_cst, align %d", cmpr, pv, mty, ev, mty, dv, al);
+                    cg_emit("%s = extractvalue { %s, i1 } %s, 1", ok, mty, cmpr);
+                    return ok;
+                }
+                if (strcmp(cname, "atomic_xchg") == 0 || strcmp(cname, "atomic_add") == 0 ||
+                    strcmp(cname, "atomic_sub") == 0 || strcmp(cname, "atomic_and") == 0 ||
+                    strcmp(cname, "atomic_or") == 0 || strcmp(cname, "atomic_xor") == 0) {
+                    const char* pv = cg_expr(args[0], NULL);
+                    Type* et = args[0]->ty->elem;
+                    const char* vv = cg_reg_to_mem(cg_coerce(cg_expr(args[1], et), args[1]->ty, et), et);
+                    const char* mty = llvm_mem_ty(et);
+                    int al = (et->kind == TY_BOOL || et->kind == TY_I8 || et->kind == TY_U8) ? 1 :
+                             (et->kind == TY_I16 || et->kind == TY_U16) ? 2 :
+                             (et->kind == TY_I32 || et->kind == TY_U32) ? 4 : 8;
+                    const char* op = cname + 7; /* xchg, add, sub, and, or, xor */
+                    const char* mv = cg_reg();
+                    cg_emit("%s = atomicrmw %s ptr %s, %s %s seq_cst, align %d", mv, op, pv, mty, vv, al);
+                    return cg_mem_to_reg(mv, et);
                 }
                 if (strcmp(cname, "str") == 0 || strcmp(cname, "repr") == 0) {
                     if (args[0]->ty->kind == TY_CLASS) {

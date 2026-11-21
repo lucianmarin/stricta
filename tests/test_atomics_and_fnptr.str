@@ -1,0 +1,74 @@
+from typing import Callable
+
+@extern("pthread_create")
+def _pthread_create(tid: addr[u64], attr: addr[u8] | None, start_routine: Callable[[addr[u8]], addr[u8] | None], arg: addr[u8]) -> i32:
+    pass
+
+@extern("pthread_join")
+def _pthread_join(tid: u64, retval: addr[u8] | None) -> i32:
+    pass
+
+def _worker(arg: addr[u8]) -> addr[u8] | None:
+    p = arg
+    # Cast addr[u8] to addr[i64] via u64? Wait: let's test atomic_add on u8 first, or pass addr[i64]
+    atomic_add(p, u8(1))
+    return None
+
+def test_atomics_basic() -> None:
+    x: i64 = 10
+    p = x.addr
+    assert atomic_load(p) == 10
+    atomic_store(p, 20)
+    assert atomic_load(p) == 20
+
+    old_add = atomic_add(p, 5)
+    assert old_add == 20
+    assert atomic_load(p) == 25
+
+    old_sub = atomic_sub(p, 3)
+    assert old_sub == 25
+    assert atomic_load(p) == 22
+
+    old_xchg = atomic_xchg(p, 100)
+    assert old_xchg == 22
+    assert atomic_load(p) == 100
+
+    assert not atomic_cas(p, 99, 200)
+    assert atomic_load(p) == 100
+    assert atomic_cas(p, 100, 200)
+    assert atomic_load(p) == 200
+
+    bits: u32 = u32(0b1010)
+    bp = bits.addr
+    assert atomic_or(bp, u32(0b0101)) == u32(0b1010)
+    assert atomic_load(bp) == u32(0b1111)
+    assert atomic_and(bp, u32(0b1100)) == u32(0b1111)
+    assert atomic_load(bp) == u32(0b1100)
+    assert atomic_xor(bp, u32(0b1010)) == u32(0b1100)
+    assert atomic_load(bp) == u32(0b0110)
+
+    flag: bool = False
+    fp = flag.addr
+    assert not atomic_load(fp)
+    assert atomic_cas(fp, False, True)
+    assert atomic_load(fp)
+    atomic_store(fp, False)
+    assert not atomic_load(fp)
+
+    atomic_fence()
+
+def test_c_fnptr_pthread() -> None:
+    counter: u8 = u8(0)
+    tid1: u64 = u64(0)
+    tid2: u64 = u64(0)
+    rc1 = _pthread_create(tid1.addr, None, _worker, counter.addr)
+    rc2 = _pthread_create(tid2.addr, None, _worker, counter.addr)
+    assert rc1 == i32(0)
+    assert rc2 == i32(0)
+    assert _pthread_join(tid1, None) == i32(0)
+    assert _pthread_join(tid2, None) == i32(0)
+    assert atomic_load(counter.addr) == u8(2)
+
+test_atomics_basic()
+test_c_fnptr_pthread()
+print("atomics_and_fnptr: ok")
